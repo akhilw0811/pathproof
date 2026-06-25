@@ -3,6 +3,7 @@ package graph
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -22,14 +23,117 @@ func TestGraphAddNodeDeduplicates(t *testing.T) {
 	first := mustAddNode(t, g, node)
 	second := mustAddNode(t, g, NewNode(Workload, "orders-api"))
 
-	if first != node {
+	if !reflect.DeepEqual(first, node) {
 		t.Fatalf("first added node = %#v, want %#v", first, node)
 	}
-	if second != node {
+	if !reflect.DeepEqual(second, node) {
 		t.Fatalf("deduplicated node = %#v, want original %#v", second, node)
 	}
 	if got := g.Nodes(); len(got) != 1 {
 		t.Fatalf("node count = %d, want 1", len(got))
+	}
+}
+
+func TestGraphAddNodeDeduplicatesAndPreservesEvidence(t *testing.T) {
+	g := New()
+	evidence := []SourceEvidence{{Source: "fixture.yaml#document=1", Detail: "kubernetes Service"}}
+	node := NewNode(PublicEndpoint, "public-api")
+	node.Evidence = evidence
+
+	first := mustAddNode(t, g, node)
+	second := mustAddNode(t, g, Node{
+		Kind:     PublicEndpoint,
+		Name:     "public-api",
+		Evidence: []SourceEvidence{{Source: "changed.yaml#document=1", Detail: "changed"}},
+	})
+
+	if !reflect.DeepEqual(first, node) {
+		t.Fatalf("first added node = %#v, want %#v", first, node)
+	}
+	if !reflect.DeepEqual(second, node) {
+		t.Fatalf("deduplicated node = %#v, want original %#v", second, node)
+	}
+	gotNodes := g.Nodes()
+	if len(gotNodes) != 1 {
+		t.Fatalf("node count = %d, want 1", len(gotNodes))
+	}
+	if !reflect.DeepEqual(gotNodes[0].Evidence, evidence) {
+		t.Fatalf("evidence = %#v, want %#v", gotNodes[0].Evidence, evidence)
+	}
+}
+
+func TestGraphAddNodeClonesCallerEvidence(t *testing.T) {
+	g := New()
+	evidence := []SourceEvidence{{Source: "fixture.yaml#document=1", Detail: "kubernetes Service"}}
+	node := NewNode(PublicEndpoint, "public-api")
+	node.Evidence = evidence
+
+	added := mustAddNode(t, g, node)
+	evidence[0].Source = "changed.yaml#document=1"
+
+	got, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found", added.ID)
+	}
+	if got.Evidence[0].Source != "fixture.yaml#document=1" {
+		t.Fatalf("stored evidence source = %q, want original", got.Evidence[0].Source)
+	}
+}
+
+func TestGraphNodeClonesReturnedEvidence(t *testing.T) {
+	g := New()
+	node := NewNode(PublicEndpoint, "public-api")
+	node.Evidence = []SourceEvidence{{Source: "fixture.yaml#document=1", Detail: "kubernetes Service"}}
+	added := mustAddNode(t, g, node)
+
+	got, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found", added.ID)
+	}
+	got.Evidence[0].Source = "changed.yaml#document=1"
+
+	stored, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after mutation", added.ID)
+	}
+	if stored.Evidence[0].Source != "fixture.yaml#document=1" {
+		t.Fatalf("stored evidence source = %q, want original", stored.Evidence[0].Source)
+	}
+}
+
+func TestGraphNodesCloneReturnedEvidence(t *testing.T) {
+	g := New()
+	node := NewNode(PublicEndpoint, "public-api")
+	node.Evidence = []SourceEvidence{{Source: "fixture.yaml#document=1", Detail: "kubernetes Service"}}
+	added := mustAddNode(t, g, node)
+
+	nodes := g.Nodes()
+	nodes[0].Evidence[0].Source = "changed.yaml#document=1"
+
+	stored, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after mutation", added.ID)
+	}
+	if stored.Evidence[0].Source != "fixture.yaml#document=1" {
+		t.Fatalf("stored evidence source = %q, want original", stored.Evidence[0].Source)
+	}
+}
+
+func TestGraphAddDuplicateNodeClonesReturnedEvidence(t *testing.T) {
+	g := New()
+	node := NewNode(PublicEndpoint, "public-api")
+	node.Evidence = []SourceEvidence{{Source: "fixture.yaml#document=1", Detail: "kubernetes Service"}}
+	added := mustAddNode(t, g, node)
+
+	duplicate := mustAddNode(t, g, NewNode(PublicEndpoint, "public-api"))
+	duplicate.Evidence[0].Source = "changed.yaml#document=1"
+
+	stored, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after duplicate mutation", added.ID)
+	}
+	if stored.Evidence[0].Source != "fixture.yaml#document=1" {
+		t.Fatalf("stored evidence source = %q, want original", stored.Evidence[0].Source)
 	}
 }
 
@@ -59,7 +163,7 @@ func TestGraphAddNodeAcceptsCorrectSuppliedID(t *testing.T) {
 
 	got := mustAddNode(t, g, Node{ID: node.ID, Kind: node.Kind, Name: node.Name})
 
-	if got != node {
+	if !reflect.DeepEqual(got, node) {
 		t.Fatalf("node = %#v, want %#v", got, node)
 	}
 }
@@ -77,7 +181,7 @@ func TestGraphAddNodeRejectsIncorrectSuppliedIDWithoutMutation(t *testing.T) {
 	if len(gotNodes) != 1 {
 		t.Fatalf("node count = %d, want 1", len(gotNodes))
 	}
-	if gotNodes[0] != existing {
+	if !reflect.DeepEqual(gotNodes[0], existing) {
 		t.Fatalf("remaining node = %#v, want %#v", gotNodes[0], existing)
 	}
 	if _, ok := g.Node(staleID); ok {
@@ -93,7 +197,7 @@ func TestGraphAddNodeRejectsExistingSuppliedIDBeforeDeduplication(t *testing.T) 
 	if !errors.Is(err, ErrInvalidNodeID) {
 		t.Fatalf("invalid node ID error = %v, want %v", err, ErrInvalidNodeID)
 	}
-	if got == existing {
+	if reflect.DeepEqual(got, existing) {
 		t.Fatalf("invalid node returned existing duplicate %#v", got)
 	}
 
@@ -101,14 +205,14 @@ func TestGraphAddNodeRejectsExistingSuppliedIDBeforeDeduplication(t *testing.T) 
 	if len(gotNodes) != 1 {
 		t.Fatalf("node count = %d, want 1", len(gotNodes))
 	}
-	if gotNodes[0] != existing {
+	if !reflect.DeepEqual(gotNodes[0], existing) {
 		t.Fatalf("remaining node = %#v, want %#v", gotNodes[0], existing)
 	}
 	gotExisting, ok := g.Node(existing.ID)
 	if !ok {
 		t.Fatalf("existing node %q not found", existing.ID)
 	}
-	if gotExisting != existing {
+	if !reflect.DeepEqual(gotExisting, existing) {
 		t.Fatalf("existing node = %#v, want %#v", gotExisting, existing)
 	}
 }
@@ -121,7 +225,7 @@ func TestGraphNodeRetrieval(t *testing.T) {
 	if !ok {
 		t.Fatalf("node %q not found", node.ID)
 	}
-	if got != node {
+	if !reflect.DeepEqual(got, node) {
 		t.Fatalf("node = %#v, want %#v", got, node)
 	}
 
@@ -143,7 +247,7 @@ func TestGraphNodesAreSortedByID(t *testing.T) {
 		t.Fatalf("node count = %d, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Fatalf("node[%d] = %#v, want %#v", i, got[i], want[i])
 		}
 	}

@@ -36,9 +36,10 @@ var (
 )
 
 type Node struct {
-	ID   NodeID   `json:"id"`
-	Kind NodeKind `json:"kind"`
-	Name string   `json:"name"`
+	ID       NodeID           `json:"id"`
+	Kind     NodeKind         `json:"kind"`
+	Name     string           `json:"name"`
+	Evidence []SourceEvidence `json:"evidence,omitempty"`
 }
 
 type SourceEvidence struct {
@@ -95,22 +96,26 @@ func (g *Graph) AddNode(node Node) (Node, error) {
 	}
 
 	if existing, ok := g.nodes[node.ID]; ok {
-		return existing, nil
+		return cloneNode(existing), nil
 	}
 
+	node = cloneNode(node)
 	g.nodes[node.ID] = node
-	return node, nil
+	return cloneNode(node), nil
 }
 
 func (g *Graph) Node(id NodeID) (Node, bool) {
 	node, ok := g.nodes[id]
-	return node, ok
+	if !ok {
+		return Node{}, false
+	}
+	return cloneNode(node), true
 }
 
 func (g *Graph) Nodes() []Node {
 	nodes := make([]Node, 0, len(g.nodes))
 	for _, node := range g.nodes {
-		nodes = append(nodes, node)
+		nodes = append(nodes, cloneNode(node))
 	}
 
 	sort.Slice(nodes, func(i, j int) bool {
@@ -236,6 +241,18 @@ func (g *Graph) MarshalJSON() ([]byte, error) {
 		Nodes: g.Nodes(),
 		Edges: g.Edges(),
 	})
+}
+
+func cloneNode(node Node) Node {
+	node.Evidence = cloneEvidence(node.Evidence)
+	return node
+}
+
+func cloneEvidence(evidence []SourceEvidence) []SourceEvidence {
+	if evidence == nil {
+		return nil
+	}
+	return append([]SourceEvidence(nil), evidence...)
 }
 
 func nodeID(kind NodeKind, name string) NodeID {
