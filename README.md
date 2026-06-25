@@ -9,7 +9,16 @@ broken.
 
 ## Current milestone
 
-Build a tested Go CLI bootstrap. Graph domain logic is not implemented yet.
+Build a tested Go CLI with the first deterministic, evidence-backed in-memory
+graph slice for Kubernetes routing.
+
+Implemented Kubernetes support is intentionally small:
+
+- Parse `Service`, `Deployment`, `networking.k8s.io/v1` `Ingress`, and
+  `ServiceAccount` manifests from local YAML files.
+- Resolve public Services and Ingresses to Deployment workloads.
+- Model each Deployment as running as a ServiceAccount, using observed
+  ServiceAccount manifests when present and inferred accounts when missing.
 
 ## Usage
 
@@ -34,10 +43,10 @@ The built binary is written to `bin/pathproof`.
 
 ## Not currently in scope
 
-- Kubernetes parsing
 - Terraform parsing
 - GitHub Actions parsing
 - SBOM parsing
+- Kubernetes RBAC, Secrets, live-cluster verification, or remediation
 - AI agents
 - Machine learning
 - Dashboard

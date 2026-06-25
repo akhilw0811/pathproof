@@ -62,16 +62,236 @@ spec:
 	}
 
 	want := []Deployment{{
-		Namespace: "prod",
-		Name:      "api",
-		PodLabels: map[string]string{"app": "api", "tier": "backend"},
-		Source:    Source{Filename: path, Document: 1},
+		Namespace:          "prod",
+		Name:               "api",
+		PodLabels:          map[string]string{"app": "api", "tier": "backend"},
+		ServiceAccountName: "default",
+		Source:             Source{Filename: path, Document: 1},
 	}}
 	if !reflect.DeepEqual(resources.Deployments, want) {
 		t.Fatalf("deployments = %#v, want %#v", resources.Deployments, want)
 	}
 	if len(resources.Services) != 0 {
 		t.Fatalf("service count = %d, want 0", len(resources.Services))
+	}
+}
+
+func TestParseDirParsesValidServiceAccount(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "service-account.yaml", `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payments-sa
+  namespace: prod
+automountServiceAccountToken: false
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []ServiceAccount{{
+		Namespace:                    "prod",
+		Name:                         "payments-sa",
+		AutomountServiceAccountToken: boolPtr(false),
+		Source:                       Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.ServiceAccounts, want) {
+		t.Fatalf("service accounts = %#v, want %#v", resources.ServiceAccounts, want)
+	}
+}
+
+func TestParseDirPreservesServiceAccountAutomountTokenStates(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "service-accounts.yaml", `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: omitted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: explicit-false
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: explicit-true
+automountServiceAccountToken: true
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []ServiceAccount{
+		{Namespace: "default", Name: "explicit-false", AutomountServiceAccountToken: boolPtr(false), Source: Source{Filename: path, Document: 2}},
+		{Namespace: "default", Name: "explicit-true", AutomountServiceAccountToken: boolPtr(true), Source: Source{Filename: path, Document: 3}},
+		{Namespace: "default", Name: "omitted", Source: Source{Filename: path, Document: 1}},
+	}
+	if !reflect.DeepEqual(resources.ServiceAccounts, want) {
+		t.Fatalf("service accounts = %#v, want %#v", resources.ServiceAccounts, want)
+	}
+}
+
+func TestParseDirIgnoresUnsupportedServiceAccountBeforeTypedDecode(t *testing.T) {
+	dir := t.TempDir()
+	resourcesPath := writeManifest(t, dir, "resources.yaml", `apiVersion: example.io/v1
+kind: ServiceAccount
+metadata:
+  name: unsupported
+automountServiceAccountToken:
+  mode: custom
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payments-sa
+  namespace: prod
+automountServiceAccountToken: true
+`)
+	deploymentPath := writeManifest(t, dir, "deployment.yaml", `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	wantServiceAccounts := []ServiceAccount{{
+		Namespace:                    "prod",
+		Name:                         "payments-sa",
+		AutomountServiceAccountToken: boolPtr(true),
+		Source:                       Source{Filename: resourcesPath, Document: 2},
+	}}
+	if !reflect.DeepEqual(resources.ServiceAccounts, wantServiceAccounts) {
+		t.Fatalf("service accounts = %#v, want %#v", resources.ServiceAccounts, wantServiceAccounts)
+	}
+
+	wantDeployments := []Deployment{{
+		Namespace:          "prod",
+		Name:               "api",
+		PodLabels:          map[string]string{"app": "api"},
+		ServiceAccountName: "default",
+		Source:             Source{Filename: deploymentPath, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Deployments, wantDeployments) {
+		t.Fatalf("deployments = %#v, want %#v", resources.Deployments, wantDeployments)
+	}
+}
+
+func TestParseDirMalformedCoreV1ServiceAccountReturnsActionableError(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "bad-service-account.yaml", `apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bad
+automountServiceAccountToken:
+  mode: custom
+`)
+
+	resources, err := ParseDir(dir)
+	if err == nil {
+		t.Fatal("parse dir error = nil, want malformed ServiceAccount field error")
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want empty result on error", resources)
+	}
+	if got := err.Error(); !strings.Contains(got, path) || !strings.Contains(got, "ServiceAccount") || !strings.Contains(got, "document 1") {
+		t.Fatalf("error = %q, want filename, ServiceAccount kind, and document", got)
+	}
+}
+
+func TestParseDirParsesDeploymentServiceAccountName(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "deployment.yaml", `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+spec:
+  template:
+    spec:
+      serviceAccountName: payments-sa
+    metadata:
+      labels:
+        app: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Deployment{{
+		Namespace:          "prod",
+		Name:               "api",
+		PodLabels:          map[string]string{"app": "api"},
+		ServiceAccountName: "payments-sa",
+		Source:             Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Deployments, want) {
+		t.Fatalf("deployments = %#v, want %#v", resources.Deployments, want)
+	}
+}
+
+func TestParseDirDefaultsMissingDeploymentServiceAccountName(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "deployment.yaml", `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got := resources.Deployments[0].ServiceAccountName; got != "default" {
+		t.Fatalf("service account name = %q, want default", got)
+	}
+}
+
+func TestParseDirDefaultsEmptyDeploymentServiceAccountName(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "deployment.yaml", `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      serviceAccountName: ""
+    metadata:
+      labels:
+        app: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got := resources.Deployments[0].ServiceAccountName; got != "default" {
+		t.Fatalf("service account name = %q, want default", got)
 	}
 }
 
@@ -101,10 +321,11 @@ spec:
 	}
 
 	want := []Deployment{{
-		Namespace: "prod",
-		Name:      "api",
-		PodLabels: map[string]string{"app": "api", "tier": "backend"},
-		Source:    Source{Filename: path, Document: 1},
+		Namespace:          "prod",
+		Name:               "api",
+		PodLabels:          map[string]string{"app": "api", "tier": "backend"},
+		ServiceAccountName: "default",
+		Source:             Source{Filename: path, Document: 1},
 	}}
 	if !reflect.DeepEqual(resources.Deployments, want) {
 		t.Fatalf("deployments = %#v, want %#v", resources.Deployments, want)
@@ -146,10 +367,11 @@ spec:
 		Source:    Source{Filename: path, Document: 1},
 	}}
 	wantDeployments := []Deployment{{
-		Namespace: "default",
-		Name:      "api",
-		PodLabels: map[string]string{"app": "api"},
-		Source:    Source{Filename: path, Document: 2},
+		Namespace:          "default",
+		Name:               "api",
+		PodLabels:          map[string]string{"app": "api"},
+		ServiceAccountName: "default",
+		Source:             Source{Filename: path, Document: 2},
 	}}
 	if !reflect.DeepEqual(resources.Services, wantServices) {
 		t.Fatalf("services = %#v, want %#v", resources.Services, wantServices)
@@ -341,10 +563,11 @@ spec:
 	}
 
 	want := []Deployment{{
-		Namespace: "default",
-		Name:      "api",
-		PodLabels: map[string]string{"app": "api"},
-		Source:    Source{Filename: path, Document: 1},
+		Namespace:          "default",
+		Name:               "api",
+		PodLabels:          map[string]string{"app": "api"},
+		ServiceAccountName: "default",
+		Source:             Source{Filename: path, Document: 1},
 	}}
 	if !reflect.DeepEqual(resources.Deployments, want) {
 		t.Fatalf("deployments = %#v, want %#v", resources.Deployments, want)
@@ -415,6 +638,12 @@ metadata:
 spec:
   type: LoadBalancer
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: z-api
+  namespace: prod
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -433,6 +662,12 @@ metadata:
   namespace: prod
 spec:
   type: NodePort
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: a-api
+  namespace: prod
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -463,6 +698,9 @@ spec:
 	}
 	if got := []string{first.Deployments[0].Name, first.Deployments[1].Name}; !reflect.DeepEqual(got, []string{"a-api", "z-api"}) {
 		t.Fatalf("deployment order = %#v, want sorted by resource identity", got)
+	}
+	if got := []string{first.ServiceAccounts[0].Name, first.ServiceAccounts[1].Name}; !reflect.DeepEqual(got, []string{"a-api", "z-api"}) {
+		t.Fatalf("service account order = %#v, want sorted by resource identity", got)
 	}
 }
 
@@ -742,4 +980,8 @@ func writeManifest(t *testing.T, dir, name, content string) string {
 		t.Fatalf("write manifest %q: %v", name, err)
 	}
 	return path
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
