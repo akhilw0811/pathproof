@@ -21,16 +21,11 @@ func TestAddRoutesLoadBalancerServiceCreatesRouteToWorkload(t *testing.T) {
 	}
 
 	nodes := g.Nodes()
-	edges := g.Edges()
-	if len(nodes) != 2 {
-		t.Fatalf("node count = %d, want 2: %#v", len(nodes), nodes)
+	if len(nodes) != 3 {
+		t.Fatalf("node count = %d, want 3: %#v", len(nodes), nodes)
 	}
-	if len(edges) != 1 {
-		t.Fatalf("edge count = %d, want 1: %#v", len(edges), edges)
-	}
-	if edges[0].Kind != graph.RoutesTo {
-		t.Fatalf("edge kind = %q, want %q", edges[0].Kind, graph.RoutesTo)
-	}
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 
 	endpoint := graph.NewNode(graph.PublicEndpoint, "kubernetes://prod/service/public-api")
 	workload := graph.NewNode(graph.Workload, "kubernetes://prod/deployment/api")
@@ -40,8 +35,9 @@ func TestAddRoutesLoadBalancerServiceCreatesRouteToWorkload(t *testing.T) {
 	if _, ok := g.Node(workload.ID); !ok {
 		t.Fatalf("workload node %q not found", workload.ID)
 	}
-	if edges[0].From != endpoint.ID || edges[0].To != workload.ID {
-		t.Fatalf("edge endpoints = %q -> %q, want %q -> %q", edges[0].From, edges[0].To, endpoint.ID, workload.ID)
+	routeEdges := edgesOfKind(g, graph.RoutesTo)
+	if routeEdges[0].From != endpoint.ID || routeEdges[0].To != workload.ID {
+		t.Fatalf("edge endpoints = %q -> %q, want %q -> %q", routeEdges[0].From, routeEdges[0].To, endpoint.ID, workload.ID)
 	}
 }
 
@@ -52,7 +48,9 @@ func TestAddRoutesNodePortServiceCreatesRouteToWorkload(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesClusterIPServiceCreatesNoPublicEndpoint(t *testing.T) {
@@ -62,7 +60,10 @@ func TestAddRoutesClusterIPServiceCreatesNoPublicEndpoint(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 0, 0, 0)
+	assertGraphCounts(t, g, 2, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 0)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesPublicServiceWithNoMatchingDeploymentCreatesOnlyEndpoint(t *testing.T) {
@@ -74,10 +75,13 @@ func TestAddRoutesPublicServiceWithNoMatchingDeploymentCreatesOnlyEndpoint(t *te
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 1, 0, 0)
+	assertGraphCounts(t, g, 3, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 1)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
-func TestAddRoutesUnmatchedDeploymentIsNotAddedAsWorkload(t *testing.T) {
+func TestAddRoutesUnmatchedDeploymentIsModeledButNotExposed(t *testing.T) {
 	g := graph.New()
 	resources := parserkubernetes.Resources{
 		Deployments: []parserkubernetes.Deployment{deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)},
@@ -87,7 +91,10 @@ func TestAddRoutesUnmatchedDeploymentIsNotAddedAsWorkload(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 0, 0, 0)
+	assertGraphCounts(t, g, 2, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 0)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesSelectorMismatchCreatesNoEdge(t *testing.T) {
@@ -99,7 +106,10 @@ func TestAddRoutesSelectorMismatchCreatesNoEdge(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 1, 0, 0)
+	assertGraphCounts(t, g, 3, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 1)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesNamespaceMismatchCreatesNoEdge(t *testing.T) {
@@ -111,7 +121,10 @@ func TestAddRoutesNamespaceMismatchCreatesNoEdge(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 1, 0, 0)
+	assertGraphCounts(t, g, 3, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 1)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesEmptyServiceSelectorCreatesNoEdge(t *testing.T) {
@@ -123,7 +136,10 @@ func TestAddRoutesEmptyServiceSelectorCreatesNoEdge(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 1, 0, 0)
+	assertGraphCounts(t, g, 3, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 1)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesSelectorMatchingMultipleDeploymentsCreatesOneEdgePerDeployment(t *testing.T) {
@@ -137,7 +153,9 @@ func TestAddRoutesSelectorMatchingMultipleDeploymentsCreatesOneEdgePerDeployment
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 3, 2, 2)
+	assertGraphCounts(t, g, 4, 2, 4)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 2)
+	assertEdgeKindCount(t, g, graph.RunsAs, 2)
 }
 
 func TestAddRoutesDeploymentWithAdditionalLabelsMatches(t *testing.T) {
@@ -149,7 +167,9 @@ func TestAddRoutesDeploymentWithAdditionalLabelsMatches(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesDoesNotMatchDeploymentMetadataLabels(t *testing.T) {
@@ -187,7 +207,10 @@ spec:
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 1, 0, 0)
+	assertGraphCounts(t, g, 3, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 1)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesMatchesTemplateLabelsWhenDeploymentSelectorPresent(t *testing.T) {
@@ -229,7 +252,9 @@ spec:
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesEvidenceIdentifiesSources(t *testing.T) {
@@ -254,13 +279,272 @@ func TestAddRoutesEvidenceIdentifiesSources(t *testing.T) {
 		t.Fatalf("workload evidence = %#v", workload.Evidence)
 	}
 
-	edges := g.Edges()
-	if len(edges) != 1 {
-		t.Fatalf("edge count = %d, want 1", len(edges))
+	routeEdges := edgesOfKind(g, graph.RoutesTo)
+	if len(routeEdges) != 1 {
+		t.Fatalf("route edge count = %d, want 1", len(routeEdges))
 	}
-	if !strings.Contains(edges[0].Evidence.Source, "service service.yaml#document=1") ||
-		!strings.Contains(edges[0].Evidence.Source, "deployment deployment.yaml#document=1") {
-		t.Fatalf("edge evidence source = %q, want service and deployment sources", edges[0].Evidence.Source)
+	if !strings.Contains(routeEdges[0].Evidence.Source, "service service.yaml#document=1") ||
+		!strings.Contains(routeEdges[0].Evidence.Source, "deployment deployment.yaml#document=1") {
+		t.Fatalf("edge evidence source = %q, want service and deployment sources", routeEdges[0].Evidence.Source)
+	}
+}
+
+func TestAddRoutesDeploymentRunsAsObservedServiceAccount(t *testing.T) {
+	g := graph.New()
+	deployment := deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	deployment.ServiceAccountName = "payments-sa"
+	resources := parserkubernetes.Resources{
+		Deployments:     []parserkubernetes.Deployment{deployment},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{serviceAccount("prod", "payments-sa", nil, "service-account.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	assertNodeKindCount(t, g, graph.ServiceAccount, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
+	workload := graph.NewNode(graph.Workload, "kubernetes://prod/deployment/api")
+	account := graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/payments-sa")
+	edge := edgesOfKind(g, graph.RunsAs)[0]
+	if edge.From != workload.ID || edge.To != account.ID {
+		t.Fatalf("runs-as endpoints = %q -> %q, want %q -> %q", edge.From, edge.To, workload.ID, account.ID)
+	}
+}
+
+func TestAddRoutesDeploymentMissingServiceAccountNameRunsAsDefault(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Deployments: []parserkubernetes.Deployment{deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	account := graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/default")
+	if _, ok := g.Node(account.ID); !ok {
+		t.Fatalf("service account node %q not found", account.ID)
+	}
+}
+
+func TestAddRoutesServiceAccountMatchingIsNamespaceScoped(t *testing.T) {
+	g := graph.New()
+	deployment := deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	deployment.ServiceAccountName = "payments-sa"
+	resources := parserkubernetes.Resources{
+		Deployments:     []parserkubernetes.Deployment{deployment},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{serviceAccount("staging", "payments-sa", nil, "service-account.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	account := mustNode(t, g, graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/payments-sa").ID)
+	if got := account.Evidence[0]; !strings.Contains(got.Source, "deployment deployment.yaml#document=1") || strings.Contains(got.Source, "service-account.yaml") {
+		t.Fatalf("service account evidence = %#v, want inferred deployment evidence only", account.Evidence)
+	}
+}
+
+func TestAddRoutesObservedServiceAccountEvidenceIsPreserved(t *testing.T) {
+	g := graph.New()
+	deployment := deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	deployment.ServiceAccountName = "payments-sa"
+	resources := parserkubernetes.Resources{
+		Deployments:     []parserkubernetes.Deployment{deployment},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{serviceAccount("prod", "payments-sa", boolPtr(false), "service-account.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	account := mustNode(t, g, graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/payments-sa").ID)
+	wantEvidence := []graph.SourceEvidence{{Source: "service-account.yaml#document=1", Detail: "observed kubernetes ServiceAccount"}}
+	if !reflect.DeepEqual(account.Evidence, wantEvidence) {
+		t.Fatalf("service account evidence = %#v, want %#v", account.Evidence, wantEvidence)
+	}
+	edge := edgesOfKind(g, graph.RunsAs)[0]
+	for _, want := range []string{"deployment deployment.yaml#document=1", "serviceaccount service-account.yaml#document=1"} {
+		if !strings.Contains(edge.Evidence.Source, want) {
+			t.Fatalf("runs-as evidence source = %q, want %q", edge.Evidence.Source, want)
+		}
+	}
+	if edge.Evidence.Detail != "kubernetes Deployment serviceAccountName runs as observed ServiceAccount" {
+		t.Fatalf("runs-as evidence detail = %q", edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesInferredServiceAccountEvidenceIdentifiesDeploymentReference(t *testing.T) {
+	g := graph.New()
+	deployment := deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	deployment.ServiceAccountName = "payments-sa"
+
+	if err := AddRoutes(g, parserkubernetes.Resources{Deployments: []parserkubernetes.Deployment{deployment}}); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	account := mustNode(t, g, graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/payments-sa").ID)
+	if len(account.Evidence) != 1 {
+		t.Fatalf("service account evidence count = %d, want 1: %#v", len(account.Evidence), account.Evidence)
+	}
+	if got := account.Evidence[0]; !strings.Contains(got.Source, "deployment deployment.yaml#document=1") || !strings.Contains(got.Source, "serviceAccountName payments-sa") {
+		t.Fatalf("service account evidence = %#v, want deployment reference", got)
+	}
+	edge := edgesOfKind(g, graph.RunsAs)[0]
+	if !strings.Contains(edge.Evidence.Source, "deployment deployment.yaml#document=1") || !strings.Contains(edge.Evidence.Source, "serviceAccountName payments-sa") {
+		t.Fatalf("runs-as evidence = %#v, want deployment reference", edge.Evidence)
+	}
+	if edge.Evidence.Detail != "kubernetes Deployment serviceAccountName runs as inferred ServiceAccount" {
+		t.Fatalf("runs-as evidence detail = %q", edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesMultipleDeploymentsShareOneServiceAccountNodeAndDistinctRunsAsEdges(t *testing.T) {
+	g := graph.New()
+	api := deployment("prod", "api", map[string]string{"app": "api"}, "api-deployment.yaml", 1)
+	api.ServiceAccountName = "payments-sa"
+	worker := deployment("prod", "worker", map[string]string{"app": "worker"}, "worker-deployment.yaml", 1)
+	worker.ServiceAccountName = "payments-sa"
+	resources := parserkubernetes.Resources{
+		Deployments:     []parserkubernetes.Deployment{worker, api},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{serviceAccount("prod", "payments-sa", nil, "service-account.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 3, 2, 2)
+	assertNodeKindCount(t, g, graph.ServiceAccount, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 2)
+}
+
+func TestAddRoutesAggregatesInferredServiceAccountEvidenceDeterministically(t *testing.T) {
+	api := deployment("prod", "api", map[string]string{"app": "api"}, "api-deployment.yaml", 1)
+	api.ServiceAccountName = "payments-sa"
+	worker := deployment("prod", "worker", map[string]string{"app": "worker"}, "worker-deployment.yaml", 1)
+	worker.ServiceAccountName = "payments-sa"
+	forward := parserkubernetes.Resources{Deployments: []parserkubernetes.Deployment{api, worker}}
+	reverse := parserkubernetes.Resources{Deployments: []parserkubernetes.Deployment{worker, api}}
+
+	g := graph.New()
+	if err := AddRoutes(g, reverse); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+	account := mustNode(t, g, graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/payments-sa").ID)
+	wantEvidence := []graph.SourceEvidence{
+		{Source: "deployment api-deployment.yaml#document=1; serviceAccountName payments-sa", Detail: "inferred kubernetes ServiceAccount from Deployment serviceAccountName"},
+		{Source: "deployment worker-deployment.yaml#document=1; serviceAccountName payments-sa", Detail: "inferred kubernetes ServiceAccount from Deployment serviceAccountName"},
+	}
+	if !reflect.DeepEqual(account.Evidence, wantEvidence) {
+		t.Fatalf("service account evidence = %#v, want %#v", account.Evidence, wantEvidence)
+	}
+
+	firstJSON := mustGraphJSON(t, forward)
+	secondJSON := mustGraphJSON(t, reverse)
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("json differs by input order:\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
+	}
+}
+
+func TestAddRoutesIdenticalDuplicateServiceAccountsAreAccepted(t *testing.T) {
+	g := graph.New()
+	deployment := deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	resources := parserkubernetes.Resources{
+		Deployments: []parserkubernetes.Deployment{deployment},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{
+			serviceAccount("prod", "default", boolPtr(false), "a-service-account.yaml", 1),
+			serviceAccount("prod", "default", boolPtr(false), "z-service-account.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	account := mustNode(t, g, graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/default").ID)
+	if got, want := account.Evidence[0].Source, "a-service-account.yaml#document=1"; got != want {
+		t.Fatalf("service account evidence source = %q, want %q", got, want)
+	}
+}
+
+func TestAddRoutesRejectsConflictingDuplicateServiceAccountsWithoutMutation(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Deployments: []parserkubernetes.Deployment{deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{
+			serviceAccount("prod", "default", nil, "a-service-account.yaml", 1),
+			serviceAccount("prod", "default", boolPtr(false), "z-service-account.yaml", 1),
+		},
+	}
+
+	err := AddRoutes(g, resources)
+	if err == nil {
+		t.Fatal("add routes error = nil, want duplicate ServiceAccount conflict")
+	}
+	assertConflictError(t, err, "ServiceAccount", "prod/default", "a-service-account.yaml#document=1", "z-service-account.yaml#document=1")
+	assertGraphCounts(t, g, 0, 0, 0)
+}
+
+func TestAddRoutesRejectsConflictingDuplicateServiceAccountsLeavesPrepopulatedGraphUnchanged(t *testing.T) {
+	g := graph.New()
+	if err := AddRoutes(g, routeResources("LoadBalancer")); err != nil {
+		t.Fatalf("seed graph: %v", err)
+	}
+	before := mustMarshalGraph(t, g)
+	resources := parserkubernetes.Resources{
+		Deployments: []parserkubernetes.Deployment{deployment("prod", "worker", map[string]string{"app": "worker"}, "worker-deployment.yaml", 1)},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{
+			serviceAccount("prod", "default", nil, "a-service-account.yaml", 1),
+			serviceAccount("prod", "default", boolPtr(true), "z-service-account.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err == nil {
+		t.Fatal("add routes error = nil, want duplicate ServiceAccount conflict")
+	}
+	after := mustMarshalGraph(t, g)
+	if string(after) != string(before) {
+		t.Fatalf("graph changed after failed AddRoutes:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+func TestAddRoutesRejectsDuplicateDeploymentWithDifferentServiceAccountNameWithoutMutation(t *testing.T) {
+	g := graph.New()
+	first := deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	second := deployment("prod", "api", map[string]string{"app": "api"}, "deployment-conflict.yaml", 1)
+	second.ServiceAccountName = "payments-sa"
+
+	err := AddRoutes(g, parserkubernetes.Resources{Deployments: []parserkubernetes.Deployment{first, second}})
+	if err == nil {
+		t.Fatal("add routes error = nil, want duplicate Deployment conflict")
+	}
+	assertConflictError(t, err, "Deployment", "prod/api", "deployment.yaml#document=1", "deployment-conflict.yaml#document=1")
+	assertGraphCounts(t, g, 0, 0, 0)
+}
+
+func TestAddRoutesRejectsDuplicateDeploymentWithDifferentServiceAccountNameLeavesPrepopulatedGraphUnchanged(t *testing.T) {
+	g := graph.New()
+	if err := AddRoutes(g, routeResources("LoadBalancer")); err != nil {
+		t.Fatalf("seed graph: %v", err)
+	}
+	before := mustMarshalGraph(t, g)
+	first := deployment("prod", "worker", map[string]string{"app": "worker"}, "worker-deployment.yaml", 1)
+	second := deployment("prod", "worker", map[string]string{"app": "worker"}, "worker-deployment-conflict.yaml", 1)
+	second.ServiceAccountName = "worker-sa"
+
+	if err := AddRoutes(g, parserkubernetes.Resources{Deployments: []parserkubernetes.Deployment{first, second}}); err == nil {
+		t.Fatal("add routes error = nil, want duplicate Deployment conflict")
+	}
+	after := mustMarshalGraph(t, g)
+	if string(after) != string(before) {
+		t.Fatalf("graph changed after failed AddRoutes:\nbefore: %s\nafter:  %s", before, after)
 	}
 }
 
@@ -309,7 +593,7 @@ func TestAddRoutesDuplicateInputDocumentsDoNotDuplicateRelationships(t *testing.
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
 	endpoint := mustNode(t, g, graph.NewNode(graph.PublicEndpoint, "kubernetes://prod/service/public-api").ID)
 	workload := mustNode(t, g, graph.NewNode(graph.Workload, "kubernetes://prod/deployment/api").ID)
 	if got, want := endpoint.Evidence[0].Source, "a-service.yaml#document=1"; got != want {
@@ -318,7 +602,7 @@ func TestAddRoutesDuplicateInputDocumentsDoNotDuplicateRelationships(t *testing.
 	if got, want := workload.Evidence[0].Source, "a-deployment.yaml#document=1"; got != want {
 		t.Fatalf("workload evidence source = %q, want %q", got, want)
 	}
-	if got := g.Edges()[0].Evidence.Source; !strings.Contains(got, "a-service.yaml#document=1") || !strings.Contains(got, "a-deployment.yaml#document=1") {
+	if got := edgesOfKind(g, graph.RoutesTo)[0].Evidence.Source; !strings.Contains(got, "a-service.yaml#document=1") || !strings.Contains(got, "a-deployment.yaml#document=1") {
 		t.Fatalf("edge evidence source = %q, want first deterministic service and deployment sources", got)
 	}
 }
@@ -334,7 +618,9 @@ func TestAddRoutesIdenticalDuplicateServicesAreAccepted(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesRejectsDuplicateServiceWithDifferentSelectors(t *testing.T) {
@@ -378,7 +664,9 @@ func TestAddRoutesIdenticalDuplicateDeploymentsAreAccepted(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesRejectsDuplicateDeploymentWithDifferentPodTemplateLabels(t *testing.T) {
@@ -413,7 +701,9 @@ func TestAddRoutesDuplicateMapOrderDoesNotCreateFalseConflict(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestStringMapsEqualHandlesEmptyValues(t *testing.T) {
@@ -477,7 +767,9 @@ func TestAddRoutesAcceptsIdenticalDuplicateEmptyValueMaps(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesConflictLeavesPreviouslyPopulatedGraphUnchanged(t *testing.T) {
@@ -650,7 +942,9 @@ func TestAddRoutesIngressToClusterIPServiceCreatesRouteToWorkload(t *testing.T) 
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 	endpoint := graph.NewNode(graph.PublicEndpoint, "kubernetes://prod/ingress/public-api")
 	workload := graph.NewNode(graph.Workload, "kubernetes://prod/deployment/api")
 	if _, ok := g.Node(endpoint.ID); !ok {
@@ -659,7 +953,7 @@ func TestAddRoutesIngressToClusterIPServiceCreatesRouteToWorkload(t *testing.T) 
 	if _, ok := g.Node(workload.ID); !ok {
 		t.Fatalf("workload node %q not found", workload.ID)
 	}
-	edge := g.Edges()[0]
+	edge := edgesOfKind(g, graph.RoutesTo)[0]
 	if edge.From != endpoint.ID || edge.To != workload.ID {
 		t.Fatalf("edge endpoints = %q -> %q, want %q -> %q", edge.From, edge.To, endpoint.ID, workload.ID)
 	}
@@ -677,9 +971,10 @@ func TestAddRoutesIngressMultiplePathsSameServiceDeduplicateRoute(t *testing.T) 
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
-	if got := strings.Count(g.Edges()[0].Evidence.Source, "service service.yaml#document=1"); got != 1 {
-		t.Fatalf("service evidence occurrence count = %d, want 1 in %q", got, g.Edges()[0].Evidence.Source)
+	assertGraphCounts(t, g, 3, 1, 2)
+	routeEdge := edgesOfKind(g, graph.RoutesTo)[0]
+	if got := strings.Count(routeEdge.Evidence.Source, "service service.yaml#document=1"); got != 1 {
+		t.Fatalf("service evidence occurrence count = %d, want 1 in %q", got, routeEdge.Evidence.Source)
 	}
 }
 
@@ -706,7 +1001,9 @@ func TestAddRoutesIngressMultiplePathsDifferentServicesResolveCorrectly(t *testi
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 3, 2, 2)
+	assertGraphCounts(t, g, 4, 2, 4)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 2)
+	assertEdgeKindCount(t, g, graph.RunsAs, 2)
 }
 
 func TestAddRoutesIngressResolvesServicesOnlyInSameNamespace(t *testing.T) {
@@ -727,7 +1024,10 @@ func TestAddRoutesIngressResolvesServicesOnlyInSameNamespace(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 1, 0, 0)
+	assertGraphCounts(t, g, 3, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 1)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 	endpoint := graph.NewNode(graph.PublicEndpoint, "kubernetes://prod/ingress/public-api")
 	if _, ok := g.Node(endpoint.ID); !ok {
 		t.Fatalf("endpoint node %q not found", endpoint.ID)
@@ -758,7 +1058,10 @@ func TestAddRoutesIngressSelectorMismatchCreatesNoRoute(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 1, 0, 0)
+	assertGraphCounts(t, g, 3, 1, 1)
+	assertNodeKindCount(t, g, graph.PublicEndpoint, 1)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 0)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesIngressMatchesDeploymentPodTemplateLabels(t *testing.T) {
@@ -806,7 +1109,9 @@ spec:
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func TestAddRoutesIngressEvidenceIdentifiesSources(t *testing.T) {
@@ -825,13 +1130,13 @@ func TestAddRoutesIngressEvidenceIdentifiesSources(t *testing.T) {
 		t.Fatalf("workload evidence = %#v", workload.Evidence)
 	}
 
-	edges := g.Edges()
-	if len(edges) != 1 {
-		t.Fatalf("edge count = %d, want 1", len(edges))
+	routeEdges := edgesOfKind(g, graph.RoutesTo)
+	if len(routeEdges) != 1 {
+		t.Fatalf("route edge count = %d, want 1", len(routeEdges))
 	}
 	for _, want := range []string{"ingress ingress.yaml#document=1", "service service.yaml#document=1", "deployment deployment.yaml#document=1"} {
-		if !strings.Contains(edges[0].Evidence.Source, want) {
-			t.Fatalf("edge evidence source = %q, want %q", edges[0].Evidence.Source, want)
+		if !strings.Contains(routeEdges[0].Evidence.Source, want) {
+			t.Fatalf("edge evidence source = %q, want %q", routeEdges[0].Evidence.Source, want)
 		}
 	}
 }
@@ -858,8 +1163,8 @@ func TestAddRoutesIngressTwoServicesSameDeploymentCreateOneEdgeWithBothServiceSo
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
-	evidence := g.Edges()[0].Evidence.Source
+	assertGraphCounts(t, g, 3, 1, 2)
+	evidence := edgesOfKind(g, graph.RoutesTo)[0].Evidence.Source
 	for _, want := range []string{"service api-service.yaml#document=1", "service api-v2-service.yaml#document=1"} {
 		if !strings.Contains(evidence, want) {
 			t.Fatalf("edge evidence source = %q, want %q", evidence, want)
@@ -916,8 +1221,8 @@ func TestAddRoutesIngressRepeatedServiceReferencesDoNotDuplicateEvidence(t *test
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
-	evidence := g.Edges()[0].Evidence.Source
+	assertGraphCounts(t, g, 3, 1, 2)
+	evidence := edgesOfKind(g, graph.RoutesTo)[0].Evidence.Source
 	if got := strings.Count(evidence, "ingress ingress.yaml#document=1"); got != 1 {
 		t.Fatalf("ingress evidence occurrence count = %d, want 1 in %q", got, evidence)
 	}
@@ -940,7 +1245,9 @@ func TestAddRoutesFixturePublicRoute(t *testing.T) {
 		t.Fatalf("add routes: %v", err)
 	}
 
-	assertGraphCounts(t, g, 2, 1, 1)
+	assertGraphCounts(t, g, 3, 1, 2)
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
 }
 
 func routeResources(serviceType string) parserkubernetes.Resources {
@@ -980,10 +1287,11 @@ func service(namespace, name, serviceType string, selector map[string]string, fi
 
 func deployment(namespace, name string, podLabels map[string]string, filename string, document int) parserkubernetes.Deployment {
 	return parserkubernetes.Deployment{
-		Namespace: namespace,
-		Name:      name,
-		PodLabels: podLabels,
-		Source:    parserkubernetes.Source{Filename: filename, Document: document},
+		Namespace:          namespace,
+		Name:               name,
+		PodLabels:          podLabels,
+		ServiceAccountName: "default",
+		Source:             parserkubernetes.Source{Filename: filename, Document: document},
 	}
 }
 
@@ -994,6 +1302,19 @@ func ingress(namespace, name string, backends []parserkubernetes.IngressBackend,
 		Backends:  backends,
 		Source:    parserkubernetes.Source{Filename: filename, Document: document},
 	}
+}
+
+func serviceAccount(namespace, name string, automount *bool, filename string, document int) parserkubernetes.ServiceAccount {
+	return parserkubernetes.ServiceAccount{
+		Namespace:                    namespace,
+		Name:                         name,
+		AutomountServiceAccountToken: automount,
+		Source:                       parserkubernetes.Source{Filename: filename, Document: document},
+	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func assertGraphCounts(t *testing.T, g *graph.Graph, nodes, workloads, edges int) {
@@ -1018,6 +1339,39 @@ func assertGraphCounts(t *testing.T, g *graph.Graph, nodes, workloads, edges int
 	if len(gotEdges) != edges {
 		t.Fatalf("edge count = %d, want %d: %#v", len(gotEdges), edges, gotEdges)
 	}
+}
+
+func assertNodeKindCount(t *testing.T, g *graph.Graph, kind graph.NodeKind, want int) {
+	t.Helper()
+
+	got := 0
+	for _, node := range g.Nodes() {
+		if node.Kind == kind {
+			got++
+		}
+	}
+	if got != want {
+		t.Fatalf("%s node count = %d, want %d: %#v", kind, got, want, g.Nodes())
+	}
+}
+
+func assertEdgeKindCount(t *testing.T, g *graph.Graph, kind graph.EdgeKind, want int) {
+	t.Helper()
+
+	got := len(edgesOfKind(g, kind))
+	if got != want {
+		t.Fatalf("%s edge count = %d, want %d: %#v", kind, got, want, g.Edges())
+	}
+}
+
+func edgesOfKind(g *graph.Graph, kind graph.EdgeKind) []graph.Edge {
+	var edges []graph.Edge
+	for _, edge := range g.Edges() {
+		if edge.Kind == kind {
+			edges = append(edges, edge)
+		}
+	}
+	return edges
 }
 
 func mustGraphJSON(t *testing.T, resources parserkubernetes.Resources) []byte {

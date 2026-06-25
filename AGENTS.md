@@ -63,7 +63,9 @@ Before reporting completion:
 7. Inspect the complete Git diff.
 8. Review for correctness, security, unnecessary complexity, and missing
    negative tests.
-9. Report every validation command and whether it passed.
+9. Update documentation for final implemented behavior and current limitations:
+   architecture, graph schema, testing, roadmap, and README when affected.
+10. Report every validation command and whether it passed.
 
 ## Standard commands
 
@@ -86,5 +88,7 @@ A task is complete only when:
 - Output is deterministic where required.
 - Errors are actionable.
 - No unrelated files changed.
+- Required documentation is updated to match the implemented behavior and
+  current limitations.
 - No unexplained TODO placeholders remain.
 - No deferred feature was implemented accidentally.

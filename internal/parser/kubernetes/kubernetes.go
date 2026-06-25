@@ -12,9 +12,10 @@ import (
 )
 
 type Resources struct {
-	Services    []Service
-	Deployments []Deployment
-	Ingresses   []Ingress
+	Services        []Service
+	Deployments     []Deployment
+	Ingresses       []Ingress
+	ServiceAccounts []ServiceAccount
 }
 
 type Source struct {
@@ -31,10 +32,11 @@ type Service struct {
 }
 
 type Deployment struct {
-	Namespace string
-	Name      string
-	PodLabels map[string]string
-	Source    Source
+	Namespace          string
+	Name               string
+	PodLabels          map[string]string
+	ServiceAccountName string
+	Source             Source
 }
 
 type Ingress struct {
@@ -47,6 +49,13 @@ type Ingress struct {
 type IngressBackend struct {
 	Kind        string
 	ServiceName string
+}
+
+type ServiceAccount struct {
+	Namespace                    string
+	Name                         string
+	AutomountServiceAccountToken *bool
+	Source                       Source
 }
 
 func ParseDir(dir string) (Resources, error) {
@@ -77,6 +86,7 @@ func ParseDir(dir string) (Resources, error) {
 		resources.Services = append(resources.Services, fileResources.Services...)
 		resources.Deployments = append(resources.Deployments, fileResources.Deployments...)
 		resources.Ingresses = append(resources.Ingresses, fileResources.Ingresses...)
+		resources.ServiceAccounts = append(resources.ServiceAccounts, fileResources.ServiceAccounts...)
 	}
 
 	sortResources(resources)
@@ -135,10 +145,11 @@ func parseDocuments(r io.Reader, filename string) (Resources, error) {
 				return Resources{}, fmt.Errorf("parse kubernetes Deployment %q document %d: %w", filename, document, err)
 			}
 			resources.Deployments = append(resources.Deployments, Deployment{
-				Namespace: namespaceOrDefault(manifest.Metadata.Namespace),
-				Name:      manifest.Metadata.Name,
-				PodLabels: copyMap(manifest.Spec.Template.Metadata.Labels),
-				Source:    source,
+				Namespace:          namespaceOrDefault(manifest.Metadata.Namespace),
+				Name:               manifest.Metadata.Name,
+				PodLabels:          copyMap(manifest.Spec.Template.Metadata.Labels),
+				ServiceAccountName: serviceAccountNameOrDefault(manifest.Spec.Template.Spec.ServiceAccountName),
+				Source:             source,
 			})
 		case "Ingress":
 			if meta.APIVersion != "networking.k8s.io/v1" {
@@ -153,6 +164,20 @@ func parseDocuments(r io.Reader, filename string) (Resources, error) {
 				Name:      manifest.Metadata.Name,
 				Backends:  ingressBackends(manifest.Spec),
 				Source:    source,
+			})
+		case "ServiceAccount":
+			if meta.APIVersion != "v1" {
+				continue
+			}
+			var manifest serviceAccountManifest
+			if err := documentNode.Decode(&manifest); err != nil {
+				return Resources{}, fmt.Errorf("parse kubernetes ServiceAccount %q document %d: %w", filename, document, err)
+			}
+			resources.ServiceAccounts = append(resources.ServiceAccounts, ServiceAccount{
+				Namespace:                    namespaceOrDefault(manifest.Metadata.Namespace),
+				Name:                         manifest.Metadata.Name,
+				AutomountServiceAccountToken: manifest.AutomountServiceAccountToken,
+				Source:                       source,
 			})
 		}
 	}
@@ -169,6 +194,9 @@ func sortResources(resources Resources) {
 	})
 	sort.SliceStable(resources.Ingresses, func(i, j int) bool {
 		return ingressLess(resources.Ingresses[i], resources.Ingresses[j])
+	})
+	sort.SliceStable(resources.ServiceAccounts, func(i, j int) bool {
+		return serviceAccountLess(resources.ServiceAccounts[i], resources.ServiceAccounts[j])
 	})
 }
 
@@ -202,6 +230,16 @@ func ingressLess(a, b Ingress) bool {
 	return sourceLess(a.Source, b.Source)
 }
 
+func serviceAccountLess(a, b ServiceAccount) bool {
+	if a.Namespace != b.Namespace {
+		return a.Namespace < b.Namespace
+	}
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	return sourceLess(a.Source, b.Source)
+}
+
 func sourceLess(a, b Source) bool {
 	if a.Filename != b.Filename {
 		return a.Filename < b.Filename
@@ -214,6 +252,13 @@ func namespaceOrDefault(namespace string) string {
 		return "default"
 	}
 	return namespace
+}
+
+func serviceAccountNameOrDefault(name string) string {
+	if name == "" {
+		return "default"
+	}
+	return name
 }
 
 func copyMap(in map[string]string) map[string]string {
@@ -247,6 +292,11 @@ type ingressManifest struct {
 	Spec     ingressSpec `yaml:"spec"`
 }
 
+type serviceAccountManifest struct {
+	Metadata                     metadata `yaml:"metadata"`
+	AutomountServiceAccountToken *bool    `yaml:"automountServiceAccountToken"`
+}
+
 type metadata struct {
 	Name      string            `yaml:"name"`
 	Namespace string            `yaml:"namespace"`
@@ -264,6 +314,11 @@ type deploymentSpec struct {
 
 type template struct {
 	Metadata metadata `yaml:"metadata"`
+	Spec     podSpec  `yaml:"spec"`
+}
+
+type podSpec struct {
+	ServiceAccountName string `yaml:"serviceAccountName"`
 }
 
 type ingressSpec struct {
