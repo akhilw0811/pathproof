@@ -141,19 +141,31 @@ func TestGraphAddNodeAssignsEmptyCanonicalIDs(t *testing.T) {
 	g := New()
 
 	workload := mustAddNode(t, g, Node{Kind: Workload, Name: "orders-api"})
+	role := mustAddNode(t, g, Node{Kind: Role, Name: "orders-role"})
+	permission := mustAddNode(t, g, Node{Kind: Permission, Name: "read-secrets"})
 	secret := mustAddNode(t, g, Node{Kind: Secret, Name: "database-password"})
 
 	if workload.ID != NewNode(Workload, "orders-api").ID {
 		t.Fatalf("workload ID = %q, want canonical ID", workload.ID)
 	}
+	if role.ID != NewNode(Role, "orders-role").ID {
+		t.Fatalf("role ID = %q, want canonical ID", role.ID)
+	}
+	if permission.ID != NewNode(Permission, "read-secrets").ID {
+		t.Fatalf("permission ID = %q, want canonical ID", permission.ID)
+	}
 	if secret.ID != NewNode(Secret, "database-password").ID {
 		t.Fatalf("secret ID = %q, want canonical ID", secret.ID)
 	}
-	if workload.ID == secret.ID {
-		t.Fatalf("distinct empty-ID nodes collided on ID %q", workload.ID)
+	seen := map[NodeID]struct{}{}
+	for _, node := range []Node{workload, role, permission, secret} {
+		if _, exists := seen[node.ID]; exists {
+			t.Fatalf("distinct empty-ID nodes collided on ID %q", node.ID)
+		}
+		seen[node.ID] = struct{}{}
 	}
-	if got := g.Nodes(); len(got) != 2 {
-		t.Fatalf("node count = %d, want 2", len(got))
+	if got := g.Nodes(); len(got) != 4 {
+		t.Fatalf("node count = %d, want 4", len(got))
 	}
 }
 
@@ -352,6 +364,8 @@ func TestGraphAddEdgeEmptyIDDuplicatePreservesExistingEvidence(t *testing.T) {
 
 func TestGraphAddEdgeAssignsEmptyCanonicalIDs(t *testing.T) {
 	g, endpoint, workload, serviceAccount, _ := exampleGraphNodes(t)
+	role := mustAddNode(t, g, NewNode(Role, "orders-role"))
+	permission := mustAddNode(t, g, NewNode(Permission, "read-secrets"))
 
 	routesTo := mustAddEdge(t, g, Edge{
 		Kind:     RoutesTo,
@@ -365,6 +379,18 @@ func TestGraphAddEdgeAssignsEmptyCanonicalIDs(t *testing.T) {
 		To:       serviceAccount.ID,
 		Evidence: SourceEvidence{Source: "fixture", Detail: "service account"},
 	})
+	boundTo := mustAddEdge(t, g, Edge{
+		Kind:     BoundTo,
+		From:     serviceAccount.ID,
+		To:       role.ID,
+		Evidence: SourceEvidence{Source: "fixture", Detail: "role binding"},
+	})
+	grantsPermission := mustAddEdge(t, g, Edge{
+		Kind:     GrantsPermission,
+		From:     role.ID,
+		To:       permission.ID,
+		Evidence: SourceEvidence{Source: "fixture", Detail: "role rule"},
+	})
 
 	if routesTo.ID != NewEdge(RoutesTo, endpoint.ID, workload.ID, routesTo.Evidence).ID {
 		t.Fatalf("routesTo ID = %q, want canonical ID", routesTo.ID)
@@ -372,11 +398,21 @@ func TestGraphAddEdgeAssignsEmptyCanonicalIDs(t *testing.T) {
 	if runsAs.ID != NewEdge(RunsAs, workload.ID, serviceAccount.ID, runsAs.Evidence).ID {
 		t.Fatalf("runsAs ID = %q, want canonical ID", runsAs.ID)
 	}
-	if routesTo.ID == runsAs.ID {
-		t.Fatalf("distinct empty-ID edges collided on ID %q", routesTo.ID)
+	if boundTo.ID != NewEdge(BoundTo, serviceAccount.ID, role.ID, boundTo.Evidence).ID {
+		t.Fatalf("boundTo ID = %q, want canonical ID", boundTo.ID)
 	}
-	if got := g.Edges(); len(got) != 2 {
-		t.Fatalf("edge count = %d, want 2", len(got))
+	if grantsPermission.ID != NewEdge(GrantsPermission, role.ID, permission.ID, grantsPermission.Evidence).ID {
+		t.Fatalf("grantsPermission ID = %q, want canonical ID", grantsPermission.ID)
+	}
+	seen := map[EdgeID]struct{}{}
+	for _, edge := range []Edge{routesTo, runsAs, boundTo, grantsPermission} {
+		if _, exists := seen[edge.ID]; exists {
+			t.Fatalf("distinct empty-ID edges collided on ID %q", edge.ID)
+		}
+		seen[edge.ID] = struct{}{}
+	}
+	if got := g.Edges(); len(got) != 4 {
+		t.Fatalf("edge count = %d, want 4", len(got))
 	}
 }
 
