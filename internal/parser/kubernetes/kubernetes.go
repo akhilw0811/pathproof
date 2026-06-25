@@ -14,6 +14,7 @@ import (
 type Resources struct {
 	Services    []Service
 	Deployments []Deployment
+	Ingresses   []Ingress
 }
 
 type Source struct {
@@ -34,6 +35,18 @@ type Deployment struct {
 	Name      string
 	PodLabels map[string]string
 	Source    Source
+}
+
+type Ingress struct {
+	Namespace string
+	Name      string
+	Backends  []IngressBackend
+	Source    Source
+}
+
+type IngressBackend struct {
+	Kind        string
+	ServiceName string
 }
 
 func ParseDir(dir string) (Resources, error) {
@@ -63,6 +76,7 @@ func ParseDir(dir string) (Resources, error) {
 		}
 		resources.Services = append(resources.Services, fileResources.Services...)
 		resources.Deployments = append(resources.Deployments, fileResources.Deployments...)
+		resources.Ingresses = append(resources.Ingresses, fileResources.Ingresses...)
 	}
 
 	sortResources(resources)
@@ -126,6 +140,20 @@ func parseDocuments(r io.Reader, filename string) (Resources, error) {
 				PodLabels: copyMap(manifest.Spec.Template.Metadata.Labels),
 				Source:    source,
 			})
+		case "Ingress":
+			if meta.APIVersion != "networking.k8s.io/v1" {
+				continue
+			}
+			var manifest ingressManifest
+			if err := documentNode.Decode(&manifest); err != nil {
+				return Resources{}, fmt.Errorf("parse kubernetes Ingress %q document %d: %w", filename, document, err)
+			}
+			resources.Ingresses = append(resources.Ingresses, Ingress{
+				Namespace: namespaceOrDefault(manifest.Metadata.Namespace),
+				Name:      manifest.Metadata.Name,
+				Backends:  ingressBackends(manifest.Spec),
+				Source:    source,
+			})
 		}
 	}
 
@@ -138,6 +166,9 @@ func sortResources(resources Resources) {
 	})
 	sort.SliceStable(resources.Deployments, func(i, j int) bool {
 		return deploymentLess(resources.Deployments[i], resources.Deployments[j])
+	})
+	sort.SliceStable(resources.Ingresses, func(i, j int) bool {
+		return ingressLess(resources.Ingresses[i], resources.Ingresses[j])
 	})
 }
 
@@ -152,6 +183,16 @@ func serviceLess(a, b Service) bool {
 }
 
 func deploymentLess(a, b Deployment) bool {
+	if a.Namespace != b.Namespace {
+		return a.Namespace < b.Namespace
+	}
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	return sourceLess(a.Source, b.Source)
+}
+
+func ingressLess(a, b Ingress) bool {
 	if a.Namespace != b.Namespace {
 		return a.Namespace < b.Namespace
 	}
@@ -201,6 +242,11 @@ type deploymentManifest struct {
 	Spec     deploymentSpec `yaml:"spec"`
 }
 
+type ingressManifest struct {
+	Metadata metadata    `yaml:"metadata"`
+	Spec     ingressSpec `yaml:"spec"`
+}
+
 type metadata struct {
 	Name      string            `yaml:"name"`
 	Namespace string            `yaml:"namespace"`
@@ -218,4 +264,45 @@ type deploymentSpec struct {
 
 type template struct {
 	Metadata metadata `yaml:"metadata"`
+}
+
+type ingressSpec struct {
+	DefaultBackend ingressBackendManifest `yaml:"defaultBackend"`
+	Rules          []ingressRule          `yaml:"rules"`
+}
+
+type ingressRule struct {
+	HTTP ingressHTTPRule `yaml:"http"`
+}
+
+type ingressHTTPRule struct {
+	Paths []ingressPath `yaml:"paths"`
+}
+
+type ingressPath struct {
+	Backend ingressBackendManifest `yaml:"backend"`
+}
+
+type ingressBackendManifest struct {
+	Service ingressBackendService `yaml:"service"`
+}
+
+type ingressBackendService struct {
+	Name string `yaml:"name"`
+}
+
+func ingressBackends(spec ingressSpec) []IngressBackend {
+	var backends []IngressBackend
+	if spec.DefaultBackend.Service.Name != "" {
+		backends = append(backends, IngressBackend{Kind: "default", ServiceName: spec.DefaultBackend.Service.Name})
+	}
+	for _, rule := range spec.Rules {
+		for _, path := range rule.HTTP.Paths {
+			if path.Backend.Service.Name == "" {
+				continue
+			}
+			backends = append(backends, IngressBackend{Kind: "rule", ServiceName: path.Backend.Service.Name})
+		}
+	}
+	return backends
 }

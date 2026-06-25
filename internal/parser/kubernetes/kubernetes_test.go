@@ -497,6 +497,243 @@ spec:
 	}
 }
 
+func TestParseDirParsesValidNetworkingV1Ingress(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "ingress.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: public-api
+  namespace: prod
+spec:
+  rules:
+  - http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: api
+            port:
+              number: 80
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Ingress{{
+		Namespace: "prod",
+		Name:      "public-api",
+		Backends:  []IngressBackend{{Kind: "rule", ServiceName: "api"}},
+		Source:    Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Ingresses, want) {
+		t.Fatalf("ingresses = %#v, want %#v", resources.Ingresses, want)
+	}
+}
+
+func TestParseDirParsesIngressRuleBackendServiceName(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "ingress.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: public-api
+spec:
+  rules:
+  - http:
+      paths:
+      - backend:
+          service:
+            name: api
+      - backend:
+          service:
+            name: worker
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Ingress{{
+		Namespace: "default",
+		Name:      "public-api",
+		Backends: []IngressBackend{
+			{Kind: "rule", ServiceName: "api"},
+			{Kind: "rule", ServiceName: "worker"},
+		},
+		Source: Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Ingresses, want) {
+		t.Fatalf("ingresses = %#v, want %#v", resources.Ingresses, want)
+	}
+}
+
+func TestParseDirParsesIngressDefaultBackendServiceName(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "ingress.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: public-api
+spec:
+  defaultBackend:
+    service:
+      name: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Ingress{{
+		Namespace: "default",
+		Name:      "public-api",
+		Backends:  []IngressBackend{{Kind: "default", ServiceName: "api"}},
+		Source:    Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Ingresses, want) {
+		t.Fatalf("ingresses = %#v, want %#v", resources.Ingresses, want)
+	}
+}
+
+func TestParseDirDefaultsIngressNamespaceToDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "ingress.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: public-api
+spec:
+  defaultBackend:
+    service:
+      name: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got := resources.Ingresses[0].Namespace; got != "default" {
+		t.Fatalf("namespace = %q, want default", got)
+	}
+}
+
+func TestParseDirIgnoresLegacyIngressBeforeTypedDecode(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "legacy-ingress.yaml", `apiVersion: networking.k8s.io/v1beta1
+kind: Ingress
+metadata:
+  name: legacy
+spec:
+  backend:
+    serviceName: api
+    servicePort: 80
+  rules:
+  - http:
+      paths:
+      - backend:
+          serviceName: api
+          servicePort: 80
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want legacy Ingress skipped", resources)
+	}
+}
+
+func TestParseDirIgnoresIngressUnsupportedBackendsAndEmptyServiceNames(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "ingress.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: public-api
+spec:
+  defaultBackend:
+    resource:
+      apiGroup: example.io
+      kind: StorageBucket
+      name: static-assets
+  rules:
+  - http:
+      paths:
+      - backend:
+          resource:
+            apiGroup: example.io
+            kind: StorageBucket
+            name: static-assets
+      - backend:
+          service:
+            name: ""
+      - backend:
+          service:
+            name: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Ingress{{
+		Namespace: "default",
+		Name:      "public-api",
+		Backends:  []IngressBackend{{Kind: "rule", ServiceName: "api"}},
+		Source:    Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Ingresses, want) {
+		t.Fatalf("ingresses = %#v, want %#v", resources.Ingresses, want)
+	}
+}
+
+func TestParseDirMalformedIngressYAMLReturnsActionableError(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "bad-ingress.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: [
+`)
+
+	resources, err := ParseDir(dir)
+	if err == nil {
+		t.Fatal("parse dir error = nil, want malformed YAML error")
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want empty result on error", resources)
+	}
+	if got := err.Error(); !strings.Contains(got, path) || !strings.Contains(got, "document 1") {
+		t.Fatalf("error = %q, want filename and document", got)
+	}
+}
+
+func TestParseDirMalformedIngressSupportedBackendReturnsActionableError(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "bad-ingress.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: public-api
+spec:
+  defaultBackend:
+    service:
+    - name: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err == nil {
+		t.Fatal("parse dir error = nil, want malformed Ingress backend error")
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want empty result on error", resources)
+	}
+	if got := err.Error(); !strings.Contains(got, path) || !strings.Contains(got, "Ingress") || !strings.Contains(got, "document 1") {
+		t.Fatalf("error = %q, want filename, Ingress kind, and document", got)
+	}
+}
+
 func writeManifest(t *testing.T, dir, name, content string) string {
 	t.Helper()
 

@@ -522,6 +522,413 @@ func TestAddRoutesConflictingResourcesCannotCreateUnionOfRoutes(t *testing.T) {
 	assertGraphCounts(t, g, 0, 0, 0)
 }
 
+func TestAddRoutesIdenticalDuplicateIngressesAreAccepted(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "api"}}, "a-ingress.yaml", 1),
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "api"}}, "z-ingress.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 1, 0, 0)
+}
+
+func TestAddRoutesDuplicateIngressesWithReversedBackendOrderAreAccepted(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "rule", ServiceName: "api"},
+				{Kind: "default", ServiceName: "fallback"},
+			}, "a-ingress.yaml", 1),
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "default", ServiceName: "fallback"},
+				{Kind: "rule", ServiceName: "api"},
+			}, "z-ingress.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 1, 0, 0)
+}
+
+func TestAddRoutesDuplicateIngressesWithRepeatedBackendReferencesAreAccepted(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "rule", ServiceName: "api"},
+				{Kind: "default", ServiceName: "fallback"},
+			}, "a-ingress.yaml", 1),
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "rule", ServiceName: "api"},
+				{Kind: "rule", ServiceName: "api"},
+				{Kind: "default", ServiceName: "fallback"},
+			}, "z-ingress.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 1, 0, 0)
+}
+
+func TestAddRoutesDuplicateIngressesPreserveRuleAndDefaultBackendDistinction(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "api"}}, "a-ingress.yaml", 1),
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "default", ServiceName: "api"}}, "z-ingress.yaml", 1),
+		},
+	}
+
+	err := AddRoutes(g, resources)
+	if err == nil {
+		t.Fatal("add routes error = nil, want duplicate Ingress conflict")
+	}
+	assertConflictError(t, err, "Ingress", "prod/public-api", "a-ingress.yaml#document=1", "z-ingress.yaml#document=1")
+	assertGraphCounts(t, g, 0, 0, 0)
+}
+
+func TestAddRoutesRejectsDuplicateIngressWithDifferentCanonicalBackendSet(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "api"}}, "a-ingress.yaml", 1),
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "admin"}}, "z-ingress.yaml", 1),
+		},
+	}
+
+	err := AddRoutes(g, resources)
+	if err == nil {
+		t.Fatal("add routes error = nil, want duplicate Ingress conflict")
+	}
+	assertConflictError(t, err, "Ingress", "prod/public-api", "a-ingress.yaml#document=1", "z-ingress.yaml#document=1")
+	assertGraphCounts(t, g, 0, 0, 0)
+}
+
+func TestAddRoutesDuplicateIngressConflictLeavesPreviouslyPopulatedGraphUnchanged(t *testing.T) {
+	g := graph.New()
+	if err := AddRoutes(g, routeResources("LoadBalancer")); err != nil {
+		t.Fatalf("seed graph: %v", err)
+	}
+	before := mustMarshalGraph(t, g)
+
+	conflict := parserkubernetes.Resources{
+		Services:    routeResources("LoadBalancer").Services,
+		Deployments: routeResources("LoadBalancer").Deployments,
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "api"}}, "a-ingress.yaml", 1),
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "admin"}}, "z-ingress.yaml", 1),
+		},
+	}
+	if err := AddRoutes(g, conflict); err == nil {
+		t.Fatal("add routes error = nil, want duplicate Ingress conflict")
+	}
+
+	after := mustMarshalGraph(t, g)
+	if string(after) != string(before) {
+		t.Fatalf("graph changed after failed AddRoutes:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+func TestAddRoutesIngressToClusterIPServiceCreatesRouteToWorkload(t *testing.T) {
+	g := graph.New()
+	resources := ingressRouteResources()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	endpoint := graph.NewNode(graph.PublicEndpoint, "kubernetes://prod/ingress/public-api")
+	workload := graph.NewNode(graph.Workload, "kubernetes://prod/deployment/api")
+	if _, ok := g.Node(endpoint.ID); !ok {
+		t.Fatalf("endpoint node %q not found", endpoint.ID)
+	}
+	if _, ok := g.Node(workload.ID); !ok {
+		t.Fatalf("workload node %q not found", workload.ID)
+	}
+	edge := g.Edges()[0]
+	if edge.From != endpoint.ID || edge.To != workload.ID {
+		t.Fatalf("edge endpoints = %q -> %q, want %q -> %q", edge.From, edge.To, endpoint.ID, workload.ID)
+	}
+}
+
+func TestAddRoutesIngressMultiplePathsSameServiceDeduplicateRoute(t *testing.T) {
+	g := graph.New()
+	resources := ingressRouteResources()
+	resources.Ingresses[0].Backends = []parserkubernetes.IngressBackend{
+		{Kind: "rule", ServiceName: "api"},
+		{Kind: "rule", ServiceName: "api"},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	if got := strings.Count(g.Edges()[0].Evidence.Source, "service service.yaml#document=1"); got != 1 {
+		t.Fatalf("service evidence occurrence count = %d, want 1 in %q", got, g.Edges()[0].Evidence.Source)
+	}
+}
+
+func TestAddRoutesIngressMultiplePathsDifferentServicesResolveCorrectly(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Services: []parserkubernetes.Service{
+			service("prod", "api", "ClusterIP", map[string]string{"app": "api"}, "api-service.yaml", 1),
+			service("prod", "worker", "ClusterIP", map[string]string{"app": "worker"}, "worker-service.yaml", 1),
+		},
+		Deployments: []parserkubernetes.Deployment{
+			deployment("prod", "api", map[string]string{"app": "api"}, "api-deployment.yaml", 1),
+			deployment("prod", "worker", map[string]string{"app": "worker"}, "worker-deployment.yaml", 1),
+		},
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "rule", ServiceName: "api"},
+				{Kind: "rule", ServiceName: "worker"},
+			}, "ingress.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 3, 2, 2)
+}
+
+func TestAddRoutesIngressResolvesServicesOnlyInSameNamespace(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Services: []parserkubernetes.Service{
+			service("staging", "api", "ClusterIP", map[string]string{"app": "api"}, "staging-service.yaml", 1),
+		},
+		Deployments: []parserkubernetes.Deployment{
+			deployment("staging", "api", map[string]string{"app": "api"}, "staging-deployment.yaml", 1),
+		},
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "api"}}, "ingress.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 1, 0, 0)
+	endpoint := graph.NewNode(graph.PublicEndpoint, "kubernetes://prod/ingress/public-api")
+	if _, ok := g.Node(endpoint.ID); !ok {
+		t.Fatalf("endpoint node %q not found", endpoint.ID)
+	}
+}
+
+func TestAddRoutesIngressMissingReferencedServiceCreatesOnlyEndpoint(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "missing"}}, "ingress.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 1, 0, 0)
+}
+
+func TestAddRoutesIngressSelectorMismatchCreatesNoRoute(t *testing.T) {
+	g := graph.New()
+	resources := ingressRouteResources()
+	resources.Services[0].Selector = map[string]string{"app": "worker"}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 1, 0, 0)
+}
+
+func TestAddRoutesIngressMatchesDeploymentPodTemplateLabels(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "resources.yaml", `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: public-api
+  namespace: prod
+spec:
+  defaultBackend:
+    service:
+      name: api
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: prod
+spec:
+  type: ClusterIP
+  selector:
+    app: api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+  labels:
+    app: metadata-only
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+`)
+	resources, err := parserkubernetes.ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+}
+
+func TestAddRoutesIngressEvidenceIdentifiesSources(t *testing.T) {
+	g := graph.New()
+
+	if err := AddRoutes(g, ingressRouteResources()); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	endpoint := mustNode(t, g, graph.NewNode(graph.PublicEndpoint, "kubernetes://prod/ingress/public-api").ID)
+	workload := mustNode(t, g, graph.NewNode(graph.Workload, "kubernetes://prod/deployment/api").ID)
+	if !reflect.DeepEqual(endpoint.Evidence, []graph.SourceEvidence{{Source: "ingress.yaml#document=1", Detail: "kubernetes Ingress"}}) {
+		t.Fatalf("endpoint evidence = %#v", endpoint.Evidence)
+	}
+	if !reflect.DeepEqual(workload.Evidence, []graph.SourceEvidence{{Source: "deployment.yaml#document=1", Detail: "kubernetes Deployment"}}) {
+		t.Fatalf("workload evidence = %#v", workload.Evidence)
+	}
+
+	edges := g.Edges()
+	if len(edges) != 1 {
+		t.Fatalf("edge count = %d, want 1", len(edges))
+	}
+	for _, want := range []string{"ingress ingress.yaml#document=1", "service service.yaml#document=1", "deployment deployment.yaml#document=1"} {
+		if !strings.Contains(edges[0].Evidence.Source, want) {
+			t.Fatalf("edge evidence source = %q, want %q", edges[0].Evidence.Source, want)
+		}
+	}
+}
+
+func TestAddRoutesIngressTwoServicesSameDeploymentCreateOneEdgeWithBothServiceSources(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Services: []parserkubernetes.Service{
+			service("prod", "api", "ClusterIP", map[string]string{"app": "api"}, "api-service.yaml", 1),
+			service("prod", "api-v2", "ClusterIP", map[string]string{"app": "api"}, "api-v2-service.yaml", 1),
+		},
+		Deployments: []parserkubernetes.Deployment{
+			deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1),
+		},
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "rule", ServiceName: "api"},
+				{Kind: "rule", ServiceName: "api-v2"},
+			}, "ingress.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	evidence := g.Edges()[0].Evidence.Source
+	for _, want := range []string{"service api-service.yaml#document=1", "service api-v2-service.yaml#document=1"} {
+		if !strings.Contains(evidence, want) {
+			t.Fatalf("edge evidence source = %q, want %q", evidence, want)
+		}
+	}
+}
+
+func TestAddRoutesIngressEvidenceAndJSONDeterministicWhenInputOrderChanges(t *testing.T) {
+	forward := parserkubernetes.Resources{
+		Services: []parserkubernetes.Service{
+			service("prod", "api", "ClusterIP", map[string]string{"app": "api"}, "api-service.yaml", 1),
+			service("prod", "api-v2", "ClusterIP", map[string]string{"app": "api"}, "api-v2-service.yaml", 1),
+		},
+		Deployments: []parserkubernetes.Deployment{
+			deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1),
+		},
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "rule", ServiceName: "api"},
+				{Kind: "rule", ServiceName: "api-v2"},
+			}, "ingress.yaml", 1),
+		},
+	}
+	reverse := parserkubernetes.Resources{
+		Services: []parserkubernetes.Service{forward.Services[1], forward.Services[0]},
+		Deployments: []parserkubernetes.Deployment{
+			forward.Deployments[0],
+		},
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{
+				{Kind: "rule", ServiceName: "api-v2"},
+				{Kind: "rule", ServiceName: "api"},
+			}, "ingress.yaml", 1),
+		},
+	}
+
+	firstJSON := mustGraphJSON(t, forward)
+	secondJSON := mustGraphJSON(t, reverse)
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("json differs by input order:\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
+	}
+}
+
+func TestAddRoutesIngressRepeatedServiceReferencesDoNotDuplicateEvidence(t *testing.T) {
+	g := graph.New()
+	resources := ingressRouteResources()
+	resources.Ingresses[0].Backends = []parserkubernetes.IngressBackend{
+		{Kind: "rule", ServiceName: "api"},
+		{Kind: "rule", ServiceName: "api"},
+		{Kind: "rule", ServiceName: "api"},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertGraphCounts(t, g, 2, 1, 1)
+	evidence := g.Edges()[0].Evidence.Source
+	if got := strings.Count(evidence, "ingress ingress.yaml#document=1"); got != 1 {
+		t.Fatalf("ingress evidence occurrence count = %d, want 1 in %q", got, evidence)
+	}
+	if got := strings.Count(evidence, "service service.yaml#document=1"); got != 1 {
+		t.Fatalf("service evidence occurrence count = %d, want 1 in %q", got, evidence)
+	}
+	if got := strings.Count(evidence, "deployment deployment.yaml#document=1"); got != 1 {
+		t.Fatalf("deployment evidence occurrence count = %d, want 1 in %q", got, evidence)
+	}
+}
+
 func TestAddRoutesFixturePublicRoute(t *testing.T) {
 	resources, err := parserkubernetes.ParseDir("testdata/public-route")
 	if err != nil {
@@ -547,6 +954,20 @@ func routeResources(serviceType string) parserkubernetes.Resources {
 	}
 }
 
+func ingressRouteResources() parserkubernetes.Resources {
+	return parserkubernetes.Resources{
+		Services: []parserkubernetes.Service{
+			service("prod", "api", "ClusterIP", map[string]string{"app": "api"}, "service.yaml", 1),
+		},
+		Deployments: []parserkubernetes.Deployment{
+			deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1),
+		},
+		Ingresses: []parserkubernetes.Ingress{
+			ingress("prod", "public-api", []parserkubernetes.IngressBackend{{Kind: "rule", ServiceName: "api"}}, "ingress.yaml", 1),
+		},
+	}
+}
+
 func service(namespace, name, serviceType string, selector map[string]string, filename string, document int) parserkubernetes.Service {
 	return parserkubernetes.Service{
 		Namespace: namespace,
@@ -562,6 +983,15 @@ func deployment(namespace, name string, podLabels map[string]string, filename st
 		Namespace: namespace,
 		Name:      name,
 		PodLabels: podLabels,
+		Source:    parserkubernetes.Source{Filename: filename, Document: document},
+	}
+}
+
+func ingress(namespace, name string, backends []parserkubernetes.IngressBackend, filename string, document int) parserkubernetes.Ingress {
+	return parserkubernetes.Ingress{
+		Namespace: namespace,
+		Name:      name,
+		Backends:  backends,
 		Source:    parserkubernetes.Source{Filename: filename, Document: document},
 	}
 }
