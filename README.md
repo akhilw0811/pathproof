@@ -9,7 +9,28 @@ broken.
 
 ## Current milestone
 
-Build a tested Go CLI and deterministic in-memory graph engine.
+Build a tested Go CLI bootstrap. Graph domain logic is not implemented yet.
+
+## Usage
+
+```sh
+go run ./cmd/pathproof version
+```
+
+Expected output:
+
+```text
+pathproof dev
+```
+
+## Development
+
+```sh
+make check
+make build
+```
+
+The built binary is written to `bin/pathproof`.
 
 ## Not currently in scope
 
