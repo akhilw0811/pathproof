@@ -1234,6 +1234,1043 @@ func TestAddRoutesIngressRepeatedServiceReferencesDoNotDuplicateEvidence(t *test
 	}
 }
 
+func TestAddRoutesRoleBindingConnectsSameNamespaceServiceAccountToRole(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles:        []parserkubernetes.Role{role("prod", "pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertNodeKindCount(t, g, graph.ServiceAccount, 1)
+	assertNodeKindCount(t, g, graph.Role, 1)
+	assertNodeKindCount(t, g, graph.Permission, 1)
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 1)
+	account := graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/api")
+	role := graph.NewNode(graph.Role, "kubernetes://prod/role/pod-reader")
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	if edge.From != account.ID || edge.To != role.ID {
+		t.Fatalf("bound-to endpoints = %q -> %q, want %q -> %q", edge.From, edge.To, account.ID, role.ID)
+	}
+}
+
+func TestAddRoutesRoleBindingCanBindCrossNamespaceServiceAccount(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles:        []parserkubernetes.Role{role("authz", "pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("authz", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	account := graph.NewNode(graph.ServiceAccount, "kubernetes://workloads/serviceaccount/api")
+	role := graph.NewNode(graph.Role, "kubernetes://authz/role/pod-reader")
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	if edge.From != account.ID || edge.To != role.ID {
+		t.Fatalf("bound-to endpoints = %q -> %q, want cross-namespace subject %q -> role %q", edge.From, edge.To, account.ID, role.ID)
+	}
+}
+
+func TestAddRoutesRoleBindingCanReferenceClusterRoleWithNamespaceScope(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "pod-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "role-binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	role := graph.NewNode(graph.Role, "kubernetes://cluster/clusterrole/pod-reader")
+	if _, ok := g.Node(role.ID); !ok {
+		t.Fatalf("cluster role graph node %q not found", role.ID)
+	}
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	for _, want := range []string{"binding_kind=RoleBinding", "binding_namespace=prod", "scope_kind=namespace", "scope_name=prod"} {
+		if !strings.Contains(edge.Evidence.Detail, want) {
+			t.Fatalf("bound-to evidence detail = %q, want %q", edge.Evidence.Detail, want)
+		}
+	}
+}
+
+func TestAddRoutesClusterRoleBindingConnectsServiceAccountToClusterRoleWithClusterScope(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "pod-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "cluster-role-binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	account := graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/api")
+	role := graph.NewNode(graph.Role, "kubernetes://cluster/clusterrole/pod-reader")
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	if edge.From != account.ID || edge.To != role.ID {
+		t.Fatalf("bound-to endpoints = %q -> %q, want %q -> %q", edge.From, edge.To, account.ID, role.ID)
+	}
+	for _, want := range []string{"binding_kind=ClusterRoleBinding", "scope_kind=cluster"} {
+		if !strings.Contains(edge.Evidence.Detail, want) {
+			t.Fatalf("bound-to evidence detail = %q, want %q", edge.Evidence.Detail, want)
+		}
+	}
+	if strings.Contains(edge.Evidence.Detail, "binding_namespace=") || strings.Contains(edge.Evidence.Detail, "scope_name=") {
+		t.Fatalf("cluster-scoped bound-to evidence detail = %q, want no namespace scope fields", edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesRoleBindingAndClusterRoleBindingScopeEvidenceAreDistinguishable(t *testing.T) {
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "pod-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "role-binding.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("read-pods-cluster", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "pod-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "worker")}, "cluster-role-binding.yaml", 1)},
+	}
+
+	g := graph.New()
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	edges := edgesOfKind(g, graph.BoundTo)
+	if len(edges) != 2 {
+		t.Fatalf("bound-to edge count = %d, want 2: %#v", len(edges), edges)
+	}
+	firstDetail := edges[0].Evidence.Detail
+	secondDetail := edges[1].Evidence.Detail
+	if firstDetail == secondDetail {
+		t.Fatalf("scope evidence details are identical: %q", firstDetail)
+	}
+	combined := firstDetail + "\n" + secondDetail
+	for _, want := range []string{"binding_kind=RoleBinding", "scope_kind=namespace", "binding_kind=ClusterRoleBinding", "scope_kind=cluster"} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("scope evidence details = %q, want %q", combined, want)
+		}
+	}
+
+	reversed := parserkubernetes.Resources{
+		ClusterRoleBindings: resources.ClusterRoleBindings,
+		RoleBindings:        resources.RoleBindings,
+		ClusterRoles:        resources.ClusterRoles,
+	}
+	if firstJSON, secondJSON := mustGraphJSON(t, resources), mustGraphJSON(t, reversed); string(firstJSON) != string(secondJSON) {
+		t.Fatalf("json differs by RBAC resource order:\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
+	}
+}
+
+func TestAddRoutesAggregatesRoleBindingScopesForSameServiceAccountAndClusterRole(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("team-a", "read-pods-a", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "a-binding.yaml", 1),
+			roleBinding("team-b", "read-pods-b", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=team-a", "binding_name=read-pods-a", "scope_kind=namespace", "scope_name=team-a", "binding_source=a-binding.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=team-b", "binding_name=read-pods-b", "scope_kind=namespace", "scope_name=team-b", "binding_source=b-binding.yaml#document=1")
+}
+
+func TestAddRoutesAggregatesRoleBindingAndClusterRoleBindingScopesForSameServiceAccountAndClusterRole(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "role-binding.yaml", 1),
+		},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{
+			clusterRoleBinding("read-pods-cluster", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "cluster-role-binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods", "scope_kind=namespace", "scope_name=prod", "binding_source=role-binding.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=ClusterRoleBinding", "binding_name=read-pods-cluster", "scope_kind=cluster", "binding_source=cluster-role-binding.yaml#document=1")
+}
+
+func TestAddRoutesAggregatesDistinctRoleBindingsWithSameScopeAndEndpoints(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-pods-a", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "a-binding.yaml", 1),
+			roleBinding("prod", "read-pods-b", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods-a", "scope_kind=namespace", "scope_name=prod", "binding_source=a-binding.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods-b", "scope_kind=namespace", "scope_name=prod", "binding_source=b-binding.yaml#document=1")
+}
+
+func TestAddRoutesRepeatedIdenticalBindingDoesNotDuplicateAggregatedEvidence(t *testing.T) {
+	g := graph.New()
+	binding := roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "binding.yaml", 1)
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			binding,
+			binding,
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-pods"); got != 1 {
+		t.Fatalf("binding record count = %d, want 1 in %q", got, edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesIdenticalRoleBindingSourcesArePreserved(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "a-binding.yaml", 1),
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods", "binding_source=a-binding.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods", "binding_source=b-binding.yaml#document=1")
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-pods"); got != 2 {
+		t.Fatalf("binding record count = %d, want 2 in %q", got, edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesIdenticalRoleBindingDocumentSourcesArePreserved(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "bindings.yaml", 1),
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "bindings.yaml", 2),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods", "binding_source=bindings.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods", "binding_source=bindings.yaml#document=2")
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-pods"); got != 2 {
+		t.Fatalf("binding record count = %d, want 2 in %q", got, edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesIdenticalRoleBindingSameSourceDeduplicatesEvidence(t *testing.T) {
+	g := graph.New()
+	binding := roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "bindings.yaml", 1)
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			binding,
+			binding,
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-pods"); got != 1 {
+		t.Fatalf("binding record count = %d, want 1 in %q", got, edge.Evidence.Detail)
+	}
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods", "binding_source=bindings.yaml#document=1")
+}
+
+func TestAddRoutesIdenticalClusterRoleBindingSourcesArePreserved(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{
+			clusterRoleBinding("read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "a-binding.yaml", 1),
+			clusterRoleBinding("read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=ClusterRoleBinding", "binding_name=read-pods", "binding_source=a-binding.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=ClusterRoleBinding", "binding_name=read-pods", "binding_source=b-binding.yaml#document=1")
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-pods"); got != 2 {
+		t.Fatalf("binding record count = %d, want 2 in %q", got, edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesIdenticalClusterRoleBindingDocumentSourcesArePreserved(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{
+			clusterRoleBinding("read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "bindings.yaml", 1),
+			clusterRoleBinding("read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "bindings.yaml", 2),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=ClusterRoleBinding", "binding_name=read-pods", "binding_source=bindings.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=ClusterRoleBinding", "binding_name=read-pods", "binding_source=bindings.yaml#document=2")
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-pods"); got != 2 {
+		t.Fatalf("binding record count = %d, want 2 in %q", got, edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesIdenticalClusterRoleBindingSameSourceDeduplicatesEvidence(t *testing.T) {
+	g := graph.New()
+	binding := clusterRoleBinding("read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "bindings.yaml", 1)
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{
+			binding,
+			binding,
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-pods"); got != 1 {
+		t.Fatalf("binding record count = %d, want 1 in %q", got, edge.Evidence.Detail)
+	}
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=ClusterRoleBinding", "binding_name=read-pods", "binding_source=bindings.yaml#document=1")
+}
+
+func TestAddRoutesDuplicateBindingSourceEvidenceIsDeterministic(t *testing.T) {
+	forward := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{
+			clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1),
+			clusterRole("unused", []parserkubernetes.PolicyRule{podGetRule()}, "unused-cluster-role.yaml", 1),
+		},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "a-role-binding.yaml", 1),
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-role-binding.yaml", 1),
+		},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{
+			clusterRoleBinding("read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "a-cluster-role-binding.yaml", 1),
+			clusterRoleBinding("read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-cluster-role-binding.yaml", 1),
+		},
+	}
+	reverse := parserkubernetes.Resources{
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{forward.ClusterRoleBindings[1], forward.ClusterRoleBindings[0]},
+		RoleBindings:        []parserkubernetes.RoleBinding{forward.RoleBindings[1], forward.RoleBindings[0]},
+		ClusterRoles:        []parserkubernetes.ClusterRole{forward.ClusterRoles[1], forward.ClusterRoles[0]},
+	}
+
+	first := graph.New()
+	if err := AddRoutes(first, forward); err != nil {
+		t.Fatalf("add forward routes: %v", err)
+	}
+	second := graph.New()
+	if err := AddRoutes(second, reverse); err != nil {
+		t.Fatalf("add reverse routes: %v", err)
+	}
+
+	if string(mustMarshalGraph(t, first)) != string(mustMarshalGraph(t, second)) {
+		t.Fatalf("json differs by duplicate binding source order:\nfirst:  %s\nsecond: %s", mustMarshalGraph(t, first), mustMarshalGraph(t, second))
+	}
+	edge := edgesOfKind(first, graph.BoundTo)[0]
+	for _, want := range []string{
+		"binding_source=a-role-binding.yaml#document=1",
+		"binding_source=b-role-binding.yaml#document=1",
+		"binding_source=a-cluster-role-binding.yaml#document=1",
+		"binding_source=b-cluster-role-binding.yaml#document=1",
+	} {
+		if !strings.Contains(edge.Evidence.Detail, want) {
+			t.Fatalf("bound-to evidence detail = %q, want %q", edge.Evidence.Detail, want)
+		}
+	}
+}
+
+func TestAddRoutesAggregatedBoundToEvidenceIsDeterministic(t *testing.T) {
+	forward := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{
+			clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1),
+			clusterRole("unused", []parserkubernetes.PolicyRule{podGetRule()}, "unused-cluster-role.yaml", 1),
+		},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("team-a", "read-pods-a", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api"), serviceAccountSubject("ignored", "worker")}, "a-binding.yaml", 1),
+			roleBinding("team-b", "read-pods-b", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-binding.yaml", 1),
+		},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{
+			clusterRoleBinding("read-pods-cluster", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "cluster-role-binding.yaml", 1),
+		},
+	}
+	reverse := parserkubernetes.Resources{
+		ClusterRoleBindings: forward.ClusterRoleBindings,
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("team-b", "read-pods-b", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-binding.yaml", 1),
+			roleBinding("team-a", "read-pods-a", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("ignored", "worker"), serviceAccountSubject("workloads", "api")}, "a-binding.yaml", 1),
+		},
+		ClusterRoles: []parserkubernetes.ClusterRole{forward.ClusterRoles[1], forward.ClusterRoles[0]},
+	}
+
+	first := graph.New()
+	if err := AddRoutes(first, forward); err != nil {
+		t.Fatalf("add forward routes: %v", err)
+	}
+	second := graph.New()
+	if err := AddRoutes(second, reverse); err != nil {
+		t.Fatalf("add reverse routes: %v", err)
+	}
+
+	firstEvidence := edgesOfKind(first, graph.BoundTo)
+	secondEvidence := edgesOfKind(second, graph.BoundTo)
+	if len(firstEvidence) != len(secondEvidence) {
+		t.Fatalf("bound-to counts differ: %d vs %d", len(firstEvidence), len(secondEvidence))
+	}
+	if string(mustMarshalGraph(t, first)) != string(mustMarshalGraph(t, second)) {
+		t.Fatalf("json differs by RBAC input order:\nfirst:  %s\nsecond: %s", mustMarshalGraph(t, first), mustMarshalGraph(t, second))
+	}
+}
+
+func TestAddRoutesSingleBindingProducesOneScopeRecord(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-pods", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	edge := edgesOfKind(g, graph.BoundTo)[0]
+	if got := strings.Count(edge.Evidence.Detail, "binding_kind="); got != 1 {
+		t.Fatalf("scope record count = %d, want 1 in %q", got, edge.Evidence.Detail)
+	}
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-pods", "scope_kind=namespace", "scope_name=prod", "binding_source=binding.yaml#document=1")
+}
+
+func TestAddRoutesUnresolvedRoleAggregatesBindingScopeDeterministically(t *testing.T) {
+	forward := parserkubernetes.Resources{
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-missing-a", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "missing"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "a-binding.yaml", 1),
+			roleBinding("prod", "read-missing-b", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "missing"}, []parserkubernetes.Subject{serviceAccountSubject("workloads", "api")}, "b-binding.yaml", 1),
+		},
+	}
+	reverse := parserkubernetes.Resources{RoleBindings: []parserkubernetes.RoleBinding{forward.RoleBindings[1], forward.RoleBindings[0]}}
+
+	first := graph.New()
+	if err := AddRoutes(first, forward); err != nil {
+		t.Fatalf("add forward routes: %v", err)
+	}
+	second := graph.New()
+	if err := AddRoutes(second, reverse); err != nil {
+		t.Fatalf("add reverse routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, first, graph.BoundTo, 1)
+	edge := edgesOfKind(first, graph.BoundTo)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-missing-a", "scope_kind=namespace", "scope_name=prod", "binding_source=a-binding.yaml#document=1")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "binding_namespace=prod", "binding_name=read-missing-b", "scope_kind=namespace", "scope_name=prod", "binding_source=b-binding.yaml#document=1")
+	assertNodeKindCount(t, first, graph.Permission, 0)
+	assertEdgeKindCount(t, first, graph.GrantsPermission, 0)
+	if string(mustMarshalGraph(t, first)) != string(mustMarshalGraph(t, second)) {
+		t.Fatalf("unresolved-role json differs by input order:\nfirst:  %s\nsecond: %s", mustMarshalGraph(t, first), mustMarshalGraph(t, second))
+	}
+}
+
+func TestAddRoutesRoleBindingOmittedServiceAccountNamespaceCreatesNoBinding(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{role("prod", "pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "pod-reader",
+		}, []parserkubernetes.Subject{{Kind: "ServiceAccount", Name: "api"}}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertNodeKindCount(t, g, graph.ServiceAccount, 0)
+	assertNodeKindCount(t, g, graph.Role, 0)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.BoundTo, 0)
+}
+
+func TestAddRoutesClusterRoleBindingOmittedServiceAccountNamespaceCreatesNoBinding(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "pod-reader",
+		}, []parserkubernetes.Subject{{Kind: "ServiceAccount", Name: "api"}}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertNodeKindCount(t, g, graph.ServiceAccount, 0)
+	assertNodeKindCount(t, g, graph.Role, 0)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.BoundTo, 0)
+}
+
+func TestAddRoutesNamespaceMismatchDoesNotBindWrongServiceAccount(t *testing.T) {
+	g := graph.New()
+	deployment := deployment("staging", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	resources := parserkubernetes.Resources{
+		Deployments: []parserkubernetes.Deployment{deployment},
+		Roles:       []parserkubernetes.Role{role("prod", "pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "pod-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	stagingAccount := graph.NewNode(graph.ServiceAccount, "kubernetes://staging/serviceaccount/default")
+	role := graph.NewNode(graph.Role, "kubernetes://prod/role/pod-reader")
+	for _, edge := range edgesOfKind(g, graph.BoundTo) {
+		if edge.From == stagingAccount.ID && edge.To == role.ID {
+			t.Fatalf("bound staging account to prod role: %#v", edge)
+		}
+	}
+}
+
+func TestAddRoutesUnsupportedRoleRefCreatesNoRBACGraph(t *testing.T) {
+	tests := []struct {
+		name string
+		res  parserkubernetes.Resources
+	}{
+		{
+			name: "invalid api group",
+			res: parserkubernetes.Resources{
+				Roles: []parserkubernetes.Role{role("prod", "pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "role.yaml", 1)},
+				RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{
+					APIGroup: "example.io",
+					Kind:     "Role",
+					Name:     "pod-reader",
+				}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+			},
+		},
+		{
+			name: "invalid rolebinding kind",
+			res: parserkubernetes.Resources{
+				Roles: []parserkubernetes.Role{role("prod", "pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "role.yaml", 1)},
+				RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{
+					APIGroup: "rbac.authorization.k8s.io",
+					Kind:     "Secret",
+					Name:     "pod-reader",
+				}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+			},
+		},
+		{
+			name: "invalid clusterrolebinding kind",
+			res: parserkubernetes.Resources{
+				ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("pod-reader", []parserkubernetes.PolicyRule{podGetRule()}, "cluster-role.yaml", 1)},
+				ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("read-pods", parserkubernetes.RoleRef{
+					APIGroup: "rbac.authorization.k8s.io",
+					Kind:     "Role",
+					Name:     "pod-reader",
+				}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := graph.New()
+			if err := AddRoutes(g, tt.res); err != nil {
+				t.Fatalf("add routes: %v", err)
+			}
+			assertNodeKindCount(t, g, graph.ServiceAccount, 0)
+			assertNodeKindCount(t, g, graph.Role, 0)
+			assertNodeKindCount(t, g, graph.Permission, 0)
+			assertEdgeKindCount(t, g, graph.BoundTo, 0)
+			assertEdgeKindCount(t, g, graph.GrantsPermission, 0)
+		})
+	}
+}
+
+func TestAddRoutesMissingRoleReferenceCreatesUnresolvedRoleWithoutPermissions(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "missing",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	roleNode := mustNode(t, g, graph.NewNode(graph.Role, "kubernetes://prod/role/missing").ID)
+	if got := roleNode.Evidence[0]; !strings.Contains(got.Detail, "unresolved") || strings.Contains(got.Detail, "observed") {
+		t.Fatalf("role evidence = %#v, want unresolved and not observed", roleNode.Evidence)
+	}
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 0)
+}
+
+func TestAddRoutesMissingClusterRoleReferenceCreatesUnresolvedClusterRoleWithoutPermissions(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("read-pods", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "missing",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	roleNode := mustNode(t, g, graph.NewNode(graph.Role, "kubernetes://cluster/clusterrole/missing").ID)
+	if got := roleNode.Evidence[0]; !strings.Contains(got.Detail, "unresolved") || strings.Contains(got.Detail, "observed") {
+		t.Fatalf("cluster role evidence = %#v, want unresolved and not observed", roleNode.Evidence)
+	}
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 0)
+}
+
+func TestAddRoutesReachableObservedRoleWithNoRulesCreatesNoPermissions(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{role("prod", "empty", nil, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "bind-empty", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "empty",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	mustNode(t, g, graph.NewNode(graph.Role, "kubernetes://prod/role/empty").ID)
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 0)
+}
+
+func TestAddRoutesClusterRoleWithOnlyNonResourceURLsCreatesNoPermissions(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("health-reader", []parserkubernetes.PolicyRule{
+			{NonResourceURLs: []string{"/healthz"}, Verbs: []string{"get"}},
+		}, "cluster-role.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("bind-health", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "health-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	mustNode(t, g, graph.NewNode(graph.Role, "kubernetes://cluster/clusterrole/health-reader").ID)
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 0)
+}
+
+func TestAddRoutesRoleWithResourceAndNonResourceRulesCreatesOnlyResourcePermission(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{role("prod", "mixed-reader", []parserkubernetes.PolicyRule{
+			podGetRule(),
+			{NonResourceURLs: []string{"/healthz"}, Verbs: []string{"get"}},
+		}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "bind-mixed", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "mixed-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertNodeKindCount(t, g, graph.Permission, 1)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 1)
+	permission := nodesOfKind(g, graph.Permission)[0]
+	if strings.Contains(permission.Evidence[0].Detail, "nonResourceURLs") || strings.Contains(permission.Evidence[0].Detail, "healthz") {
+		t.Fatalf("permission evidence = %#v, want only resource rule", permission.Evidence)
+	}
+}
+
+func TestAddRoutesRuleWithNonResourceURLsAndResourceFieldsIsSkipped(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{role("prod", "mixed-rule", []parserkubernetes.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"pods"}, NonResourceURLs: []string{"/healthz"}, Verbs: []string{"get"}},
+		}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "bind-mixed-rule", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "mixed-rule",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 0)
+}
+
+func TestAddRoutesRuleWithEmptyResourcesCreatesNoPermission(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{role("prod", "empty-resource", []parserkubernetes.PolicyRule{
+			{APIGroups: []string{""}, Verbs: []string{"get"}},
+		}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "bind-empty-resource", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "empty-resource",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+	assertNodeKindCount(t, g, graph.Permission, 0)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 0)
+}
+
+func TestAddRoutesNonResourceURLOrderingDoesNotAffectGraphOutput(t *testing.T) {
+	forward := parserkubernetes.Resources{
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("health-reader", []parserkubernetes.PolicyRule{
+			{NonResourceURLs: []string{"/readyz", "/healthz"}, Verbs: []string{"get"}},
+		}, "cluster-role.yaml", 1)},
+		ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("bind-health", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "health-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+	reverse := parserkubernetes.Resources{
+		ClusterRoleBindings: forward.ClusterRoleBindings,
+		ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("health-reader", []parserkubernetes.PolicyRule{
+			{NonResourceURLs: []string{"/healthz", "/readyz"}, Verbs: []string{"get"}},
+		}, "cluster-role.yaml", 1)},
+	}
+
+	first := mustGraphJSON(t, forward)
+	second := mustGraphJSON(t, reverse)
+	if string(first) != string(second) {
+		t.Fatalf("json differs by nonResourceURLs order:\nfirst:  %s\nsecond: %s", first, second)
+	}
+}
+
+func TestAddRoutesMultipleRulesCreateDistinctDeterministicPermissions(t *testing.T) {
+	rules := []parserkubernetes.PolicyRule{
+		podGetRule(),
+		{APIGroups: []string{"apps"}, Resources: []string{"deployments"}, Verbs: []string{"list"}},
+	}
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{role("prod", "reader", rules, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+
+	first := mustGraphJSON(t, resources)
+	second := mustGraphJSON(t, parserkubernetes.Resources{
+		RoleBindings: resources.RoleBindings,
+		Roles:        []parserkubernetes.Role{role("prod", "reader", []parserkubernetes.PolicyRule{rules[1], rules[0]}, "role.yaml", 1)},
+	})
+	if string(first) != string(second) {
+		t.Fatalf("json differs by equivalent rule ordering:\nfirst:  %s\nsecond: %s", first, second)
+	}
+
+	g := graph.New()
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+	assertNodeKindCount(t, g, graph.Permission, 2)
+	assertEdgeKindCount(t, g, graph.GrantsPermission, 2)
+}
+
+func TestPermissionNodeCanonicalID(t *testing.T) {
+	base := parserkubernetes.PolicyRule{
+		APIGroups:     []string{"apps", ""},
+		Resources:     []string{"pods", "deployments"},
+		ResourceNames: []string{"api"},
+		Verbs:         []string{"get", "list"},
+	}
+	reordered := parserkubernetes.PolicyRule{
+		APIGroups:     []string{"", "apps"},
+		Resources:     []string{"deployments", "pods"},
+		ResourceNames: []string{"api"},
+		Verbs:         []string{"list", "get"},
+	}
+	changedVerb := base
+	changedVerb.Verbs = []string{"watch"}
+	changedAPIGroup := base
+	changedAPIGroup.APIGroups = []string{"batch"}
+	noResourceNames := base
+	noResourceNames.ResourceNames = nil
+
+	baseNode, _, err := permissionNode(base)
+	if err != nil {
+		t.Fatalf("base permission node: %v", err)
+	}
+	reorderedNode, _, err := permissionNode(reordered)
+	if err != nil {
+		t.Fatalf("reordered permission node: %v", err)
+	}
+	if reorderedNode.ID != baseNode.ID {
+		t.Fatalf("reordered equivalent rule ID = %q, want %q", reorderedNode.ID, baseNode.ID)
+	}
+	for name, rule := range map[string]parserkubernetes.PolicyRule{
+		"changed verbs":         changedVerb,
+		"changed api groups":    changedAPIGroup,
+		"empty resource names":  noResourceNames,
+		"nonempty resourceName": base,
+	} {
+		node, _, err := permissionNode(rule)
+		if err != nil {
+			t.Fatalf("%s permission node: %v", name, err)
+		}
+		if name != "nonempty resourceName" && node.ID == baseNode.ID {
+			t.Fatalf("%s permission ID = %q, want different from base %q", name, node.ID, baseNode.ID)
+		}
+		if name == "nonempty resourceName" && !strings.Contains(node.Evidence[0].Detail, `"apiGroups":["","apps"]`) {
+			t.Fatalf("permission evidence detail = %q, want empty core API group preserved", node.Evidence[0].Detail)
+		}
+	}
+}
+
+func TestAddRoutesSharedPermissionNodeEvidenceDoesNotDependOnRoleOrder(t *testing.T) {
+	rule := podGetRule()
+	firstResources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{
+			role("prod", "a-reader", []parserkubernetes.PolicyRule{rule}, "a-role.yaml", 1),
+			role("prod", "z-reader", []parserkubernetes.PolicyRule{rule}, "z-role.yaml", 1),
+		},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "a-bind", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "a-reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "a-binding.yaml", 1),
+			roleBinding("prod", "z-bind", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "z-reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "z-binding.yaml", 1),
+		},
+	}
+	secondResources := parserkubernetes.Resources{
+		Roles:        []parserkubernetes.Role{firstResources.Roles[1], firstResources.Roles[0]},
+		RoleBindings: []parserkubernetes.RoleBinding{firstResources.RoleBindings[1], firstResources.RoleBindings[0]},
+	}
+
+	first := graph.New()
+	if err := AddRoutes(first, firstResources); err != nil {
+		t.Fatalf("add first routes: %v", err)
+	}
+	second := graph.New()
+	if err := AddRoutes(second, secondResources); err != nil {
+		t.Fatalf("add second routes: %v", err)
+	}
+
+	assertNodeKindCount(t, first, graph.Permission, 1)
+	assertEdgeKindCount(t, first, graph.GrantsPermission, 2)
+	firstPermission := nodesOfKind(first, graph.Permission)[0]
+	secondPermission := nodesOfKind(second, graph.Permission)[0]
+	if !reflect.DeepEqual(firstPermission, secondPermission) {
+		t.Fatalf("permission node differs by role order:\nfirst: %#v\nsecond: %#v", firstPermission, secondPermission)
+	}
+	firstJSON := mustMarshalGraph(t, first)
+	secondJSON := mustMarshalGraph(t, second)
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("json differs by role order:\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
+	}
+}
+
+func TestAddRoutesIdenticalDuplicateRBACResourcesAreAccepted(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{
+			role("prod", "reader", []parserkubernetes.PolicyRule{podGetRule()}, "a-role.yaml", 1),
+			role("prod", "reader", []parserkubernetes.PolicyRule{podGetRule()}, "z-role.yaml", 1),
+		},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "a-binding.yaml", 1),
+			roleBinding("prod", "read", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "z-binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertNodeKindCount(t, g, graph.Role, 1)
+	assertNodeKindCount(t, g, graph.Permission, 1)
+	assertEdgeKindCount(t, g, graph.BoundTo, 1)
+}
+
+func TestAddRoutesRejectsConflictingDuplicateRBACBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name string
+		res  parserkubernetes.Resources
+		kind string
+		id   string
+	}{
+		{
+			name: "role",
+			res: parserkubernetes.Resources{Roles: []parserkubernetes.Role{
+				role("prod", "reader", []parserkubernetes.PolicyRule{podGetRule()}, "a-role.yaml", 1),
+				role("prod", "reader", []parserkubernetes.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}}}, "z-role.yaml", 1),
+			}},
+			kind: "Role",
+			id:   "prod/reader",
+		},
+		{
+			name: "rolebinding",
+			res: parserkubernetes.Resources{RoleBindings: []parserkubernetes.RoleBinding{
+				roleBinding("prod", "read", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "a-binding.yaml", 1),
+				roleBinding("prod", "read", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "other"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "z-binding.yaml", 1),
+			}},
+			kind: "RoleBinding",
+			id:   "prod/read",
+		},
+		{
+			name: "clusterrole",
+			res: parserkubernetes.Resources{ClusterRoles: []parserkubernetes.ClusterRole{
+				clusterRole("reader", []parserkubernetes.PolicyRule{podGetRule()}, "a-cluster-role.yaml", 1),
+				clusterRole("reader", []parserkubernetes.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}}}, "z-cluster-role.yaml", 1),
+			}},
+			kind: "ClusterRole",
+			id:   "reader",
+		},
+		{
+			name: "clusterrolebinding",
+			res: parserkubernetes.Resources{ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{
+				clusterRoleBinding("read", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "a-binding.yaml", 1),
+				clusterRoleBinding("read", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "other"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "z-binding.yaml", 1),
+			}},
+			kind: "ClusterRoleBinding",
+			id:   "read",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := graph.New()
+			err := AddRoutes(g, tt.res)
+			if err == nil {
+				t.Fatal("add routes error = nil, want RBAC duplicate conflict")
+			}
+			assertConflictError(t, err, tt.kind, tt.id, "a-", "z-")
+			assertGraphCounts(t, g, 0, 0, 0)
+		})
+	}
+}
+
+func TestAddRoutesRBACConflictLeavesPrepopulatedGraphUnchanged(t *testing.T) {
+	g := graph.New()
+	if err := AddRoutes(g, routeResources("LoadBalancer")); err != nil {
+		t.Fatalf("seed graph: %v", err)
+	}
+	before := mustMarshalGraph(t, g)
+	resources := parserkubernetes.Resources{
+		Roles: []parserkubernetes.Role{
+			role("prod", "reader", []parserkubernetes.PolicyRule{podGetRule()}, "a-role.yaml", 1),
+			role("prod", "reader", []parserkubernetes.PolicyRule{{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}}}, "z-role.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err == nil {
+		t.Fatal("add routes error = nil, want RBAC duplicate conflict")
+	}
+	after := mustMarshalGraph(t, g)
+	if string(after) != string(before) {
+		t.Fatalf("graph changed after failed AddRoutes:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
 func TestAddRoutesFixturePublicRoute(t *testing.T) {
 	resources, err := parserkubernetes.ParseDir("testdata/public-route")
 	if err != nil {
@@ -1313,6 +2350,58 @@ func serviceAccount(namespace, name string, automount *bool, filename string, do
 	}
 }
 
+func role(namespace, name string, rules []parserkubernetes.PolicyRule, filename string, document int) parserkubernetes.Role {
+	return parserkubernetes.Role{
+		Namespace: namespace,
+		Name:      name,
+		Rules:     rules,
+		Source:    parserkubernetes.Source{Filename: filename, Document: document},
+	}
+}
+
+func clusterRole(name string, rules []parserkubernetes.PolicyRule, filename string, document int) parserkubernetes.ClusterRole {
+	return parserkubernetes.ClusterRole{
+		Name:   name,
+		Rules:  rules,
+		Source: parserkubernetes.Source{Filename: filename, Document: document},
+	}
+}
+
+func roleBinding(namespace, name string, roleRef parserkubernetes.RoleRef, subjects []parserkubernetes.Subject, filename string, document int) parserkubernetes.RoleBinding {
+	return parserkubernetes.RoleBinding{
+		Namespace: namespace,
+		Name:      name,
+		RoleRef:   roleRef,
+		Subjects:  subjects,
+		Source:    parserkubernetes.Source{Filename: filename, Document: document},
+	}
+}
+
+func clusterRoleBinding(name string, roleRef parserkubernetes.RoleRef, subjects []parserkubernetes.Subject, filename string, document int) parserkubernetes.ClusterRoleBinding {
+	return parserkubernetes.ClusterRoleBinding{
+		Name:     name,
+		RoleRef:  roleRef,
+		Subjects: subjects,
+		Source:   parserkubernetes.Source{Filename: filename, Document: document},
+	}
+}
+
+func serviceAccountSubject(namespace, name string) parserkubernetes.Subject {
+	return parserkubernetes.Subject{
+		Kind:      "ServiceAccount",
+		Namespace: namespace,
+		Name:      name,
+	}
+}
+
+func podGetRule() parserkubernetes.PolicyRule {
+	return parserkubernetes.PolicyRule{
+		APIGroups: []string{""},
+		Resources: []string{"pods"},
+		Verbs:     []string{"get"},
+	}
+}
+
 func boolPtr(value bool) *bool {
 	return &value
 }
@@ -1374,6 +2463,16 @@ func edgesOfKind(g *graph.Graph, kind graph.EdgeKind) []graph.Edge {
 	return edges
 }
 
+func nodesOfKind(g *graph.Graph, kind graph.NodeKind) []graph.Node {
+	var nodes []graph.Node
+	for _, node := range g.Nodes() {
+		if node.Kind == kind {
+			nodes = append(nodes, node)
+		}
+	}
+	return nodes
+}
+
 func mustGraphJSON(t *testing.T, resources parserkubernetes.Resources) []byte {
 	t.Helper()
 
@@ -1417,6 +2516,24 @@ func assertConflictError(t *testing.T, err error, kind, name, firstSource, secon
 			t.Fatalf("error = %q, want to contain %q", message, want)
 		}
 	}
+}
+
+func assertEvidenceRecordContains(t *testing.T, detail string, fields ...string) {
+	t.Helper()
+
+	for _, record := range strings.Split(detail, " | ") {
+		matches := true
+		for _, field := range fields {
+			if !strings.Contains(record, field) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return
+		}
+	}
+	t.Fatalf("evidence detail = %q, want one record containing %#v", detail, fields)
 }
 
 func writeManifest(t *testing.T, dir, name, content string) string {

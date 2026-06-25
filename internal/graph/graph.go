@@ -15,6 +15,8 @@ const (
 	PublicEndpoint NodeKind = "PublicEndpoint"
 	Workload       NodeKind = "Workload"
 	ServiceAccount NodeKind = "ServiceAccount"
+	Role           NodeKind = "Role"
+	Permission     NodeKind = "Permission"
 	Secret         NodeKind = "Secret"
 )
 
@@ -24,9 +26,11 @@ type EdgeID string
 type EdgeKind string
 
 const (
-	RoutesTo EdgeKind = "RoutesTo"
-	RunsAs   EdgeKind = "RunsAs"
-	CanRead  EdgeKind = "CanRead"
+	RoutesTo         EdgeKind = "RoutesTo"
+	RunsAs           EdgeKind = "RunsAs"
+	BoundTo          EdgeKind = "BoundTo"
+	GrantsPermission EdgeKind = "GrantsPermission"
+	CanRead          EdgeKind = "CanRead"
 )
 
 var (

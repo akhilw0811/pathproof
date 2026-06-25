@@ -972,6 +972,440 @@ spec:
 	}
 }
 
+func TestParseDirParsesValidRole(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: prod
+rules:
+- apiGroups: ["apps", ""]
+  resources: ["pods", "deployments", "pods"]
+  resourceNames: ["api", "worker"]
+  verbs: ["watch", "get", "get"]
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Role{{
+		Namespace: "prod",
+		Name:      "pod-reader",
+		Rules: []PolicyRule{{
+			APIGroups:     []string{"", "apps"},
+			Resources:     []string{"deployments", "pods"},
+			ResourceNames: []string{"api", "worker"},
+			Verbs:         []string{"get", "watch"},
+		}},
+		Source: Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Roles, want) {
+		t.Fatalf("roles = %#v, want %#v", resources.Roles, want)
+	}
+}
+
+func TestParseDirParsesValidClusterRole(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "cluster-role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list", "get"]
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []ClusterRole{{
+		Name: "pod-reader",
+		Rules: []PolicyRule{{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get", "list"},
+		}},
+		Source: Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.ClusterRoles, want) {
+		t.Fatalf("cluster roles = %#v, want %#v", resources.ClusterRoles, want)
+	}
+}
+
+func TestParseDirParsesValidRoleBinding(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "role-binding.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: workloads
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []RoleBinding{{
+		Namespace: "prod",
+		Name:      "read-pods",
+		RoleRef:   RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "pod-reader"},
+		Subjects:  []Subject{{Kind: "ServiceAccount", Namespace: "workloads", Name: "api"}},
+		Source:    Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.RoleBindings, want) {
+		t.Fatalf("role bindings = %#v, want %#v", resources.RoleBindings, want)
+	}
+}
+
+func TestParseDirParsesValidClusterRoleBinding(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "cluster-role-binding.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: read-pods
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: prod
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []ClusterRoleBinding{{
+		Name:     "read-pods",
+		RoleRef:  RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "pod-reader"},
+		Subjects: []Subject{{Kind: "ServiceAccount", Namespace: "prod", Name: "api"}},
+		Source:   Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.ClusterRoleBindings, want) {
+		t.Fatalf("cluster role bindings = %#v, want %#v", resources.ClusterRoleBindings, want)
+	}
+}
+
+func TestParseDirIgnoresUnsupportedRBACVersionBeforeTypedDecode(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "legacy-role.yaml", `apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: Role
+metadata:
+  name: legacy
+rules:
+- apiGroups:
+    bad: shape
+  resources: pods
+  verbs: get
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want unsupported RBAC skipped", resources)
+	}
+}
+
+func TestParseDirRoleRulesPreserveWildcardsAndCoreAPIGroup(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wildcard
+rules:
+- apiGroups: ["", "*"]
+  resources: ["*", "pods"]
+  verbs: ["*", "get"]
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	rule := resources.Roles[0].Rules[0]
+	if !reflect.DeepEqual(rule.APIGroups, []string{"", "*"}) {
+		t.Fatalf("api groups = %#v, want core and wildcard preserved", rule.APIGroups)
+	}
+	if !reflect.DeepEqual(rule.Resources, []string{"*", "pods"}) {
+		t.Fatalf("resources = %#v, want wildcard preserved", rule.Resources)
+	}
+	if !reflect.DeepEqual(rule.Verbs, []string{"*", "get"}) {
+		t.Fatalf("verbs = %#v, want wildcard preserved", rule.Verbs)
+	}
+}
+
+func TestParseDirRoleResourceNamesAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: named-resources
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  resourceNames: ["worker", "api", "api"]
+  verbs: ["get"]
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got, want := resources.Roles[0].Rules[0].ResourceNames, []string{"api", "worker"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("resource names = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseDirRoleNonResourceURLsAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: health-reader
+rules:
+- nonResourceURLs: ["/readyz", "/healthz", "/readyz"]
+  verbs: ["get"]
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got, want := resources.ClusterRoles[0].Rules[0].NonResourceURLs, []string{"/healthz", "/readyz"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("nonResourceURLs = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseDirNonResourceURLOrderingDoesNotAffectParse(t *testing.T) {
+	firstDir := t.TempDir()
+	writeManifest(t, firstDir, "role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: health-reader
+rules:
+- nonResourceURLs: ["/readyz", "/healthz"]
+  verbs: ["get"]
+`)
+	secondDir := t.TempDir()
+	writeManifest(t, secondDir, "role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: health-reader
+rules:
+- nonResourceURLs: ["/healthz", "/readyz"]
+  verbs: ["get"]
+`)
+
+	first, err := ParseDir(firstDir)
+	if err != nil {
+		t.Fatalf("parse first dir: %v", err)
+	}
+	second, err := ParseDir(secondDir)
+	if err != nil {
+		t.Fatalf("parse second dir: %v", err)
+	}
+
+	first.ClusterRoles[0].Source = Source{}
+	second.ClusterRoles[0].Source = Source{}
+	if !reflect.DeepEqual(first.ClusterRoles, second.ClusterRoles) {
+		t.Fatalf("cluster roles differ by nonResourceURLs order:\nfirst: %#v\nsecond: %#v", first.ClusterRoles, second.ClusterRoles)
+	}
+}
+
+func TestParseDirRoleBindingDoesNotDefaultServiceAccountSubjectNamespace(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "role-binding.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got := resources.RoleBindings[0].Subjects[0].Namespace; got != "" {
+		t.Fatalf("subject namespace = %q, want empty unresolved namespace", got)
+	}
+}
+
+func TestParseDirClusterRoleBindingMissingServiceAccountNamespaceRemainsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "cluster-role-binding.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: read-pods
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got := resources.ClusterRoleBindings[0].Subjects[0].Namespace; got != "" {
+		t.Fatalf("subject namespace = %q, want empty unresolved namespace", got)
+	}
+}
+
+func TestParseDirIgnoresUnsupportedRBACSubjects(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "role-binding.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pod-reader
+subjects:
+- kind: User
+  name: alice
+- kind: Group
+  name: developers
+- kind: ServiceAccount
+  name: api
+  namespace: prod
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Subject{{Kind: "ServiceAccount", Namespace: "prod", Name: "api"}}
+	if got := resources.RoleBindings[0].Subjects; !reflect.DeepEqual(got, want) {
+		t.Fatalf("subjects = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseDirReturnsDeterministicRBACResourceOrdering(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "z.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: z-role
+  namespace: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: z-cluster-role
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: z-binding
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: z-role
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: z-cluster-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: z-cluster-role
+`)
+	writeManifest(t, dir, "a.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: a-role
+  namespace: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: a-cluster-role
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: a-binding
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: a-role
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: a-cluster-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: a-cluster-role
+`)
+
+	first, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir first: %v", err)
+	}
+	second, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir second: %v", err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("resources differ across repeated parse:\nfirst: %#v\nsecond: %#v", first, second)
+	}
+	if got := []string{first.Roles[0].Name, first.Roles[1].Name}; !reflect.DeepEqual(got, []string{"a-role", "z-role"}) {
+		t.Fatalf("role order = %#v, want sorted by identity", got)
+	}
+	if got := []string{first.ClusterRoles[0].Name, first.ClusterRoles[1].Name}; !reflect.DeepEqual(got, []string{"a-cluster-role", "z-cluster-role"}) {
+		t.Fatalf("cluster role order = %#v, want sorted by identity", got)
+	}
+	if got := []string{first.RoleBindings[0].Name, first.RoleBindings[1].Name}; !reflect.DeepEqual(got, []string{"a-binding", "z-binding"}) {
+		t.Fatalf("role binding order = %#v, want sorted by identity", got)
+	}
+	if got := []string{first.ClusterRoleBindings[0].Name, first.ClusterRoleBindings[1].Name}; !reflect.DeepEqual(got, []string{"a-cluster-binding", "z-cluster-binding"}) {
+		t.Fatalf("cluster role binding order = %#v, want sorted by identity", got)
+	}
+}
+
 func writeManifest(t *testing.T, dir, name, content string) string {
 	t.Helper()
 

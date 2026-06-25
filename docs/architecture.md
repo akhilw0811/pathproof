@@ -11,15 +11,25 @@ resources:
 - `Deployment`
 - `networking.k8s.io/v1` `Ingress`
 - `ServiceAccount`
+- `rbac.authorization.k8s.io/v1` `Role`
+- `rbac.authorization.k8s.io/v1` `ClusterRole`
+- `rbac.authorization.k8s.io/v1` `RoleBinding`
+- `rbac.authorization.k8s.io/v1` `ClusterRoleBinding`
 
 Implemented Kubernetes routing lives under `internal/routing/kubernetes`.
 It builds deterministic graph relationships for:
 
 - public Service or Ingress routes to Deployment workloads,
 - Deployment `serviceAccountName` relationships to ServiceAccounts.
+- ServiceAccount RBAC bindings to Roles or ClusterRoles,
+- reachable observed Role or ClusterRole resource rules to canonical
+  Permissions.
+
+RBAC non-resource URL authorization rules are parsed only so they can be
+recognized as unsupported and skipped during resource Permission construction.
 
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
 graph storage, and routing construction are separate packages. No attack-path
-analysis, verification, remediation, persistence, AI, dashboard, plugin system,
-external service integration, or live Kubernetes cluster integration is
-implemented.
+analysis, live Kubernetes authorization evaluation, verification, remediation,
+persistence, AI, dashboard, plugin system, external service integration, or
+live Kubernetes cluster integration is implemented.
