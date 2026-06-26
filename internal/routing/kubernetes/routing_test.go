@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -2271,6 +2272,600 @@ func TestAddRoutesRBACConflictLeavesPrepopulatedGraphUnchanged(t *testing.T) {
 	}
 }
 
+func TestAddRoutesPublicDeploymentServiceAccountCanReadSecret(t *testing.T) {
+	deploy := deployment("prod", "api", map[string]string{"app": "api"}, "deployment.yaml", 1)
+	deploy.ServiceAccountName = "api"
+	resources := parserkubernetes.Resources{
+		Services:        []parserkubernetes.Service{service("prod", "public-api", "LoadBalancer", map[string]string{"app": "api"}, "service.yaml", 1)},
+		Deployments:     []parserkubernetes.Deployment{deploy},
+		ServiceAccounts: []parserkubernetes.ServiceAccount{serviceAccount("prod", "api", nil, "service-account.yaml", 1)},
+		Secrets:         []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+		Roles:           []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "secret-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.RoutesTo, 1)
+	assertEdgeKindCount(t, g, graph.RunsAs, 1)
+	assertEdgeKindCount(t, g, graph.CanRead, 1)
+	account := graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/api")
+	secretNode := graph.NewNode(graph.Secret, "kubernetes://prod/secret/database-password")
+	edge := edgesOfKind(g, graph.CanRead)[0]
+	if edge.From != account.ID || edge.To != secretNode.ID {
+		t.Fatalf("can-read endpoints = %q -> %q, want %q -> %q", edge.From, edge.To, account.ID, secretNode.ID)
+	}
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "role_kind=Role", "matched_verb=get", "secret_sources=secret.yaml#document=1")
+}
+
+func TestAddRoutesSecretNodesAggregateAllDistinctSources(t *testing.T) {
+	tests := []struct {
+		name    string
+		secrets []parserkubernetes.Secret
+		want    []graph.SourceEvidence
+	}{
+		{
+			name: "different files",
+			secrets: []parserkubernetes.Secret{
+				secret("prod", "database-password", "z-secret.yaml", 1),
+				secret("prod", "database-password", "a-secret.yaml", 1),
+			},
+			want: []graph.SourceEvidence{
+				{Source: "a-secret.yaml#document=1", Detail: "kubernetes Secret metadata"},
+				{Source: "z-secret.yaml#document=1", Detail: "kubernetes Secret metadata"},
+			},
+		},
+		{
+			name: "different documents",
+			secrets: []parserkubernetes.Secret{
+				secret("prod", "database-password", "secret.yaml", 2),
+				secret("prod", "database-password", "secret.yaml", 1),
+			},
+			want: []graph.SourceEvidence{
+				{Source: "secret.yaml#document=1", Detail: "kubernetes Secret metadata"},
+				{Source: "secret.yaml#document=2", Detail: "kubernetes Secret metadata"},
+			},
+		},
+		{
+			name: "identical source deduplicates",
+			secrets: []parserkubernetes.Secret{
+				secret("prod", "database-password", "secret.yaml", 1),
+				secret("prod", "database-password", "secret.yaml", 1),
+			},
+			want: []graph.SourceEvidence{
+				{Source: "secret.yaml#document=1", Detail: "kubernetes Secret metadata"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := graph.New()
+			if err := AddRoutes(g, parserkubernetes.Resources{Secrets: tt.secrets}); err != nil {
+				t.Fatalf("add routes: %v", err)
+			}
+
+			assertNodeKindCount(t, g, graph.Secret, 1)
+			secretNode := mustNode(t, g, graph.NewNode(graph.Secret, "kubernetes://prod/secret/database-password").ID)
+			if !reflect.DeepEqual(secretNode.Evidence, tt.want) {
+				t.Fatalf("secret evidence = %#v, want %#v", secretNode.Evidence, tt.want)
+			}
+		})
+	}
+}
+
+func TestAddRoutesSecretSourceEvidenceIsDeterministic(t *testing.T) {
+	forward := parserkubernetes.Resources{Secrets: []parserkubernetes.Secret{
+		secret("prod", "database-password", "a-secret.yaml", 1),
+		secret("prod", "database-password", "z-secret.yaml", 1),
+	}}
+	reverse := parserkubernetes.Resources{Secrets: []parserkubernetes.Secret{
+		forward.Secrets[1],
+		forward.Secrets[0],
+	}}
+
+	first := mustGraphJSON(t, forward)
+	second := mustGraphJSON(t, reverse)
+	if string(first) != string(second) {
+		t.Fatalf("json differs by Secret source order:\nfirst:  %s\nsecond: %s", first, second)
+	}
+}
+
+func TestAddRoutesSecretReadAuthorizationSemantics(t *testing.T) {
+	tests := []struct {
+		name      string
+		rule      parserkubernetes.PolicyRule
+		wantEdges int
+		wantVerb  string
+	}{
+		{
+			name:      "core api group",
+			rule:      secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"}),
+			wantEdges: 1,
+			wantVerb:  "get",
+		},
+		{
+			name:      "wildcard api group",
+			rule:      secretRule([]string{"*"}, []string{"secrets"}, nil, []string{"get"}),
+			wantEdges: 1,
+			wantVerb:  "get",
+		},
+		{
+			name:      "secrets resource",
+			rule:      secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"}),
+			wantEdges: 1,
+			wantVerb:  "get",
+		},
+		{
+			name:      "wildcard resource",
+			rule:      secretRule([]string{""}, []string{"*"}, nil, []string{"get"}),
+			wantEdges: 1,
+			wantVerb:  "get",
+		},
+		{
+			name:      "unrelated resource",
+			rule:      secretRule([]string{""}, []string{"pods"}, nil, []string{"get"}),
+			wantEdges: 0,
+		},
+		{
+			name:      "wildcard verb",
+			rule:      secretRule([]string{""}, []string{"secrets"}, nil, []string{"*"}),
+			wantEdges: 1,
+			wantVerb:  "*",
+		},
+		{
+			name:      "unrelated verb",
+			rule:      secretRule([]string{""}, []string{"secrets"}, nil, []string{"update"}),
+			wantEdges: 0,
+		},
+		{
+			name:      "matching resourceNames get",
+			rule:      secretRule([]string{""}, []string{"secrets"}, []string{"database-password"}, []string{"get"}),
+			wantEdges: 1,
+			wantVerb:  "get",
+		},
+		{
+			name:      "nonmatching resourceNames",
+			rule:      secretRule([]string{""}, []string{"secrets"}, []string{"other-secret"}, []string{"get"}),
+			wantEdges: 0,
+		},
+		{
+			name:      "empty resourceNames list",
+			rule:      secretRule([]string{""}, []string{"secrets"}, nil, []string{"list"}),
+			wantEdges: 1,
+			wantVerb:  "list",
+		},
+		{
+			name:      "empty resourceNames watch",
+			rule:      secretRule([]string{""}, []string{"secrets"}, nil, []string{"watch"}),
+			wantEdges: 1,
+			wantVerb:  "watch",
+		},
+		{
+			name:      "list resourceNames unsupported",
+			rule:      secretRule([]string{""}, []string{"secrets"}, []string{"database-password"}, []string{"list"}),
+			wantEdges: 0,
+		},
+		{
+			name:      "watch resourceNames unsupported",
+			rule:      secretRule([]string{""}, []string{"secrets"}, []string{"database-password"}, []string{"watch"}),
+			wantEdges: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := graph.New()
+			resources := secretReadResources(tt.rule)
+			if err := AddRoutes(g, resources); err != nil {
+				t.Fatalf("add routes: %v", err)
+			}
+
+			assertEdgeKindCount(t, g, graph.CanRead, tt.wantEdges)
+			if tt.wantEdges == 1 {
+				edge := edgesOfKind(g, graph.CanRead)[0]
+				assertEvidenceRecordContains(t, edge.Evidence.Detail, "matched_verb="+tt.wantVerb, "secret_name=prod/database-password")
+			}
+		})
+	}
+}
+
+func TestAddRoutesSecretReadScopeSemantics(t *testing.T) {
+	t.Run("rolebinding to clusterrole remains namespace scoped", func(t *testing.T) {
+		g := graph.New()
+		resources := parserkubernetes.Resources{
+			Secrets: []parserkubernetes.Secret{
+				secret("prod", "database-password", "prod-secret.yaml", 1),
+				secret("staging", "database-password", "staging-secret.yaml", 1),
+			},
+			ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "cluster-role.yaml", 1)},
+			RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "ClusterRole",
+				Name:     "secret-reader",
+			}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+		}
+
+		if err := AddRoutes(g, resources); err != nil {
+			t.Fatalf("add routes: %v", err)
+		}
+
+		assertEdgeKindCount(t, g, graph.CanRead, 1)
+		edge := edgesOfKind(g, graph.CanRead)[0]
+		prodSecret := graph.NewNode(graph.Secret, "kubernetes://prod/secret/database-password")
+		stagingSecret := graph.NewNode(graph.Secret, "kubernetes://staging/secret/database-password")
+		if edge.To != prodSecret.ID || edge.To == stagingSecret.ID {
+			t.Fatalf("can-read destination = %q, want prod secret only", edge.To)
+		}
+		assertEvidenceRecordContains(t, edge.Evidence.Detail, "scope_kind=namespace", "scope_name=prod")
+	})
+
+	t.Run("clusterrolebinding grants across namespaces", func(t *testing.T) {
+		g := graph.New()
+		resources := parserkubernetes.Resources{
+			Secrets: []parserkubernetes.Secret{
+				secret("prod", "database-password", "prod-secret.yaml", 1),
+				secret("staging", "database-password", "staging-secret.yaml", 1),
+			},
+			ClusterRoles: []parserkubernetes.ClusterRole{clusterRole("secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "cluster-role.yaml", 1)},
+			ClusterRoleBindings: []parserkubernetes.ClusterRoleBinding{clusterRoleBinding("read-secrets", parserkubernetes.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "ClusterRole",
+				Name:     "secret-reader",
+			}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+		}
+
+		if err := AddRoutes(g, resources); err != nil {
+			t.Fatalf("add routes: %v", err)
+		}
+
+		assertEdgeKindCount(t, g, graph.CanRead, 2)
+		for _, edge := range edgesOfKind(g, graph.CanRead) {
+			assertEvidenceRecordContains(t, edge.Evidence.Detail, "scope_kind=cluster")
+		}
+	})
+
+	t.Run("role cannot grant outside binding namespace", func(t *testing.T) {
+		g := graph.New()
+		resources := parserkubernetes.Resources{
+			Secrets: []parserkubernetes.Secret{
+				secret("staging", "database-password", "staging-secret.yaml", 1),
+			},
+			Roles: []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "role.yaml", 1)},
+			RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "Role",
+				Name:     "secret-reader",
+			}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+		}
+
+		if err := AddRoutes(g, resources); err != nil {
+			t.Fatalf("add routes: %v", err)
+		}
+
+		assertEdgeKindCount(t, g, graph.CanRead, 0)
+	})
+}
+
+func TestAddRoutesSecretReadResourceNamesAndEmptyResourceNames(t *testing.T) {
+	t.Run("empty resourceNames matches all secrets in scope", func(t *testing.T) {
+		g := graph.New()
+		resources := secretReadResources(secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"}))
+		resources.Secrets = append(resources.Secrets, secret("prod", "api-token", "token-secret.yaml", 1))
+
+		if err := AddRoutes(g, resources); err != nil {
+			t.Fatalf("add routes: %v", err)
+		}
+
+		assertEdgeKindCount(t, g, graph.CanRead, 2)
+	})
+
+	t.Run("resourceNames limits access to exact names", func(t *testing.T) {
+		g := graph.New()
+		resources := secretReadResources(secretRule([]string{""}, []string{"secrets"}, []string{"database-password"}, []string{"get"}))
+		resources.Secrets = append(resources.Secrets, secret("prod", "api-token", "token-secret.yaml", 1))
+
+		if err := AddRoutes(g, resources); err != nil {
+			t.Fatalf("add routes: %v", err)
+		}
+
+		assertEdgeKindCount(t, g, graph.CanRead, 1)
+		edge := edgesOfKind(g, graph.CanRead)[0]
+		wantSecret := graph.NewNode(graph.Secret, "kubernetes://prod/secret/database-password")
+		otherSecret := graph.NewNode(graph.Secret, "kubernetes://prod/secret/api-token")
+		if edge.To != wantSecret.ID || edge.To == otherSecret.ID {
+			t.Fatalf("can-read destination = %q, want only named Secret", edge.To)
+		}
+	})
+}
+
+func TestAddRoutesUnsupportedSecretReadInputsCreateNoAccess(t *testing.T) {
+	tests := []struct {
+		name string
+		res  parserkubernetes.Resources
+	}{
+		{
+			name: "unresolved role",
+			res: parserkubernetes.Resources{
+				Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+				RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+					APIGroup: "rbac.authorization.k8s.io",
+					Kind:     "Role",
+					Name:     "missing",
+				}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+			},
+		},
+		{
+			name: "invalid roleRef apiGroup",
+			res: parserkubernetes.Resources{
+				Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+				Roles:   []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "role.yaml", 1)},
+				RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+					APIGroup: "example.io",
+					Kind:     "Role",
+					Name:     "secret-reader",
+				}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+			},
+		},
+		{
+			name: "invalid roleRef kind",
+			res: parserkubernetes.Resources{
+				Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+				Roles:   []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "role.yaml", 1)},
+				RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+					APIGroup: "rbac.authorization.k8s.io",
+					Kind:     "Secret",
+					Name:     "secret-reader",
+				}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+			},
+		},
+		{
+			name: "namespace-less subject",
+			res: parserkubernetes.Resources{
+				Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+				Roles:   []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "role.yaml", 1)},
+				RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+					APIGroup: "rbac.authorization.k8s.io",
+					Kind:     "Role",
+					Name:     "secret-reader",
+				}, []parserkubernetes.Subject{{Kind: "ServiceAccount", Name: "api"}}, "binding.yaml", 1)},
+			},
+		},
+		{
+			name: "nonResourceURLs",
+			res: parserkubernetes.Resources{
+				Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+				Roles: []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{{
+					APIGroups:       []string{""},
+					Resources:       []string{"secrets"},
+					NonResourceURLs: []string{"/healthz"},
+					Verbs:           []string{"get"},
+				}}, "role.yaml", 1)},
+				RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+					APIGroup: "rbac.authorization.k8s.io",
+					Kind:     "Role",
+					Name:     "secret-reader",
+				}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := graph.New()
+			if err := AddRoutes(g, tt.res); err != nil {
+				t.Fatalf("add routes: %v", err)
+			}
+			assertEdgeKindCount(t, g, graph.CanRead, 0)
+		})
+	}
+}
+
+func TestAddRoutesMultipleSecretReadChainsAggregateOntoOneEdge(t *testing.T) {
+	g := graph.New()
+	resources := parserkubernetes.Resources{
+		Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+		Roles: []parserkubernetes.Role{
+			role("prod", "secret-reader-a", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "a-role.yaml", 1),
+			role("prod", "secret-reader-b", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "b-role.yaml", 1),
+		},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-secrets-a", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "secret-reader-a"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "a-binding.yaml", 1),
+			roleBinding("prod", "read-secrets-b", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "secret-reader-b"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "b-binding.yaml", 1),
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.CanRead, 1)
+	edge := edgesOfKind(g, graph.CanRead)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_name=read-secrets-a", "role_name=kubernetes://prod/role/secret-reader-a")
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_name=read-secrets-b", "role_name=kubernetes://prod/role/secret-reader-b")
+	if got := strings.Count(edge.Evidence.Detail, "binding_name="); got != 2 {
+		t.Fatalf("can-read evidence record count = %d, want 2 in %q", got, edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesSecretReadEvidenceAndJSONAreDeterministic(t *testing.T) {
+	forward := parserkubernetes.Resources{
+		Secrets: []parserkubernetes.Secret{
+			secret("prod", "database-password", "a-secret.yaml", 1),
+			secret("prod", "database-password", "z-secret.yaml", 1),
+		},
+		Roles: []parserkubernetes.Role{
+			role("prod", "secret-reader-a", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "a-role.yaml", 1),
+			role("prod", "secret-reader-b", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "b-role.yaml", 1),
+		},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			roleBinding("prod", "read-secrets-a", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "secret-reader-a"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "a-binding.yaml", 1),
+			roleBinding("prod", "read-secrets-b", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "secret-reader-b"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "b-binding.yaml", 1),
+		},
+	}
+	reverse := parserkubernetes.Resources{
+		RoleBindings: []parserkubernetes.RoleBinding{forward.RoleBindings[1], forward.RoleBindings[0]},
+		Roles:        []parserkubernetes.Role{forward.Roles[1], forward.Roles[0]},
+		Secrets:      []parserkubernetes.Secret{forward.Secrets[1], forward.Secrets[0]},
+	}
+
+	first := mustGraphJSON(t, forward)
+	second := mustGraphJSON(t, reverse)
+	if string(first) != string(second) {
+		t.Fatalf("json differs by Secret read input order:\nfirst:  %s\nsecond: %s", first, second)
+	}
+
+	g := graph.New()
+	if err := AddRoutes(g, forward); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+	edge := edgesOfKind(g, graph.CanRead)[0]
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "secret_sources=a-secret.yaml#document=1,z-secret.yaml#document=1")
+}
+
+func TestAddRoutesDuplicateSecretReadEvidenceDeduplicates(t *testing.T) {
+	g := graph.New()
+	binding := roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: "secret-reader"}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)
+	resources := parserkubernetes.Resources{
+		Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+		Roles:   []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"})}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{
+			binding,
+			binding,
+		},
+	}
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.CanRead, 1)
+	edge := edgesOfKind(g, graph.CanRead)[0]
+	if got := strings.Count(edge.Evidence.Detail, "binding_name=read-secrets"); got != 1 {
+		t.Fatalf("can-read evidence record count = %d, want 1 in %q", got, edge.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesSecretReadConflictLeavesGraphsUnchanged(t *testing.T) {
+	t.Run("empty graph", func(t *testing.T) {
+		g := graph.New()
+		resources := secretReadResources(secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"}))
+		resources.Roles = append(resources.Roles, role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"pods"}, nil, []string{"get"})}, "conflict-role.yaml", 1))
+
+		err := AddRoutes(g, resources)
+		if err == nil {
+			t.Fatal("add routes error = nil, want duplicate Role conflict")
+		}
+		assertGraphCounts(t, g, 0, 0, 0)
+	})
+
+	t.Run("prepopulated graph", func(t *testing.T) {
+		g := graph.New()
+		if err := AddRoutes(g, routeResources("LoadBalancer")); err != nil {
+			t.Fatalf("seed graph: %v", err)
+		}
+		before := mustMarshalGraph(t, g)
+		resources := secretReadResources(secretRule([]string{""}, []string{"secrets"}, nil, []string{"get"}))
+		resources.Roles = append(resources.Roles, role("prod", "secret-reader", []parserkubernetes.PolicyRule{secretRule([]string{""}, []string{"pods"}, nil, []string{"get"})}, "conflict-role.yaml", 1))
+
+		if err := AddRoutes(g, resources); err == nil {
+			t.Fatal("add routes error = nil, want duplicate Role conflict")
+		}
+		after := mustMarshalGraph(t, g)
+		if string(after) != string(before) {
+			t.Fatalf("graph changed after failed AddRoutes:\nbefore: %s\nafter:  %s", before, after)
+		}
+	})
+}
+
+func TestSecretValuesNeverAppearInParserGraphErrorsOrEvidence(t *testing.T) {
+	dir := t.TempDir()
+	const fakeDataValue = "FAKE_SECRET_GRAPH_DATA_VALUE_DO_NOT_RETAIN"
+	const fakeStringDataValue = "FAKE_SECRET_GRAPH_STRINGDATA_VALUE_DO_NOT_RETAIN"
+	writeManifest(t, dir, "resources.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+  namespace: prod
+data:
+  password: FAKE_SECRET_GRAPH_DATA_VALUE_DO_NOT_RETAIN
+stringData:
+  token: FAKE_SECRET_GRAPH_STRINGDATA_VALUE_DO_NOT_RETAIN
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-reader
+  namespace: prod
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-secrets
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: secret-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: prod
+`)
+	resources, err := parserkubernetes.ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	parserJSON, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	g := graph.New()
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+	graphJSON := mustMarshalGraph(t, g)
+	evidence := allGraphEvidence(g)
+
+	badDir := t.TempDir()
+	const malformedFakeValue = "FAKE_SECRET_MALFORMED_VALUE_DO_NOT_RETAIN"
+	writeManifest(t, badDir, "bad-secret.yaml", `apiVersion: v1
+kind: Secret
+metadata: [
+data:
+  password: FAKE_SECRET_MALFORMED_VALUE_DO_NOT_RETAIN
+`)
+	_, parseErr := parserkubernetes.ParseDir(badDir)
+	if parseErr == nil {
+		t.Fatal("parse malformed Secret error = nil, want error")
+	}
+
+	for _, value := range []string{fakeDataValue, fakeStringDataValue, malformedFakeValue} {
+		for name, output := range map[string]string{
+			"parser resources": string(parserJSON),
+			"graph json":       string(graphJSON),
+			"evidence":         evidence,
+			"parse error":      parseErr.Error(),
+		} {
+			if strings.Contains(output, value) {
+				t.Fatalf("%s contains secret value %q: %s", name, value, output)
+			}
+		}
+	}
+}
+
 func TestAddRoutesFixturePublicRoute(t *testing.T) {
 	resources, err := parserkubernetes.ParseDir("testdata/public-route")
 	if err != nil {
@@ -2350,6 +2945,14 @@ func serviceAccount(namespace, name string, automount *bool, filename string, do
 	}
 }
 
+func secret(namespace, name, filename string, document int) parserkubernetes.Secret {
+	return parserkubernetes.Secret{
+		Namespace: namespace,
+		Name:      name,
+		Source:    parserkubernetes.Source{Filename: filename, Document: document},
+	}
+}
+
 func role(namespace, name string, rules []parserkubernetes.PolicyRule, filename string, document int) parserkubernetes.Role {
 	return parserkubernetes.Role{
 		Namespace: namespace,
@@ -2399,6 +3002,27 @@ func podGetRule() parserkubernetes.PolicyRule {
 		APIGroups: []string{""},
 		Resources: []string{"pods"},
 		Verbs:     []string{"get"},
+	}
+}
+
+func secretRule(apiGroups, resources, resourceNames, verbs []string) parserkubernetes.PolicyRule {
+	return parserkubernetes.PolicyRule{
+		APIGroups:     apiGroups,
+		Resources:     resources,
+		ResourceNames: resourceNames,
+		Verbs:         verbs,
+	}
+}
+
+func secretReadResources(rule parserkubernetes.PolicyRule) parserkubernetes.Resources {
+	return parserkubernetes.Resources{
+		Secrets: []parserkubernetes.Secret{secret("prod", "database-password", "secret.yaml", 1)},
+		Roles:   []parserkubernetes.Role{role("prod", "secret-reader", []parserkubernetes.PolicyRule{rule}, "role.yaml", 1)},
+		RoleBindings: []parserkubernetes.RoleBinding{roleBinding("prod", "read-secrets", parserkubernetes.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "secret-reader",
+		}, []parserkubernetes.Subject{serviceAccountSubject("prod", "api")}, "binding.yaml", 1)},
 	}
 }
 
@@ -2534,6 +3158,20 @@ func assertEvidenceRecordContains(t *testing.T, detail string, fields ...string)
 		}
 	}
 	t.Fatalf("evidence detail = %q, want one record containing %#v", detail, fields)
+}
+
+func allGraphEvidence(g *graph.Graph) string {
+	var values []string
+	for _, node := range g.Nodes() {
+		for _, evidence := range node.Evidence {
+			values = append(values, evidence.Source, evidence.Detail)
+		}
+	}
+	for _, edge := range g.Edges() {
+		values = append(values, edge.Evidence.Source, edge.Evidence.Detail)
+	}
+	sort.Strings(values)
+	return strings.Join(values, "\n")
 }
 
 func writeManifest(t *testing.T, dir, name, content string) string {
