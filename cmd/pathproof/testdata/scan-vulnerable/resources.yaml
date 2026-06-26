@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: public-api
+  namespace: prod
+spec:
+  type: LoadBalancer
+  selector:
+    app: api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: api
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  namespace: prod
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+  namespace: prod
+data:
+  password: FAKE_CLI_SECRET_DATA_VALUE_DO_NOT_RETAIN
+stringData:
+  token: FAKE_CLI_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-reader
+  namespace: prod
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-secrets
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: secret-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: prod

@@ -135,6 +135,23 @@ Secret values are absent from findings because Secret values are never ingested
 into parser output or graph evidence. The analyzer does not redact arbitrary
 strings from graph evidence.
 
+The scan CLI uses a private presentation projection and does not change the
+internal graph or analysis schemas. JSON scan output has this stable top-level
+shape:
+
+```json
+{
+  "findings": [],
+  "finding_count": 0
+}
+```
+
+Each CLI JSON finding includes the finding `id`, `rule_id`, `title`,
+`severity`, `summary`, ordered `path`, ordered `evidence`, and
+`source_references`. Each path entry contains the graph node `id`, `kind`, and
+`name`. Each evidence entry contains `edge_id`, `kind`, `source`, and `detail`.
+Path and evidence order match the deterministic analysis chain order.
+
 Observed Roles or ClusterRoles with empty `rules` can still appear as reachable
 Role nodes and have `BoundTo` edges, but they create no Permission nodes and no
 `GrantsPermission` edges. Missing role references create unresolved Role nodes
@@ -150,4 +167,5 @@ resource rules in the same Role or ClusterRole are still modeled.
 
 The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
-remediation, analysis CLI commands, or attack-path rules beyond `PP-K8S-001`.
+remediation, or attack-path rules beyond `PP-K8S-001`. The scan CLI currently
+supports local Kubernetes YAML directories only.

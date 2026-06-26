@@ -22,10 +22,11 @@
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
+- Local Kubernetes YAML scan CLI for `pathproof scan <directory>` with
+  human-readable output, JSON output, and stable exit codes.
 
 ## Later
 
-- CLI integration for attack-path analysis.
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Remediation verification.
