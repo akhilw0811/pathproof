@@ -27,17 +27,24 @@
   `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
   Plans contain only complete options; multi-chain Secret read access requires
   coordinated changes in one option.
+- Opt-in read-only patch previews for `NarrowBindingSubject`, limited to exact
+  ServiceAccount subject removal from the referenced RoleBinding or
+  ClusterRoleBinding source document. Secret-bearing source files are
+  intentionally unsupported for previews.
 - Local Kubernetes YAML scan CLI for `pathproof scan <directory>` with
-  human-readable finding and remediation output, JSON output, and stable exit
-  codes.
+  human-readable finding, remediation, and optional patch preview output, JSON
+  output, and stable exit codes.
 
 ## Later
 
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Remediation verification.
-- YAML editing, patch generation, remediation application, validation rescans,
-  and pull request creation.
+- Patch application, validation rescans, and pull request creation.
+- Patch previews for RBAC rule edits, wildcard resources or verbs,
+  multi-resource rule splitting, API-group splitting, ClusterRoleBinding scope
+  changes, `resourceNames`, Secret-bearing source files, and broader patch
+  types.
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
   ClusterRoles, Secret values, broader Secret attack-path coverage,
   live-cluster authorization verification, and remediation when a concrete task

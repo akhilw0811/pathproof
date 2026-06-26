@@ -223,12 +223,33 @@ When a complete remediation plan exists, the CLI finding also includes:
             "source_reference": "resources.yaml#document=5",
             "permission_sha256": "..."
           }
+        ],
+        "patch_previews": [
+          {
+            "plan_id": "plan:...",
+            "option_index": 0,
+            "option_action": "NarrowBindingSubject",
+            "change_index": 0,
+            "status": "generated",
+            "summary": "...",
+            "file": "resources.yaml",
+            "diff": "--- resources.yaml\n+++ resources.yaml\n@@ ...\n"
+          }
         ]
       }
     ]
   }
 }
 ```
+
+`patch_previews` appears only when `pathproof scan --preview-patches` is used.
+It is omitted from default human and JSON output. Preview entries are attached
+to the remediation option that produced them and use zero-based
+`option_index` and `change_index` values to preserve the option/change
+relationship without adding persistent option IDs to remediation plans.
+Generated previews contain relative file paths and timestamp-free unified
+diffs. Unsupported previews use `status: "unsupported"` with a deterministic
+`reason` and no `diff`.
 
 Implemented remediation actions are:
 
@@ -248,14 +269,24 @@ prefers `RemoveSecretsResource` split/remove guidance when that guidance is
 complete, otherwise it omits the unsafe option. Future patch planning may add
 explicit API-group split/narrow guidance.
 
-Plans are advisory and read-only. They do not edit YAML, generate patches,
-apply changes, rescan files, or create pull requests. The planner returns only
-complete options: applying all changes in one option would break the modeled
-`CanRead` edge for that finding. If multiple independent authorization chains
-contribute to one `CanRead` edge, a complete option contains one required
-change per chain and marks that all listed changes must be applied together.
-If no complete option can be generated from structured metadata, no plan is
-reported for that finding.
+Plans are advisory and read-only. They do not edit YAML, apply changes, rescan
+files, or create pull requests. The planner returns only complete options:
+applying all changes in one option would break the modeled `CanRead` edge for
+that finding. If multiple independent authorization chains contribute to one
+`CanRead` edge, a complete option contains one required change per chain and
+marks that all listed changes must be applied together. If no complete option
+can be generated from structured metadata, no plan is reported for that
+finding.
+
+Patch previews are a separate opt-in CLI projection step, not part of the graph
+schema. The initial implementation supports only `NarrowBindingSubject` for
+`rbac.authorization.k8s.io/v1` `RoleBinding` and `ClusterRoleBinding`
+documents. It resolves the existing source reference exactly, edits only that
+referenced document in memory, and emits one preview per remediation change.
+Preview generation is intentionally unsupported for source files containing a
+core `v1` Secret with payload fields, unsupported remediation actions, missing
+or malformed source references, mismatched target documents, namespace-less
+subjects, and changes that would leave `subjects` empty.
 
 Plan IDs are stable SHA-256 hashes over canonical JSON containing the finding
 ID and ordered canonical option identities. Option identities contain priority,
@@ -280,6 +311,7 @@ resource rules in the same Role or ClusterRole are still modeled.
 
 The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
-YAML editing, patch generation, remediation application, validation rescans,
-or attack-path rules beyond `PP-K8S-001`. The scan CLI currently supports
-local Kubernetes YAML directories only.
+patch application, validation rescans, or attack-path rules beyond
+`PP-K8S-001`. The scan CLI currently supports local Kubernetes YAML
+directories only. Patch previews are limited to `NarrowBindingSubject` and do
+not cover RBAC rule edits or broader YAML patch types.
