@@ -2,7 +2,6 @@ package githubactions
 
 import (
 	"fmt"
-	"strings"
 
 	"pathproof/internal/graph"
 	parsergithubactions "pathproof/internal/parser/githubactions"
@@ -33,7 +32,10 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 			}
 
 			for _, step := range job.Steps {
-				actionUse := actionUseMetadata(workflow, job, step)
+				actionUse, ok := actionUseMetadata(workflow, job, step)
+				if !ok {
+					continue
+				}
 				actionNode := graph.NewNode(graph.GitHubAction, githubActionNodeName(workflow, job, step))
 				actionNode.Evidence = []graph.SourceEvidence{sourceEvidence(workflow.Source, "github actions workflow step uses "+step.Uses)}
 				addedAction, err := g.AddNode(actionNode)
@@ -42,7 +44,7 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 				}
 				usesAction := graph.NewEdge(graph.UsesAction, addedJob.ID, addedAction.ID, graph.SourceEvidence{
 					Source: sourceRef(workflow.Source),
-					Detail: fmt.Sprintf("github actions job %s step %d uses %s", job.ID, step.Index, step.Uses),
+					Detail: actionUseEvidenceDetail(actionUse),
 				})
 				usesAction.Metadata = &graph.EdgeMetadata{GitHubActionUse: &actionUse}
 				if _, err := g.AddEdge(usesAction); err != nil {
@@ -54,64 +56,58 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 	return nil
 }
 
-func actionUseMetadata(workflow parsergithubactions.Workflow, job parsergithubactions.Job, step parsergithubactions.Step) graph.GitHubActionUse {
-	ref := parseActionReference(step.Uses)
+func actionUseMetadata(workflow parsergithubactions.Workflow, job parsergithubactions.Job, step parsergithubactions.Step) (graph.GitHubActionUse, bool) {
+	if step.Owner == "" || step.Repo == "" || step.Uses == "" {
+		return graph.GitHubActionUse{}, false
+	}
 	return graph.GitHubActionUse{
-		WorkflowSourceReference: sourceRef(workflow.Source),
-		WorkflowFile:            workflow.Source.RelativePath,
-		WorkflowName:            workflowDisplayName(workflow),
-		JobID:                   job.ID,
-		StepIndex:               step.Index,
-		StepName:                step.Name,
-		Uses:                    step.Uses,
-		Owner:                   ref.owner,
-		Repo:                    ref.repo,
-		Path:                    ref.path,
-		Ref:                     ref.ref,
-	}
+		WorkflowSourceReference:   sourceRef(workflow.Source),
+		WorkflowFile:              workflow.Source.RelativePath,
+		WorkflowName:              workflowDisplayName(workflow),
+		TriggersPullRequestTarget: workflow.TriggersPullRequestTarget,
+		JobID:                     job.ID,
+		StepIndex:                 step.Index,
+		StepName:                  step.Name,
+		Uses:                      step.Uses,
+		Owner:                     step.Owner,
+		Repo:                      step.Repo,
+		Path:                      step.Path,
+		Ref:                       step.Ref,
+		CheckoutHeadSelectors:     checkoutHeadSelectors(step.CheckoutHeadSelectors),
+	}, true
 }
 
-type actionReference struct {
-	owner string
-	repo  string
-	path  string
-	ref   string
+func checkoutHeadSelectors(selectors []parsergithubactions.CheckoutHeadSelector) []graph.GitHubActionsCheckoutHeadSelector {
+	if len(selectors) == 0 {
+		return nil
+	}
+	out := make([]graph.GitHubActionsCheckoutHeadSelector, 0, len(selectors))
+	for _, selector := range selectors {
+		out = append(out, graph.GitHubActionsCheckoutHeadSelector{
+			Field:             selector.Field,
+			MatchedExpression: selector.MatchedExpression,
+		})
+	}
+	return out
 }
 
-func parseActionReference(uses string) actionReference {
-	value := strings.TrimSpace(uses)
-	if value == "" || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "docker://") {
-		return actionReference{}
+func actionUseEvidenceDetail(actionUse graph.GitHubActionUse) string {
+	detail := fmt.Sprintf("github actions job %s step %d uses %s", actionUse.JobID, actionUse.StepIndex, actionUse.Uses)
+	if !actionUse.TriggersPullRequestTarget || len(actionUse.CheckoutHeadSelectors) == 0 {
+		return detail
 	}
-	if isEntireExpression(value) {
-		return actionReference{}
-	}
-
-	target, ref, _ := strings.Cut(value, "@")
-	if strings.Contains(target, "${{") || strings.Contains(target, "}}") {
-		return actionReference{}
-	}
-	parts := strings.Split(target, "/")
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-		return actionReference{}
-	}
-	if strings.ContainsAny(parts[0], " \t\r\n:") || strings.ContainsAny(parts[1], " \t\r\n:") {
-		return actionReference{}
-	}
-	path := ""
-	if len(parts) > 2 {
-		path = strings.Join(parts[2:], "/")
-	}
-	return actionReference{
-		owner: parts[0],
-		repo:  parts[1],
-		path:  path,
-		ref:   ref,
-	}
+	return detail + " in pull_request_target with " + selectorEvidence(actionUse.CheckoutHeadSelectors)
 }
 
-func isEntireExpression(value string) bool {
-	return strings.HasPrefix(value, "${{") && strings.HasSuffix(value, "}}")
+func selectorEvidence(selectors []graph.GitHubActionsCheckoutHeadSelector) string {
+	out := ""
+	for i, selector := range selectors {
+		if i > 0 {
+			out += ", "
+		}
+		out += selector.Field + "=" + selector.MatchedExpression
+	}
+	return out
 }
 
 func workflowName(workflow parsergithubactions.Workflow) string {

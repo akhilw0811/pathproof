@@ -35,23 +35,27 @@ output, exactly one trailing newline, stderr-only errors, output write failures,
 deterministic repeated output, deterministic input file ordering, and
 Secret-value absence from stdout and stderr. GitHub Actions CLI coverage
 asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
-mixed Kubernetes and GitHub Actions findings are deterministic, `PP-GHA-001`
-appears in human and JSON output without remediation, patch previews, patch
-outputs, or validation results, and secret-like workflow env, with, and run
-values are absent from stdout, stderr, JSON, SARIF, and errors. CLI projection
+unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
+GitHub Actions findings are deterministic, `PP-GHA-001` and `PP-GHA-002`
+appear in human and JSON output without remediation, patch previews, patch
+outputs, or validation results, and secret-like workflow env, with, run, and
+expression-only `uses:` values are absent from stdout, stderr, JSON, SARIF,
+and errors. CLI projection
 tests verify that finding path entries preserve node ID/kind/name, evidence
 entries preserve edge ID/kind/source/detail, generic path edge continuity is
 enforced for all finding shapes, and inconsistent finding-to-graph projection
 is treated as an internal scan error without partial stdout.
 
 SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
-PathProof driver run, deterministic rule entries for `PP-K8S-001` and
-`PP-GHA-001`, one result for vulnerable fixtures, zero results for safe
-fixtures, deterministic rule/result fields, byte-identical repeated scans, and
-unchanged exit codes. GitHub Actions SARIF coverage asserts `PP-GHA-001`
-severity maps to `warning`, workflow artifact URIs are relative and URI-safe,
-line numbers are not guessed, rule text avoids the old inaccurate scope
-wording, and secret-like workflow values are absent. Source-location
+PathProof driver run, deterministic rule entries for `PP-K8S-001`,
+`PP-GHA-001`, and `PP-GHA-002`, one result for vulnerable fixtures, zero
+results for safe fixtures, deterministic rule/result fields, byte-identical
+repeated scans, and unchanged exit codes. GitHub Actions SARIF coverage asserts
+`PP-GHA-001` severity maps to `warning`, `PP-GHA-002` severity maps to
+`error`, workflow artifact URIs are relative and URI-safe, line numbers are
+not guessed, rule text avoids the old inaccurate scope wording, sanitized
+selector evidence is present, and secret-like workflow values are absent.
+Source-location
 tests cover URI-encoded relative artifact URIs for paths with spaces,
 display-safe relative `properties.source_references`, omission of malformed
 document suffixes, omission of outside-root references, and refusal to parse
@@ -82,10 +86,12 @@ parser output and parse errors.
 GitHub Actions parser tests cover workflow file discovery under
 `.github/workflows`, `.yml` and `.yaml` filtering, one-job workflows, multiple
 jobs sorted by job ID, run-only step omission, deterministic file ordering,
-malformed workflow errors with filenames, paths with spaces, missing workflow
-directories, and regression checks that env values, with values, secret-like
-tokens, run scripts, and raw workflow documents are absent from serialized
-parser output and errors.
+`pull_request_target` trigger detection for unquoted and quoted `on`, scalar
+`on`, sequence `on`, and mapping `on` forms, checkout PR-head selector
+detection, malformed workflow errors with filenames, paths with spaces,
+missing workflow directories, and regression checks that env values, arbitrary
+with values, secret-like tokens, run scripts, expression-only `uses:` values,
+and raw workflow documents are absent from serialized parser output and errors.
 
 Kubernetes routing tests cover deterministic graph construction, source
 evidence, duplicate conflict rejection before graph mutation, namespace-scoped
@@ -107,9 +113,10 @@ that Secret values are absent from graph JSON, metadata, and evidence.
 
 GitHub Actions routing tests cover deterministic `Workflow`, `WorkflowJob`,
 and `GitHubAction` node construction, `DefinesJob` and `UsesAction` edges,
-source evidence, repeated action uses remaining distinct by step index, static
-owner/repo/path/ref parsing, local and Docker action exclusion from static
-action metadata, expression handling, and regression checks that ignored
+source evidence, repeated action uses remaining distinct by step index,
+sanitized owner/repo/path/ref metadata, `pull_request_target` trigger metadata,
+sanitized checkout selector metadata, local and Docker action exclusion from
+static action metadata, expression handling, and regression checks that ignored
 workflow values are absent from graph JSON.
 
 Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
@@ -127,13 +134,19 @@ preserves graph evidence and does not perform generic redaction.
 
 GitHub Actions analysis tests cover `PP-GHA-001` positives for action refs
 such as `actions/checkout@v4`, `docker/login-action@main`,
-`owner/repo/path@v1.2.3`, missing refs, and expression refs on static
+`owner/repo/path@v1.2.3`, missing refs, and sanitized expression refs on static
 `owner/repo` actions. Negative tests cover local actions, Docker actions,
 entire expression `uses:` values, and refs pinned to exactly 40 hexadecimal
 characters including uppercase hex. Coverage also asserts fixed `Medium`
 severity, deterministic repeated analysis, stable finding IDs, finding ID
-changes when action refs change, absence of the old inaccurate scope wording, and
-secret-like workflow values absent from finding JSON.
+changes when action refs change, absence of the old inaccurate scope wording,
+and secret-like workflow values absent from finding JSON. `PP-GHA-002` tests
+cover `pull_request_target` workflows with `actions/checkout` PR-head SHA,
+head ref, and head repository selectors; negatives for `pull_request` only,
+checkout without head override, non-checkout actions with PR-head-looking
+fields, expression-only `uses`, and no checkout step; stable and selector-
+sensitive finding IDs; sanitized evidence; secret exclusion; and both
+`PP-GHA-001` and `PP-GHA-002` firing on the same unpinned unsafe checkout.
 
 Remediation tests cover the read-only `internal/remediation.Build` API for
 `PP-K8S-001`. Coverage asserts complete advisory options for

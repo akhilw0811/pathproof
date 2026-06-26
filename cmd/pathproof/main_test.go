@@ -272,6 +272,208 @@ func TestRunScanGitHubActionsJSONOutputIncludesFindingWithoutRemediation(t *test
 	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
 }
 
+func TestRunScanGitHubActionsUnsafePullRequestTargetCheckoutHumanOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `name: Unsafe
+on: pull_request_target
+env:
+  TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - name: Checkout
+        uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 1\n")
+	assertContains(t, stdout, "Rule: PP-GHA-002\n")
+	assertContains(t, stdout, "Title: pull_request_target workflow checks out untrusted pull request head code\n")
+	assertContains(t, stdout, "Severity: High\n")
+	assertContains(t, stdout, "Workflow githubactions://.github/workflows/unsafe.yml")
+	assertContains(t, stdout, "WorkflowJob githubactions://.github/workflows/unsafe.yml/job/test")
+	assertContains(t, stdout, "GitHubAction githubactions://.github/workflows/unsafe.yml/job/test/step/1/action/actions/checkout@0123456789abcdef0123456789abcdef01234567")
+	assertContains(t, stdout, "pull_request_target")
+	assertContains(t, stdout, "ref=github.event.pull_request.head.sha")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") || strings.Contains(stdout, "${{") {
+		t.Fatalf("PP-GHA-002 output contains unsupported or raw expression text: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsUnsafePullRequestTargetCheckoutJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `on:
+  pull_request_target:
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          password: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=json", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 {
+		t.Fatalf("finding count = %d len = %d, want 1", report.FindingCount, len(report.Findings))
+	}
+	finding := report.Findings[0]
+	if finding.RuleID != "PP-GHA-002" || finding.Severity != "High" {
+		t.Fatalf("finding = %#v, want PP-GHA-002 High", finding)
+	}
+	if finding.Remediation != nil {
+		t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+	}
+	if len(finding.Path) != 3 || len(finding.Evidence) != 2 {
+		t.Fatalf("path/evidence lengths = %d/%d, want 3/2", len(finding.Path), len(finding.Evidence))
+	}
+	assertContains(t, stdout, "repository=github.event.pull_request.head.repo.full_name")
+	assertContains(t, stdout, "ref=github.event.pull_request.head.ref")
+	for _, forbidden := range []string{"FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN", "password", "${{"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanGitHubActionsExpressionOnlyUsesValueIsNotRetained(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "expression.yml", `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: ${{ secrets.ACTION_REF }}
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+
+	for _, args := range [][]string{
+		{"scan", dir},
+		{"scan", "--format=json", dir},
+		{"scan", "--format=sarif", dir},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			stdout, stderr, code := runCommand(args...)
+
+			assertCode(t, code, 0)
+			assertString(t, "stderr", stderr, "")
+			for _, forbidden := range []string{"secrets.ACTION_REF", "${{ secrets.ACTION_REF }}"} {
+				if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+					t.Fatalf("output contains expression-only uses value %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+				}
+			}
+		})
+	}
+}
+
+func TestRunScanGitHubActionsNonCheckoutHeadSelectorDoesNotEmitPPGHA002(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe-looking.yml", `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: evil/action@v1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=json", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 {
+		t.Fatalf("findings = %#v, count = %d; want one PP-GHA-001 finding", report.Findings, report.FindingCount)
+	}
+	if report.Findings[0].RuleID != "PP-GHA-001" {
+		t.Fatalf("rule_id = %q, want PP-GHA-001 only", report.Findings[0].RuleID)
+	}
+	if strings.Contains(stdout, "PP-GHA-002") || strings.Contains(stdout, "${{") {
+		t.Fatalf("output contains unexpected PP-GHA-002 or raw expression: %s", stdout)
+	}
+}
+
+func TestRunScanGitHubActionsUnpinnedUnsafeCheckoutFindingsAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+
+	firstOut, firstErr, firstCode := runCommand("scan", "--format=json", dir)
+	secondOut, secondErr, secondCode := runCommand("scan", "--format=json", dir)
+
+	assertCode(t, firstCode, 1)
+	assertCode(t, secondCode, 1)
+	assertString(t, "first stderr", firstErr, "")
+	assertString(t, "second stderr", secondErr, "")
+	assertString(t, "stdout", secondOut, firstOut)
+	report := assertValidJSONReport(t, firstOut)
+	if report.FindingCount != 2 || len(report.Findings) != 2 {
+		t.Fatalf("finding count = %d len = %d, want 2", report.FindingCount, len(report.Findings))
+	}
+	seen := map[string]bool{}
+	for i, finding := range report.Findings {
+		seen[finding.RuleID] = true
+		if finding.Remediation != nil {
+			t.Fatalf("finding %s remediation = %#v, want nil", finding.RuleID, finding.Remediation)
+		}
+		if i > 0 && report.Findings[i-1].ID > finding.ID {
+			t.Fatalf("findings are not sorted by deterministic ID: %#v", report.Findings)
+		}
+	}
+	if !seen["PP-GHA-001"] || !seen["PP-GHA-002"] {
+		t.Fatalf("rules seen = %#v, want PP-GHA-001 and PP-GHA-002", seen)
+	}
+}
+
+func TestRunScanGitHubActionsUnsafeCheckoutPatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("mkdir scan root: %v", err)
+	}
+	writeGitHubActionsWorkflowForTest(t, root, "unsafe.yml", `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-GHA-002\n")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 0")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-GHA-002 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestRunScanMixedKubernetesAndGitHubActionsFindingsAreDeterministic(t *testing.T) {
 	dir := t.TempDir()
 	writeSplitVulnerableFixture(t, dir, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})

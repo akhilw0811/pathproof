@@ -111,8 +111,8 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	}
 	run := report.Runs[0]
 	assertString(t, "driver name", run.Tool.Driver.Name, "PathProof")
-	if len(run.Tool.Driver.Rules) != 2 {
-		t.Fatalf("rules len = %d, want 2", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 3 {
+		t.Fatalf("rules len = %d, want 3", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-K8S-001")
 	assertString(t, "rule id", rule.ID, "PP-K8S-001")
@@ -181,8 +181,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 2 {
-		t.Fatalf("rules len = %d, want 2", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 3 {
+		t.Fatalf("rules len = %d, want 3", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-001")
 	assertString(t, "rule id", rule.ID, "PP-GHA-001")
@@ -219,6 +219,66 @@ jobs:
 	}
 	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) {
 		t.Fatalf("SARIF output contains old inaccurate wording: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsUnsafeCheckoutSARIFOutputShapeAndFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe workflow.yml", `name: Unsafe
+on: pull_request_target
+env:
+  TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - name: Checkout
+        uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	run := report.Runs[0]
+	if len(run.Tool.Driver.Rules) != 3 {
+		t.Fatalf("rules len = %d, want 3", len(run.Tool.Driver.Rules))
+	}
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-002")
+	assertString(t, "rule id", rule.ID, "PP-GHA-002")
+	assertString(t, "rule name", rule.Name, "pull_request_target workflow checks out untrusted pull request head code")
+	assertContains(t, rule.FullDescription.Text, "pull_request_target")
+	assertContains(t, rule.FullDescription.Text, "actions/checkout")
+	assertString(t, "rule default level", rule.DefaultConfiguration.Level, "error")
+	if len(run.Results) != 1 {
+		t.Fatalf("results len = %d, want 1: %#v", len(run.Results), run.Results)
+	}
+	result := run.Results[0]
+	assertString(t, "ruleId", result.RuleID, "PP-GHA-002")
+	assertString(t, "level", result.Level, "error")
+	assertContains(t, result.Message.Text, ".github/workflows/unsafe workflow.yml")
+	assertContains(t, result.Message.Text, "job test step 1")
+	assertContains(t, result.Message.Text, "actions/checkout@0123456789abcdef0123456789abcdef01234567")
+	assertContains(t, result.Message.Text, "ref=github.event.pull_request.head.sha")
+	if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+		t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+	}
+	assertString(t, "severity", result.Properties.Severity, "High")
+	if len(result.Properties.NodeIDs) != 3 || len(result.Properties.EdgeIDs) != 2 {
+		t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want 3/2", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+	}
+	gotURIs := locationURIs(result.Locations)
+	wantURIs := []string{".github/workflows/unsafe%20workflow.yml#document=1"}
+	if !reflectDeepEqualStrings(gotURIs, wantURIs) {
+		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
+	}
+	if strings.Contains(stdout, "${{") {
+		t.Fatalf("SARIF output contains raw expression: %s", stdout)
 	}
 	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
 }

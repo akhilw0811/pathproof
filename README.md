@@ -7,13 +7,15 @@ Secret metadata, detects the `PP-K8S-001` path from a public workload to a
 readable Secret, proposes deterministic remediation, previews and writes
 patched copies, and validates the fix with a rescan. It also detects
 `PP-GHA-001` when a GitHub Actions `uses:` reference is not pinned to a full
-40-character commit SHA.
+40-character commit SHA, and `PP-GHA-002` when a `pull_request_target`
+workflow checks out untrusted pull request head code with `actions/checkout`.
 
 PathProof is currently a defensive Go CLI focused on two small, tested local
 slices. It scans local YAML manifests and workflows, builds an in-memory graph,
 reports `PP-K8S-001` when an internet-facing workload runs as a ServiceAccount
 that can read a Kubernetes Secret, and reports `PP-GHA-001` for unpinned
-GitHub Actions action references.
+GitHub Actions action references and `PP-GHA-002` for unsafe
+`pull_request_target` checkout of pull request head code.
 
 Cloud provider APIs, full CI/CD attack-path modeling, workflow permissions
 analysis, OIDC trust analysis, reusable workflow resolution, action source
@@ -161,6 +163,21 @@ Title: GitHub Actions workflow uses an action that is not pinned to a full commi
 Severity: Medium
 ```
 
+## GitHub Actions Security
+
+PathProof currently implements two small local GitHub Actions checks:
+
+- `PP-GHA-001`: a workflow `uses:` reference is not pinned to a full
+  40-character commit SHA.
+- `PP-GHA-002`: a `pull_request_target` workflow uses `actions/checkout` with
+  sanitized PR-head selectors such as
+  `github.event.pull_request.head.sha`, `github.head_ref`, or
+  `github.event.pull_request.head.repo.full_name`.
+
+These checks are static and local. PathProof does not execute workflows, call
+GitHub APIs, evaluate expressions, inspect action source, model workflow
+permissions, or claim full CI/CD attack-path coverage.
+
 ## CI / SARIF
 
 The GitHub Actions workflow builds and tests PathProof, then runs the built CLI
@@ -196,10 +213,13 @@ only publishes the SARIF file as an artifact.
 - Safe read-only patch previews.
 - Patched-copy output to a separate directory, never in-place edits.
 - Validation by rescanning a complete temporary patched manifest set.
-- SARIF 2.1.0 finding export for the implemented `PP-K8S-001` rule.
+- SARIF 2.1.0 finding export for implemented Kubernetes and GitHub Actions
+  rules.
 - Local GitHub Actions workflow parsing under `.github/workflows`.
 - `PP-GHA-001` detection for GitHub Actions `uses:` references that are not
   pinned to a full 40-character commit SHA.
+- `PP-GHA-002` detection for `pull_request_target` workflows that configure
+  `actions/checkout` to check out pull request head code.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -214,7 +234,7 @@ The scan loop is:
 3. Build an in-memory evidence graph.
 4. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
 5. Add deterministic GitHub Actions workflow/job/action-use edges.
-6. Analyze the graph for `PP-K8S-001` and `PP-GHA-001`.
+6. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, and `PP-GHA-002`.
 7. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
 8. Optionally generate read-only `NarrowBindingSubject` patch previews.
@@ -237,6 +257,8 @@ Implemented:
 - RBAC Secret read analysis.
 - `PP-K8S-001` finding.
 - `PP-GHA-001` finding for action references not pinned to a full commit SHA.
+- `PP-GHA-002` finding for unsafe `pull_request_target` checkout of pull
+  request head code.
 - SARIF 2.1.0 finding export.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
@@ -252,6 +274,7 @@ Not implemented:
 - Reusable workflow resolution.
 - Action source inspection.
 - Automatic action pinning patches.
+- Automatic remediation for unsafe `pull_request_target` checkout patterns.
 - PR creation.
 - In-place edits.
 - Broad RBAC patching.
