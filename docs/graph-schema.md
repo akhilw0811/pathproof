@@ -26,6 +26,11 @@ stable deterministic hashes of typed identities.
 - `GitHubAction`: one parsed workflow step with a `uses:` value. Action node
   names include the relative workflow path, job ID, step index, and raw
   `uses:` value.
+- `OIDCTokenCapability`: a local GitHub Actions workflow or job capability to
+  request an OIDC token. Workflow-level node names use
+  `githubactions://<relative-workflow-path>/oidc-token/workflow`. Job-level
+  node names use
+  `githubactions://<relative-workflow-path>/job/<job_id>/oidc-token`.
 
 ## Edge Kinds
 
@@ -39,6 +44,9 @@ stable deterministic hashes of typed identities.
   RBAC authorization model.
 - `DefinesJob`: a GitHub Actions workflow defines a job.
 - `UsesAction`: a GitHub Actions job step uses an action reference.
+- `CanRequestOIDCToken`: a GitHub Actions workflow or job can request an OIDC
+  token because it explicitly grants `id-token: write` or
+  `permissions: write-all`.
 
 ## Evidence
 
@@ -235,6 +243,54 @@ retain or serialize unknown permission values, expression-based permission
 values, `env`, arbitrary `with`, `secrets`, token values, run scripts, or raw
 workflow documents.
 
+`OIDCTokenCapability` nodes include optional typed GitHub Actions OIDC
+capability metadata:
+
+```json
+{
+  "metadata": {
+    "github_actions_oidc_token_capability": {
+      "provider": "github-actions",
+      "workflow_source_reference": ".github/workflows/deploy.yml#document=1",
+      "workflow_file": ".github/workflows/deploy.yml",
+      "workflow_name": "Deploy",
+      "scope": "job",
+      "job_id": "deploy"
+    }
+  }
+}
+```
+
+`CanRequestOIDCToken` edges include optional typed request metadata:
+
+```json
+{
+  "metadata": {
+    "github_actions_oidc_token_request": {
+      "provider": "github-actions",
+      "workflow_source_reference": ".github/workflows/deploy.yml#document=1",
+      "workflow_file": ".github/workflows/deploy.yml",
+      "workflow_name": "Deploy",
+      "scope": "job",
+      "job_id": "deploy",
+      "permission": "id-token",
+      "access": "write"
+    }
+  }
+}
+```
+
+The edge evidence detail preserves the source of the capability. Explicit
+`id-token: write` evidence says the workflow or job can request an OIDC token
+with `id-token: write`. `permissions: write-all` evidence says the workflow or
+job can request an OIDC token because `permissions: write-all` includes
+`id-token: write`; it is not rendered as though `id-token: write` was
+explicitly declared. This metadata contains only sanitized workflow identity,
+scope, job identity when applicable, provider, and modeled permission/access.
+It does not include secrets, environment values, arbitrary `with` values, run
+scripts, raw YAML, OIDC claims, JWTs, cloud trust policies, or unknown
+permission values.
+
 PathProof's static Secret read model is:
 
 - `get` or `*` with empty `resourceNames` matches every parsed Secret in the
@@ -318,6 +374,10 @@ job-level dangerous permission grants independently. It does not flag
 `permissions: read-all`, `permissions: {}`, read/none access values, omitted
 permissions, unknown values, or expression-based values. Exact GitHub
 permission inheritance/override modeling is future work.
+
+`CanRequestOIDCToken` does not produce a finding by itself. OIDC capability is
+represented only as graph structure until PathProof has modeled cloud trust
+policies or another deterministic unsafe condition.
 
 Finding IDs are deterministic and stable. `PP-K8S-001` IDs are SHA-256 hashes of a
 canonical JSON identity containing only fixed field names for `rule_id`,

@@ -683,6 +683,82 @@ func TestGraphGitHubActionsWorkflowJobEdgeMetadataIsCloned(t *testing.T) {
 	}
 }
 
+func TestGraphGitHubActionsOIDCTokenCapabilityNodeMetadataIsCloned(t *testing.T) {
+	g := New()
+	capability := NewNode(OIDCTokenCapability, "githubactions://.github/workflows/build.yml/oidc-token/workflow")
+	capability.Metadata = &NodeMetadata{GitHubActionsOIDCTokenCapability: &GitHubActionsOIDCTokenCapability{
+		Provider:                "github-actions",
+		WorkflowSourceReference: ".github/workflows/build.yml#document=1",
+		WorkflowFile:            ".github/workflows/build.yml",
+		WorkflowName:            "Build",
+		Scope:                   "workflow",
+	}}
+
+	added := mustAddNode(t, g, capability)
+	capability.Metadata.GitHubActionsOIDCTokenCapability.Scope = "job"
+	added.Metadata.GitHubActionsOIDCTokenCapability.WorkflowFile = ".github/workflows/changed.yml"
+
+	got, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found", added.ID)
+	}
+	if got.Metadata == nil || got.Metadata.GitHubActionsOIDCTokenCapability == nil {
+		t.Fatalf("metadata = %#v, want github actions oidc token capability metadata", got.Metadata)
+	}
+	if got.Metadata.GitHubActionsOIDCTokenCapability.Scope != "workflow" || got.Metadata.GitHubActionsOIDCTokenCapability.WorkflowFile != ".github/workflows/build.yml" {
+		t.Fatalf("stored metadata changed: %#v", got.Metadata.GitHubActionsOIDCTokenCapability)
+	}
+
+	got.Metadata.GitHubActionsOIDCTokenCapability.Provider = "changed"
+	again, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after mutation", added.ID)
+	}
+	if again.Metadata.GitHubActionsOIDCTokenCapability.Provider != "github-actions" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.GitHubActionsOIDCTokenCapability)
+	}
+}
+
+func TestGraphGitHubActionsOIDCTokenRequestEdgeMetadataIsCloned(t *testing.T) {
+	g := New()
+	workflow := mustAddNode(t, g, NewNode(Workflow, "githubactions://.github/workflows/build.yml"))
+	capability := mustAddNode(t, g, NewNode(OIDCTokenCapability, "githubactions://.github/workflows/build.yml/oidc-token/workflow"))
+	edge := NewEdge(CanRequestOIDCToken, workflow.ID, capability.ID, SourceEvidence{Source: "build.yml", Detail: "oidc"})
+	edge.Metadata = &EdgeMetadata{GitHubActionsOIDCTokenRequest: &GitHubActionsOIDCTokenRequest{
+		Provider:                "github-actions",
+		WorkflowSourceReference: ".github/workflows/build.yml#document=1",
+		WorkflowFile:            ".github/workflows/build.yml",
+		WorkflowName:            "Build",
+		Scope:                   "workflow",
+		Permission:              "id-token",
+		Access:                  "write",
+	}}
+
+	added := mustAddEdge(t, g, edge)
+	edge.Metadata.GitHubActionsOIDCTokenRequest.Scope = "job"
+	added.Metadata.GitHubActionsOIDCTokenRequest.WorkflowFile = ".github/workflows/changed.yml"
+
+	got, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found", added.ID)
+	}
+	if got.Metadata == nil || got.Metadata.GitHubActionsOIDCTokenRequest == nil {
+		t.Fatalf("metadata = %#v, want github actions oidc token request metadata", got.Metadata)
+	}
+	if got.Metadata.GitHubActionsOIDCTokenRequest.Scope != "workflow" || got.Metadata.GitHubActionsOIDCTokenRequest.WorkflowFile != ".github/workflows/build.yml" {
+		t.Fatalf("stored metadata changed: %#v", got.Metadata.GitHubActionsOIDCTokenRequest)
+	}
+
+	got.Metadata.GitHubActionsOIDCTokenRequest.Provider = "changed"
+	again, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found after mutation", added.ID)
+	}
+	if again.Metadata.GitHubActionsOIDCTokenRequest.Provider != "github-actions" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.GitHubActionsOIDCTokenRequest)
+	}
+}
+
 func TestGraphAddEdgeRejectsMissingEndpoints(t *testing.T) {
 	g := New()
 	from := mustAddNode(t, g, NewNode(PublicEndpoint, "public-api"))

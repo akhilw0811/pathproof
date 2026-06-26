@@ -326,6 +326,21 @@ jobs:
 	}
 }
 
+func TestAnalyzeGitHubActionsOIDCTokenCapabilityOnPushDoesNotCreateFinding(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: push
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - run: echo deploy
+`))
+
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for graph-only OIDC capability", findings)
+	}
+}
+
 func TestAnalyzeGitHubActionsDangerousJobPermissionsFinding(t *testing.T) {
 	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
 jobs:

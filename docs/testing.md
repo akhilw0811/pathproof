@@ -38,14 +38,16 @@ asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
 unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
 GitHub Actions findings are deterministic, `PP-GHA-001`, `PP-GHA-002`, and
 `PP-GHA-003` appear in human and JSON output without remediation, patch
-previews, patch outputs, or validation results, and secret-like workflow env,
-with, run, permission expressions, and expression-only `uses:` values are
-absent from stdout, stderr, JSON, SARIF, and errors. CLI projection tests
-verify that finding path entries preserve node ID/kind/name, evidence entries
-preserve edge ID/kind/source/detail, one-node workflow-level findings project
-safely, malformed one-node findings are rejected, generic multi-node path edge
-continuity is enforced, and inconsistent finding-to-graph projection is treated
-as an internal scan error without partial stdout.
+previews, patch outputs, or validation results, and a push workflow with only
+`id-token: write` exits `0` with no findings in human, JSON, and SARIF output.
+Graph-only OIDC capability text is not emitted in scan output. Secret-like
+workflow env, with, run, permission expressions, and expression-only `uses:`
+values are absent from stdout, stderr, JSON, SARIF, and errors. CLI projection
+tests verify that finding path entries preserve node ID/kind/name, evidence
+entries preserve edge ID/kind/source/detail, one-node workflow-level findings
+project safely, malformed one-node findings are rejected, generic multi-node
+path edge continuity is enforced, and inconsistent finding-to-graph projection
+is treated as an internal scan error without partial stdout.
 
 SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
 PathProof driver run, deterministic rule entries for `PP-K8S-001`,
@@ -117,13 +119,17 @@ authorization metadata, deterministic metadata ordering, and regression checks
 that Secret values are absent from graph JSON, metadata, and evidence.
 
 GitHub Actions routing tests cover deterministic `Workflow`, `WorkflowJob`,
-and `GitHubAction` node construction, `DefinesJob` and `UsesAction` edges,
-source evidence, repeated action uses remaining distinct by step index,
-sanitized owner/repo/path/ref metadata, `pull_request_target` trigger metadata,
-sanitized checkout selector metadata, sanitized workflow-level and job-level
-permission metadata, local and Docker action exclusion from static action
-metadata, expression handling, and regression checks that ignored workflow
-values are absent from graph JSON.
+`GitHubAction`, and `OIDCTokenCapability` node construction, `DefinesJob`,
+`UsesAction`, and `CanRequestOIDCToken` edges, source evidence, repeated
+action uses remaining distinct by step index, sanitized owner/repo/path/ref
+metadata, `pull_request_target` trigger metadata, sanitized checkout selector
+metadata, sanitized workflow-level and job-level permission metadata,
+workflow-level and job-level OIDC capability metadata, `id-token: write`,
+`permissions: write-all`, read/read-all/none/omitted permission negatives,
+distinct workflow and job OIDC capabilities, deterministic graph JSON across
+repeated and reversed workflow/job inputs, local and Docker action exclusion
+from static action metadata, expression handling, metadata cloning, and
+regression checks that ignored workflow values are absent from graph JSON.
 
 Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
 edge semantics, exact required node and edge kind validation, unrelated graph
@@ -159,7 +165,8 @@ negatives for read/read-all/none/omitted permissions and `pull_request` only,
 distinct workflow-level and job-level findings, stable finding IDs, ID changes
 when identity inputs change, sanitized summaries/evidence for
 `permissions: write-all`, secret exclusion, and PP-GHA-002 and PP-GHA-003
-firing on the same workflow.
+firing on the same workflow. Analysis coverage also asserts that a push
+workflow with graph-only OIDC token capability does not create a finding.
 
 Remediation tests cover the read-only `internal/remediation.Build` API for
 `PP-K8S-001`. Coverage asserts complete advisory options for

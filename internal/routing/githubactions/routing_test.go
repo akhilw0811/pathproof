@@ -342,3 +342,403 @@ func TestAddRoutesPreservesGitHubActionsPermissionGrantMetadata(t *testing.T) {
 		t.Fatalf("DefinesJob evidence detail = %q, want generic job evidence", gotDefines.Evidence.Detail)
 	}
 }
+
+func TestAddRoutesWorkflowLevelIDTokenWriteCreatesOIDCTokenCapability(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, ".github", "workflows", "oidc.yml")
+	writeWorkflowForRoutingTest(t, root, "oidc.yml", `name: OIDC
+on: push
+permissions:
+  id-token: write
+jobs:
+  test:
+    steps:
+      - run: echo test
+`)
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	workflow := graph.NewNode(graph.Workflow, "githubactions://.github/workflows/oidc.yml")
+	capability := graph.NewNode(graph.OIDCTokenCapability, "githubactions://.github/workflows/oidc.yml/oidc-token/workflow")
+	gotCapability, ok := g.Node(capability.ID)
+	if !ok {
+		t.Fatalf("missing OIDC capability node %q", capability.ID)
+	}
+	wantCapability := graph.GitHubActionsOIDCTokenCapability{
+		Provider:                "github-actions",
+		WorkflowSourceReference: path + "#document=1",
+		WorkflowFile:            ".github/workflows/oidc.yml",
+		WorkflowName:            "OIDC",
+		Scope:                   "workflow",
+	}
+	if gotCapability.Metadata == nil || gotCapability.Metadata.GitHubActionsOIDCTokenCapability == nil {
+		t.Fatalf("capability metadata = %#v, want OIDC metadata", gotCapability.Metadata)
+	}
+	if !reflect.DeepEqual(*gotCapability.Metadata.GitHubActionsOIDCTokenCapability, wantCapability) {
+		t.Fatalf("capability metadata = %#v, want %#v", *gotCapability.Metadata.GitHubActionsOIDCTokenCapability, wantCapability)
+	}
+
+	edge := graph.NewEdge(graph.CanRequestOIDCToken, workflow.ID, capability.ID, graph.SourceEvidence{})
+	gotEdge, ok := g.Edge(edge.ID)
+	if !ok {
+		t.Fatalf("missing CanRequestOIDCToken edge %q", edge.ID)
+	}
+	if gotEdge.Evidence.Detail != "github actions workflow can request OIDC token with id-token: write" {
+		t.Fatalf("edge detail = %q, want explicit id-token evidence", gotEdge.Evidence.Detail)
+	}
+	wantRequest := graph.GitHubActionsOIDCTokenRequest{
+		Provider:                "github-actions",
+		WorkflowSourceReference: path + "#document=1",
+		WorkflowFile:            ".github/workflows/oidc.yml",
+		WorkflowName:            "OIDC",
+		Scope:                   "workflow",
+		Permission:              "id-token",
+		Access:                  "write",
+	}
+	if gotEdge.Metadata == nil || gotEdge.Metadata.GitHubActionsOIDCTokenRequest == nil {
+		t.Fatalf("edge metadata = %#v, want OIDC request metadata", gotEdge.Metadata)
+	}
+	if !reflect.DeepEqual(*gotEdge.Metadata.GitHubActionsOIDCTokenRequest, wantRequest) {
+		t.Fatalf("edge metadata = %#v, want %#v", *gotEdge.Metadata.GitHubActionsOIDCTokenRequest, wantRequest)
+	}
+}
+
+func TestAddRoutesJobLevelIDTokenWriteCreatesOIDCTokenCapability(t *testing.T) {
+	resources := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
+		Name:   "OIDC",
+		Source: parsergithubactions.Source{Filename: "/repo/.github/workflows/oidc.yml", RelativePath: ".github/workflows/oidc.yml", Document: 1},
+		Jobs: []parsergithubactions.Job{{
+			ID: "deploy",
+			PermissionGrants: []parsergithubactions.PermissionGrant{{
+				Scope:      "job",
+				JobID:      "deploy",
+				Permission: "id-token",
+				Access:     "write",
+			}},
+		}},
+	}}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	job := graph.NewNode(graph.WorkflowJob, "githubactions://.github/workflows/oidc.yml/job/deploy")
+	capability := graph.NewNode(graph.OIDCTokenCapability, "githubactions://.github/workflows/oidc.yml/job/deploy/oidc-token")
+	gotCapability, ok := g.Node(capability.ID)
+	if !ok {
+		t.Fatalf("missing OIDC capability node %q", capability.ID)
+	}
+	if gotCapability.Metadata == nil || gotCapability.Metadata.GitHubActionsOIDCTokenCapability == nil {
+		t.Fatalf("capability metadata = %#v, want OIDC metadata", gotCapability.Metadata)
+	}
+	if gotCapability.Metadata.GitHubActionsOIDCTokenCapability.Scope != "job" || gotCapability.Metadata.GitHubActionsOIDCTokenCapability.JobID != "deploy" {
+		t.Fatalf("capability metadata = %#v, want job deploy", gotCapability.Metadata.GitHubActionsOIDCTokenCapability)
+	}
+
+	edge := graph.NewEdge(graph.CanRequestOIDCToken, job.ID, capability.ID, graph.SourceEvidence{})
+	gotEdge, ok := g.Edge(edge.ID)
+	if !ok {
+		t.Fatalf("missing CanRequestOIDCToken edge %q", edge.ID)
+	}
+	if gotEdge.Evidence.Detail != "github actions job deploy can request OIDC token with id-token: write" {
+		t.Fatalf("edge detail = %q, want explicit job id-token evidence", gotEdge.Evidence.Detail)
+	}
+	if gotEdge.Metadata == nil || gotEdge.Metadata.GitHubActionsOIDCTokenRequest == nil {
+		t.Fatalf("edge metadata = %#v, want OIDC request metadata", gotEdge.Metadata)
+	}
+	if gotEdge.Metadata.GitHubActionsOIDCTokenRequest.Scope != "job" || gotEdge.Metadata.GitHubActionsOIDCTokenRequest.JobID != "deploy" {
+		t.Fatalf("edge metadata = %#v, want job deploy", gotEdge.Metadata.GitHubActionsOIDCTokenRequest)
+	}
+}
+
+func TestAddRoutesOIDCTokenCapabilityPermissionCases(t *testing.T) {
+	tests := []struct {
+		name       string
+		workflow   string
+		wantEdges  int
+		wantDetail string
+	}{
+		{
+			name: "id token read",
+			workflow: `permissions:
+  id-token: read
+`,
+		},
+		{
+			name: "id token none",
+			workflow: `permissions:
+  id-token: none
+`,
+		},
+		{
+			name: "omitted permissions",
+			workflow: `jobs:
+  test:
+    steps:
+      - run: echo test
+`,
+		},
+		{
+			name: "write all",
+			workflow: `permissions: write-all
+`,
+			wantEdges:  1,
+			wantDetail: "github actions workflow can request OIDC token because permissions: write-all includes id-token: write",
+		},
+		{
+			name: "read all",
+			workflow: `permissions: read-all
+`,
+		},
+		{
+			name: "job write all",
+			workflow: `jobs:
+  deploy:
+    permissions: write-all
+`,
+			wantEdges:  1,
+			wantDetail: "github actions job deploy can request OIDC token because permissions: write-all includes id-token: write",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeWorkflowForRoutingTest(t, root, "oidc.yml", tt.workflow)
+			resources, err := parsergithubactions.ParseDir(root)
+			if err != nil {
+				t.Fatalf("parse dir: %v", err)
+			}
+			g := graph.New()
+
+			if err := AddRoutes(g, resources); err != nil {
+				t.Fatalf("add routes: %v", err)
+			}
+
+			edges := oidcTokenRequestEdges(g)
+			if len(edges) != tt.wantEdges {
+				t.Fatalf("OIDC edge count = %d, want %d: %#v", len(edges), tt.wantEdges, edges)
+			}
+			if tt.wantEdges == 0 {
+				return
+			}
+			if edges[0].Evidence.Detail != tt.wantDetail {
+				t.Fatalf("edge detail = %q, want %q", edges[0].Evidence.Detail, tt.wantDetail)
+			}
+		})
+	}
+}
+
+func TestAddRoutesWorkflowAndJobOIDCTokenCapabilitiesAreDistinct(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflowForRoutingTest(t, root, "oidc.yml", `permissions:
+  id-token: write
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+`)
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	var capabilities []graph.Node
+	for _, node := range g.Nodes() {
+		if node.Kind == graph.OIDCTokenCapability {
+			capabilities = append(capabilities, node)
+		}
+	}
+	if len(capabilities) != 2 {
+		t.Fatalf("OIDC capability node count = %d, want 2: %#v", len(capabilities), capabilities)
+	}
+	scopes := map[string]bool{}
+	for _, node := range capabilities {
+		if node.Metadata == nil || node.Metadata.GitHubActionsOIDCTokenCapability == nil {
+			t.Fatalf("capability metadata missing: %#v", node)
+		}
+		metadata := node.Metadata.GitHubActionsOIDCTokenCapability
+		scopes[metadata.Scope+":"+metadata.JobID] = true
+	}
+	if !scopes["workflow:"] || !scopes["job:deploy"] {
+		t.Fatalf("capability scopes = %#v, want workflow and job deploy", scopes)
+	}
+}
+
+func TestAddRoutesOIDCTokenCapabilityGraphJSONIsDeterministic(t *testing.T) {
+	resources := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{
+		{
+			Name:   "Z",
+			Source: parsergithubactions.Source{Filename: "/repo/.github/workflows/z.yml", RelativePath: ".github/workflows/z.yml", Document: 1},
+			PermissionGrants: []parsergithubactions.PermissionGrant{{
+				Scope:      "workflow",
+				Permission: "id-token",
+				Access:     "write",
+			}},
+			Jobs: []parsergithubactions.Job{{ID: "z"}},
+		},
+		{
+			Name:   "A",
+			Source: parsergithubactions.Source{Filename: "/repo/.github/workflows/a.yml", RelativePath: ".github/workflows/a.yml", Document: 1},
+			Jobs: []parsergithubactions.Job{
+				{
+					ID: "z",
+					PermissionGrants: []parsergithubactions.PermissionGrant{{
+						Scope:      "job",
+						JobID:      "z",
+						Permission: "id-token",
+						Access:     "write",
+					}},
+				},
+				{
+					ID: "a",
+					PermissionGrants: []parsergithubactions.PermissionGrant{{
+						Scope:      "job",
+						JobID:      "a",
+						Permission: "all",
+						Access:     "write-all",
+					}},
+				},
+			},
+		},
+	}}
+	reversed := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{
+		{
+			Name:   "A",
+			Source: parsergithubactions.Source{Filename: "/repo/.github/workflows/a.yml", RelativePath: ".github/workflows/a.yml", Document: 1},
+			Jobs: []parsergithubactions.Job{
+				{
+					ID: "a",
+					PermissionGrants: []parsergithubactions.PermissionGrant{{
+						Scope:      "job",
+						JobID:      "a",
+						Permission: "all",
+						Access:     "write-all",
+					}},
+				},
+				{
+					ID: "z",
+					PermissionGrants: []parsergithubactions.PermissionGrant{{
+						Scope:      "job",
+						JobID:      "z",
+						Permission: "id-token",
+						Access:     "write",
+					}},
+				},
+			},
+		},
+		{
+			Name:   "Z",
+			Source: parsergithubactions.Source{Filename: "/repo/.github/workflows/z.yml", RelativePath: ".github/workflows/z.yml", Document: 1},
+			PermissionGrants: []parsergithubactions.PermissionGrant{{
+				Scope:      "workflow",
+				Permission: "id-token",
+				Access:     "write",
+			}},
+			Jobs: []parsergithubactions.Job{{ID: "z"}},
+		},
+	}}
+
+	first := graph.New()
+	if err := AddRoutes(first, resources); err != nil {
+		t.Fatalf("add first routes: %v", err)
+	}
+	second := graph.New()
+	if err := AddRoutes(second, reversed); err != nil {
+		t.Fatalf("add reversed routes: %v", err)
+	}
+	firstJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first graph: %v", err)
+	}
+	secondJSON, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second graph: %v", err)
+	}
+	thirdJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first graph again: %v", err)
+	}
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("graph JSON differs by input order:\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
+	}
+	if string(firstJSON) != string(thirdJSON) {
+		t.Fatalf("graph JSON differs across repeated marshal:\nfirst: %s\nthird: %s", firstJSON, thirdJSON)
+	}
+}
+
+func TestAddRoutesOIDCTokenCapabilityGraphJSONExcludesIgnoredWorkflowValues(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflowForRoutingTest(t, root, "oidc.yml", `name: OIDC
+permissions:
+  id-token: write
+  actions: ${{ inputs.permission }}
+  contents: admin
+env:
+  TOKEN: FAKE_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+      checks: unknown
+    steps:
+      - run: echo FAKE_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: owner/repo@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_GHA_WITH_SECRET_DO_NOT_RETAIN
+`)
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+	data, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("marshal graph: %v", err)
+	}
+	for _, forbidden := range []string{
+		"FAKE_GHA_ENV_SECRET_DO_NOT_RETAIN",
+		"FAKE_GHA_WITH_SECRET_DO_NOT_RETAIN",
+		"FAKE_GHA_RUN_SECRET_DO_NOT_RETAIN",
+		"inputs.permission",
+		"${{",
+		"admin",
+		"unknown",
+		"run:",
+		"raw YAML",
+	} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("graph JSON contains %q: %s", forbidden, data)
+		}
+	}
+	if strings.Count(string(data), `"kind":"OIDCTokenCapability"`) != 2 {
+		t.Fatalf("graph JSON = %s, want two OIDC capability nodes", data)
+	}
+}
+
+func oidcTokenRequestEdges(g *graph.Graph) []graph.Edge {
+	var edges []graph.Edge
+	for _, edge := range g.Edges() {
+		if edge.Kind == graph.CanRequestOIDCToken {
+			edges = append(edges, edge)
+		}
+	}
+	return edges
+}

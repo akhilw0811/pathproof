@@ -17,6 +17,9 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 		if err != nil {
 			return fmt.Errorf("add workflow %s: %w", workflow.Source.RelativePath, err)
 		}
+		if err := addWorkflowOIDCTokenCapability(g, workflow, addedWorkflow); err != nil {
+			return err
+		}
 
 		for _, job := range workflow.Jobs {
 			jobNode := graph.NewNode(graph.WorkflowJob, workflowJobName(workflow, job))
@@ -33,6 +36,9 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 			definesJob.Metadata = &graph.EdgeMetadata{GitHubActionsWorkflowJob: &jobMetadata}
 			if _, err := g.AddEdge(definesJob); err != nil {
 				return fmt.Errorf("add workflow job edge %s %s: %w", workflow.Source.RelativePath, job.ID, err)
+			}
+			if err := addJobOIDCTokenCapability(g, workflow, job, addedJob); err != nil {
+				return err
 			}
 
 			for _, step := range job.Steps {
@@ -60,6 +66,60 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 	return nil
 }
 
+func addWorkflowOIDCTokenCapability(g *graph.Graph, workflow parsergithubactions.Workflow, workflowNode graph.Node) error {
+	grant, ok := oidcCapabilityGrant(workflow.PermissionGrants)
+	if !ok {
+		return nil
+	}
+	detail := workflowOIDCTokenCapabilityEvidenceDetail(grant)
+	capability := oidcTokenCapabilityMetadata(workflow, "workflow", "")
+	capabilityNode := graph.NewNode(graph.OIDCTokenCapability, workflowOIDCTokenCapabilityName(workflow))
+	capabilityNode.Evidence = []graph.SourceEvidence{sourceEvidence(workflow.Source, detail)}
+	capabilityNode.Metadata = &graph.NodeMetadata{GitHubActionsOIDCTokenCapability: &capability}
+	addedCapability, err := g.AddNode(capabilityNode)
+	if err != nil {
+		return fmt.Errorf("add workflow oidc token capability %s: %w", workflow.Source.RelativePath, err)
+	}
+
+	request := oidcTokenRequestMetadata(workflow, "workflow", "")
+	edge := graph.NewEdge(graph.CanRequestOIDCToken, workflowNode.ID, addedCapability.ID, graph.SourceEvidence{
+		Source: sourceRef(workflow.Source),
+		Detail: detail,
+	})
+	edge.Metadata = &graph.EdgeMetadata{GitHubActionsOIDCTokenRequest: &request}
+	if _, err := g.AddEdge(edge); err != nil {
+		return fmt.Errorf("add workflow oidc token capability edge %s: %w", workflow.Source.RelativePath, err)
+	}
+	return nil
+}
+
+func addJobOIDCTokenCapability(g *graph.Graph, workflow parsergithubactions.Workflow, job parsergithubactions.Job, jobNode graph.Node) error {
+	grant, ok := oidcCapabilityGrant(job.PermissionGrants)
+	if !ok {
+		return nil
+	}
+	detail := jobOIDCTokenCapabilityEvidenceDetail(job, grant)
+	capability := oidcTokenCapabilityMetadata(workflow, "job", job.ID)
+	capabilityNode := graph.NewNode(graph.OIDCTokenCapability, jobOIDCTokenCapabilityName(workflow, job))
+	capabilityNode.Evidence = []graph.SourceEvidence{sourceEvidence(workflow.Source, detail)}
+	capabilityNode.Metadata = &graph.NodeMetadata{GitHubActionsOIDCTokenCapability: &capability}
+	addedCapability, err := g.AddNode(capabilityNode)
+	if err != nil {
+		return fmt.Errorf("add job oidc token capability %s %s: %w", workflow.Source.RelativePath, job.ID, err)
+	}
+
+	request := oidcTokenRequestMetadata(workflow, "job", job.ID)
+	edge := graph.NewEdge(graph.CanRequestOIDCToken, jobNode.ID, addedCapability.ID, graph.SourceEvidence{
+		Source: sourceRef(workflow.Source),
+		Detail: detail,
+	})
+	edge.Metadata = &graph.EdgeMetadata{GitHubActionsOIDCTokenRequest: &request}
+	if _, err := g.AddEdge(edge); err != nil {
+		return fmt.Errorf("add job oidc token capability edge %s %s: %w", workflow.Source.RelativePath, job.ID, err)
+	}
+	return nil
+}
+
 func buildWorkflowMetadata(workflow parsergithubactions.Workflow) graph.GitHubActionsWorkflow {
 	return graph.GitHubActionsWorkflow{
 		WorkflowSourceReference:   sourceRef(workflow.Source),
@@ -78,6 +138,30 @@ func buildWorkflowJobMetadata(workflow parsergithubactions.Workflow, job parserg
 		TriggersPullRequestTarget: workflow.TriggersPullRequestTarget,
 		JobID:                     job.ID,
 		PermissionGrants:          permissionGrants(job.PermissionGrants),
+	}
+}
+
+func oidcTokenCapabilityMetadata(workflow parsergithubactions.Workflow, scope, jobID string) graph.GitHubActionsOIDCTokenCapability {
+	return graph.GitHubActionsOIDCTokenCapability{
+		Provider:                "github-actions",
+		WorkflowSourceReference: sourceRef(workflow.Source),
+		WorkflowFile:            workflow.Source.RelativePath,
+		WorkflowName:            workflowDisplayName(workflow),
+		Scope:                   scope,
+		JobID:                   jobID,
+	}
+}
+
+func oidcTokenRequestMetadata(workflow parsergithubactions.Workflow, scope, jobID string) graph.GitHubActionsOIDCTokenRequest {
+	return graph.GitHubActionsOIDCTokenRequest{
+		Provider:                "github-actions",
+		WorkflowSourceReference: sourceRef(workflow.Source),
+		WorkflowFile:            workflow.Source.RelativePath,
+		WorkflowName:            workflowDisplayName(workflow),
+		Scope:                   scope,
+		JobID:                   jobID,
+		Permission:              "id-token",
+		Access:                  "write",
 	}
 }
 
@@ -118,6 +202,20 @@ func permissionGrants(grants []parsergithubactions.PermissionGrant) []graph.GitH
 	return out
 }
 
+func oidcCapabilityGrant(grants []parsergithubactions.PermissionGrant) (parsergithubactions.PermissionGrant, bool) {
+	for _, grant := range grants {
+		if grant.Permission == "id-token" && grant.Access == "write" {
+			return grant, true
+		}
+	}
+	for _, grant := range grants {
+		if grant.Permission == "all" && grant.Access == "write-all" {
+			return grant, true
+		}
+	}
+	return parsergithubactions.PermissionGrant{}, false
+}
+
 func checkoutHeadSelectors(selectors []parsergithubactions.CheckoutHeadSelector) []graph.GitHubActionsCheckoutHeadSelector {
 	if len(selectors) == 0 {
 		return nil
@@ -150,6 +248,20 @@ func actionUseEvidenceDetail(actionUse graph.GitHubActionUse) string {
 		return detail
 	}
 	return detail + " in pull_request_target with " + selectorEvidence(actionUse.CheckoutHeadSelectors)
+}
+
+func workflowOIDCTokenCapabilityEvidenceDetail(grant parsergithubactions.PermissionGrant) string {
+	if grant.Permission == "all" && grant.Access == "write-all" {
+		return "github actions workflow can request OIDC token because permissions: write-all includes id-token: write"
+	}
+	return "github actions workflow can request OIDC token with id-token: write"
+}
+
+func jobOIDCTokenCapabilityEvidenceDetail(job parsergithubactions.Job, grant parsergithubactions.PermissionGrant) string {
+	if grant.Permission == "all" && grant.Access == "write-all" {
+		return "github actions job " + job.ID + " can request OIDC token because permissions: write-all includes id-token: write"
+	}
+	return "github actions job " + job.ID + " can request OIDC token with id-token: write"
 }
 
 func permissionGrantListEvidence(grants []graph.GitHubActionsPermissionGrant) string {
@@ -187,6 +299,14 @@ func workflowName(workflow parsergithubactions.Workflow) string {
 
 func workflowJobName(workflow parsergithubactions.Workflow, job parsergithubactions.Job) string {
 	return workflowName(workflow) + "/job/" + job.ID
+}
+
+func workflowOIDCTokenCapabilityName(workflow parsergithubactions.Workflow) string {
+	return workflowName(workflow) + "/oidc-token/workflow"
+}
+
+func jobOIDCTokenCapabilityName(workflow parsergithubactions.Workflow, job parsergithubactions.Job) string {
+	return workflowJobName(workflow, job) + "/oidc-token"
 }
 
 func githubActionNodeName(workflow parsergithubactions.Workflow, job parsergithubactions.Job, step parsergithubactions.Step) string {
