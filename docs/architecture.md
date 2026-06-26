@@ -7,6 +7,7 @@ and local Kubernetes YAML directory scans with:
 - `pathproof scan <directory>`
 - `pathproof scan --format json <directory>`
 - `pathproof scan --format=json <directory>`
+- `pathproof scan --format sarif <directory>`
 - `pathproof scan --preview-patches <directory>`
 - `pathproof scan --write-patches <output-directory> <directory>`
 - `pathproof scan --write-patches <output-directory> --validate-patches <directory>`
@@ -19,10 +20,11 @@ remediation changes, optionally writes patched copies for supported generated
 previews to a separate output directory, optionally validates written patches
 by rescanning a temporary complete patched manifest overlay, projects findings,
 plans, previews, patch output summaries, and validation results into a private
-CLI report shape, and writes either human-readable output or JSON. It does not
-persist the graph or expose graph internals beyond the ordered finding path,
-evidence, remediation plan fields, optional preview fields, optional patch
-output summaries, and optional validation results.
+CLI report shape, and writes human-readable output, JSON, or SARIF. It does
+not persist the graph or expose graph internals beyond the ordered finding
+path, evidence, remediation plan fields, optional preview fields, optional
+patch output summaries, optional validation results, and SARIF finding
+projection.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -133,6 +135,18 @@ set with the existing parse, route, and analyze pipeline, and removes the
 temporary directory before returning. Validation never scans only the partial
 patch output directory, never writes copied input files to the user-visible
 output directory, and never prints temporary paths or manifest contents.
+
+SARIF output is a findings-only CLI projection. `pathproof scan --format sarif`
+emits SARIF 2.1.0 with one PathProof tool driver, one `PP-K8S-001` rule entry,
+and one result per finding. SARIF stdout omits patch previews, patch output
+summaries, validation results, unified diffs, patched file contents, temporary
+paths, and raw manifests even when patch flags are supplied. Patch
+write/validation side effects still follow the same scan flag contract. SARIF
+locations use only clean structured `filename#document=N` source-reference
+fields; embedded references in prose are ignored. Artifact URIs are relative
+to the scan root and URI-encoded, while display source references in result
+properties remain relative display strings. SARIF does not guess line numbers
+because parser source tracking is currently file/document scoped.
 
 No live Kubernetes authorization evaluation, live validation, in-place patch
 application, persistence, AI, dashboard, plugin system, external service

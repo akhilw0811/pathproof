@@ -41,7 +41,9 @@
   remediated, failed, or skipped results for supported `PP-K8S-001` findings.
 - Local Kubernetes YAML scan CLI for `pathproof scan <directory>` with
   human-readable finding, remediation, and optional patch preview output, JSON
-  output, and stable exit codes.
+  output, SARIF 2.1.0 finding output, and stable exit codes.
+- Local findings-only SARIF export for `PP-K8S-001`. SARIF artifact locations
+  use safe relative URIs when clean structured source references are available.
 
 ## Later
 
@@ -50,6 +52,7 @@
 - Remediation verification.
 - In-place patch application, live validation, force/clobber behavior, Git
   commits, and pull request creation.
+- GitHub code scanning upload or other SARIF upload integrations.
 - Patch previews for RBAC rule edits, wildcard resources or verbs,
   multi-resource rule splitting, API-group splitting, ClusterRoleBinding scope
   changes, `resourceNames`, Secret-bearing source files, and broader patch

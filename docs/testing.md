@@ -20,13 +20,27 @@ shell test captures and checks it explicitly.
 
 Scan command tests cover argument validation, deterministic controlled flag
 errors, accepted `--format json` and `--format=json` syntax, accepted
-`--preview-patches` syntax, missing and non-directory path errors, human
-output, JSON output, exactly one trailing newline, stderr-only errors, output
-write failures, deterministic repeated output, deterministic input file
-ordering, and Secret-value absence from stdout and stderr. CLI projection tests
-verify that finding path entries preserve node ID/kind/name, evidence entries
-preserve edge ID/kind/source/detail, and inconsistent finding-to-graph
-projection is treated as an internal scan error without partial stdout.
+`--format sarif` and `--format=sarif` syntax, accepted `--preview-patches`
+syntax, missing and non-directory path errors, human output, JSON output, SARIF
+output, exactly one trailing newline, stderr-only errors, output write failures,
+deterministic repeated output, deterministic input file ordering, and
+Secret-value absence from stdout and stderr. CLI projection tests verify that
+finding path entries preserve node ID/kind/name, evidence entries preserve edge
+ID/kind/source/detail, and inconsistent finding-to-graph projection is treated
+as an internal scan error without partial stdout.
+
+SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
+PathProof driver run, exactly one deterministic `PP-K8S-001` rule entry, one
+result for the vulnerable fixture, zero results for the safe fixture,
+deterministic rule/result fields, byte-identical repeated scans, and unchanged
+exit codes. Source-location tests cover URI-encoded relative artifact URIs for
+paths with spaces, display-safe relative `properties.source_references`,
+omission of malformed document suffixes, omission of outside-root references,
+and refusal to parse source references embedded in arbitrary prose. SARIF patch
+flag tests verify that write-patch and validation side effects still occur
+under the existing flag contract while SARIF stdout remains findings-only and
+omits patch previews, patch outputs, validation arrays, diffs, patched
+contents, temporary paths, raw manifests, and Secret values.
 
 The public demo fixture under `examples/kubernetes/public-secret-path` is
 covered by a CLI smoke test. It asserts the documented loop: vulnerable scan

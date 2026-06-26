@@ -1,0 +1,251 @@
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"pathproof/internal/analysis"
+)
+
+const sarifSchema = "https://json.schemastore.org/sarif-2.1.0.json"
+
+type sarifLog struct {
+	Schema  string     `json:"$schema"`
+	Version string     `json:"version"`
+	Runs    []sarifRun `json:"runs"`
+}
+
+type sarifRun struct {
+	Tool    sarifTool     `json:"tool"`
+	Results []sarifResult `json:"results"`
+}
+
+type sarifTool struct {
+	Driver sarifDriver `json:"driver"`
+}
+
+type sarifDriver struct {
+	Name  string      `json:"name"`
+	Rules []sarifRule `json:"rules"`
+}
+
+type sarifRule struct {
+	ID                   string                    `json:"id"`
+	Name                 string                    `json:"name"`
+	ShortDescription     sarifMessage              `json:"shortDescription"`
+	FullDescription      sarifMessage              `json:"fullDescription"`
+	DefaultConfiguration sarifDefaultConfiguration `json:"defaultConfiguration"`
+	Help                 sarifMessage              `json:"help"`
+}
+
+type sarifDefaultConfiguration struct {
+	Level string `json:"level"`
+}
+
+type sarifResult struct {
+	RuleID              string                `json:"ruleId"`
+	Level               string                `json:"level,omitempty"`
+	Message             sarifMessage          `json:"message"`
+	Locations           []sarifLocation       `json:"locations,omitempty"`
+	PartialFingerprints map[string]string     `json:"partialFingerprints"`
+	Properties          sarifResultProperties `json:"properties"`
+}
+
+type sarifMessage struct {
+	Text string `json:"text"`
+}
+
+type sarifLocation struct {
+	PhysicalLocation sarifPhysicalLocation `json:"physicalLocation"`
+}
+
+type sarifPhysicalLocation struct {
+	ArtifactLocation sarifArtifactLocation `json:"artifactLocation"`
+}
+
+type sarifArtifactLocation struct {
+	URI string `json:"uri"`
+}
+
+type sarifResultProperties struct {
+	FindingID        string   `json:"finding_id"`
+	Severity         string   `json:"severity"`
+	NodeIDs          []string `json:"node_ids"`
+	EdgeIDs          []string `json:"edge_ids"`
+	SourceReferences []string `json:"source_references"`
+}
+
+type sarifSourceReference struct {
+	display string
+	uri     string
+}
+
+func writeSARIFReport(w io.Writer, root string, report scanReport) error {
+	encoder := json.NewEncoder(w)
+	return encoder.Encode(newSARIFLog(root, report))
+}
+
+func newSARIFLog(root string, report scanReport) sarifLog {
+	results := make([]sarifResult, 0, len(report.Findings))
+	for _, finding := range report.Findings {
+		results = append(results, newSARIFResult(root, finding))
+	}
+	return sarifLog{
+		Schema:  sarifSchema,
+		Version: "2.1.0",
+		Runs: []sarifRun{
+			{
+				Tool: sarifTool{
+					Driver: sarifDriver{
+						Name:  "PathProof",
+						Rules: []sarifRule{sarifPublicWorkloadCanReadSecretRule()},
+					},
+				},
+				Results: results,
+			},
+		},
+	}
+}
+
+func sarifPublicWorkloadCanReadSecretRule() sarifRule {
+	const title = "Public workload can read Kubernetes Secret"
+	return sarifRule{
+		ID:               string(analysis.RulePublicWorkloadCanReadSecret),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects a deterministic attack path: PublicEndpoint -> Workload -> ServiceAccount -> Secret."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "error",
+		},
+		Help: sarifMessage{Text: "PathProof provides deterministic remediation plans for verified paths. Where applicable, NarrowBindingSubject patch support can remove the implicated ServiceAccount subject from a RoleBinding or ClusterRoleBinding."},
+	}
+}
+
+func newSARIFResult(root string, finding scanFinding) sarifResult {
+	sourceReferences := sarifSourceReferences(root, finding)
+	locations := make([]sarifLocation, 0, len(sourceReferences))
+	displayReferences := make([]string, 0, len(sourceReferences))
+	for _, ref := range sourceReferences {
+		locations = append(locations, sarifLocation{
+			PhysicalLocation: sarifPhysicalLocation{
+				ArtifactLocation: sarifArtifactLocation{URI: ref.uri},
+			},
+		})
+		displayReferences = append(displayReferences, ref.display)
+	}
+
+	return sarifResult{
+		RuleID:    string(finding.RuleID),
+		Level:     sarifLevel(finding.Severity),
+		Message:   sarifMessage{Text: sarifFindingMessage(finding)},
+		Locations: locations,
+		PartialFingerprints: map[string]string{
+			"pathproofFindingId": string(finding.ID),
+		},
+		Properties: sarifResultProperties{
+			FindingID:        string(finding.ID),
+			Severity:         string(finding.Severity),
+			NodeIDs:          sarifNodeIDs(finding.Path),
+			EdgeIDs:          sarifEdgeIDs(finding.Evidence),
+			SourceReferences: displayReferences,
+		},
+	}
+}
+
+func sarifFindingMessage(finding scanFinding) string {
+	parts := make([]string, 0, len(finding.Path))
+	for _, node := range finding.Path {
+		parts = append(parts, string(node.Kind)+" "+node.Name)
+	}
+	return strings.Join(parts, " -> ") + "."
+}
+
+func sarifLevel(severity analysis.Severity) string {
+	switch severity {
+	case analysis.SeverityHigh:
+		return "error"
+	case analysis.Severity("Medium"):
+		return "warning"
+	case analysis.Severity("Low"):
+		return "note"
+	case "":
+		return ""
+	default:
+		return "warning"
+	}
+}
+
+func sarifNodeIDs(nodes []scanPathNode) []string {
+	out := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, string(node.ID))
+	}
+	return out
+}
+
+func sarifEdgeIDs(evidence []scanEvidence) []string {
+	out := make([]string, 0, len(evidence))
+	for _, item := range evidence {
+		out = append(out, string(item.EdgeID))
+	}
+	return out
+}
+
+func sarifSourceReferences(root string, finding scanFinding) []sarifSourceReference {
+	seen := make(map[string]struct{})
+	refs := make([]sarifSourceReference, 0)
+	add := func(value string) {
+		ref, ok := sarifSourceReferenceFromCleanValue(root, value)
+		if !ok {
+			return
+		}
+		if _, exists := seen[ref.display]; exists {
+			return
+		}
+		seen[ref.display] = struct{}{}
+		refs = append(refs, ref)
+	}
+	for _, source := range finding.SARIFSources {
+		add(source)
+	}
+	return refs
+}
+
+func sarifSourceReferenceFromCleanValue(root, value string) (sarifSourceReference, bool) {
+	if value == "" || strings.TrimSpace(value) != value {
+		return sarifSourceReference{}, false
+	}
+	filename, documentValue, ok := strings.Cut(value, "#document=")
+	if !ok || filename == "" || documentValue == "" || strings.Contains(documentValue, "#") {
+		return sarifSourceReference{}, false
+	}
+	for _, r := range documentValue {
+		if r < '0' || r > '9' {
+			return sarifSourceReference{}, false
+		}
+	}
+	document, err := strconv.Atoi(documentValue)
+	if err != nil || document <= 0 {
+		return sarifSourceReference{}, false
+	}
+	rel, ok := displayRelativeSourcePath(root, filename)
+	if !ok {
+		return sarifSourceReference{}, false
+	}
+	return sarifSourceReference{
+		display: rel + "#document=" + documentValue,
+		uri:     sarifArtifactURI(rel, documentValue),
+	}, true
+}
+
+func sarifArtifactURI(relPath, documentValue string) string {
+	uri := url.URL{
+		Path:     filepath.ToSlash(relPath),
+		Fragment: "document=" + documentValue,
+	}
+	return uri.String()
+}

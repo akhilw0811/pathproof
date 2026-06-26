@@ -343,6 +343,7 @@ func TestRunScanSafeFixtureJSONContainsNoRemediationPlans(t *testing.T) {
 	if report.FindingCount != 0 || len(report.Findings) != 0 {
 		t.Fatalf("safe report = %#v, want no findings", report)
 	}
+	assertString(t, "stdout", stdout, "{\"findings\":[],\"finding_count\":0}\n")
 	if strings.Contains(stdout, "remediation") {
 		t.Fatalf("safe stdout contains remediation: %s", stdout)
 	}
@@ -1177,6 +1178,7 @@ func TestRunScanSecretFixtureValuesNeverAppearInOutput(t *testing.T) {
 	for _, args := range [][]string{
 		{"scan", vulnerableFixture},
 		{"scan", "--format=json", vulnerableFixture},
+		{"scan", "--format=sarif", vulnerableFixture},
 		{"scan", safeFixture},
 		{"scan", invalidFixture},
 	} {
