@@ -101,6 +101,40 @@ PathProof's static Secret read model is:
 This is static authorization modeling only. It does not claim that a workload
 actually issued a Secret read request.
 
+## Findings
+
+Findings are produced by read-only analysis over the in-memory graph. The first
+implemented rule is:
+
+- Rule ID: `PP-K8S-001`
+- Title: `Public workload can read Kubernetes Secret`
+- Severity: fixed `High`
+- Required path:
+  `PublicEndpoint --RoutesTo--> Workload --RunsAs--> ServiceAccount --CanRead--> Secret`
+
+A finding is emitted only when all four nodes exist with the expected kinds and
+all three directed edges exist with the expected kinds. The ordered finding
+chain stores the four node IDs followed by the three edge IDs in path order.
+Multiple public endpoints, workloads, or Secrets create distinct findings when
+they form distinct chains. Multiple independent RBAC authorization records on a
+single `CanRead` edge remain attached to the same finding through that edge's
+aggregated evidence.
+
+Finding IDs are deterministic and stable. They are SHA-256 hashes of a
+canonical JSON identity containing only fixed field names for `rule_id`,
+ordered `node_ids`, and ordered `edge_ids`. Evidence, source references,
+summary text, title, and severity are not part of finding identity.
+
+Finding evidence preserves the complete ordered edge evidence for `RoutesTo`,
+`RunsAs`, and `CanRead`. `source_references` are derived from those edge
+evidence sources in chain order, omit empty strings, and deduplicate exact
+repeated references while preserving first appearance. They are not globally
+sorted.
+
+Secret values are absent from findings because Secret values are never ingested
+into parser output or graph evidence. The analyzer does not redact arbitrary
+strings from graph evidence.
+
 Observed Roles or ClusterRoles with empty `rules` can still appear as reachable
 Role nodes and have `BoundTo` edges, but they create no Permission nodes and no
 `GrantsPermission` edges. Missing role references create unresolved Role nodes
@@ -114,6 +148,6 @@ resource rules in the same Role or ClusterRole are still modeled.
 
 ## Current Limitations
 
-The graph does not model Kubernetes User or Group RBAC subjects, non-resource
-URLs, aggregated ClusterRoles, Secret values, live-cluster state, remediation,
-or attack-path rules.
+The graph and analysis do not model Kubernetes User or Group RBAC subjects,
+non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
+remediation, analysis CLI commands, or attack-path rules beyond `PP-K8S-001`.

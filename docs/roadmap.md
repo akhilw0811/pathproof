@@ -19,16 +19,20 @@
 - Kubernetes Secret graph construction for parsed Secret metadata and static
   RBAC-derived ServiceAccount `CanRead` edges. Secret values are never
   ingested.
+- Read-only deterministic attack-path analysis for `PP-K8S-001`: public
+  endpoint to workload to ServiceAccount to Secret read access, with fixed
+  rule-based `High` severity and deterministic finding IDs.
 
 ## Later
 
-- Deterministic attack-path analysis.
+- CLI integration for attack-path analysis.
+- Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Remediation verification.
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
-  ClusterRoles, Secret values, Secret attack-path findings, live-cluster
-  authorization verification, and remediation when a concrete task requires
-  them.
+  ClusterRoles, Secret values, broader Secret attack-path coverage,
+  live-cluster authorization verification, and remediation when a concrete task
+  requires them.
 
 AI, machine learning, dashboards, graph databases, and pull request automation
 remain out of scope until explicitly requested.
