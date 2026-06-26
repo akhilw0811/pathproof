@@ -18,7 +18,11 @@ reports `PP-K8S-001` when an internet-facing workload runs as a ServiceAccount
 that can read a Kubernetes Secret, and reports `PP-GHA-001` for unpinned
 GitHub Actions action references, `PP-GHA-002` for unsafe
 `pull_request_target` checkout of pull request head code, and `PP-GHA-003` for
-explicit dangerous token permissions under `pull_request_target`.
+explicit dangerous token permissions under `pull_request_target`. It also
+models explicit GitHub Actions OIDC token request capability in the internal
+graph when a workflow or job grants `id-token: write` or
+`permissions: write-all`; this graph-only capability does not produce a
+finding by itself.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, OIDC trust analysis, reusable
@@ -182,11 +186,15 @@ PathProof currently implements three small local GitHub Actions checks:
   `pull-requests: write`, `actions: write`, `checks: write`,
   `deployments: write`, `id-token: write`, `security-events: write`, or
   `permissions: write-all`.
+- Graph-only OIDC capability modeling: workflow-level or job-level
+  `id-token: write`, including `permissions: write-all`, is represented as an
+  internal OIDC token request capability for future path analysis.
 
 These checks are static and local. PathProof does not execute workflows, call
 GitHub APIs, evaluate expressions, inspect action source, model workflow
-permission inheritance or overrides, or claim full CI/CD attack-path coverage.
-Exact GitHub permission inheritance/override modeling is future work.
+permission inheritance or overrides, ingest cloud trust policies, contact
+cloud providers, or claim full CI/CD attack-path coverage. Exact GitHub
+permission inheritance/override modeling is future work.
 
 ## CI / SARIF
 
@@ -232,6 +240,8 @@ only publishes the SARIF file as an artifact.
   `actions/checkout` to check out pull request head code.
 - `PP-GHA-003` detection for `pull_request_target` workflows that explicitly
   grant dangerous workflow-level or job-level token permissions.
+- Internal graph-only modeling for GitHub Actions OIDC token request
+  capability from explicit `id-token: write` or `permissions: write-all`.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -245,7 +255,8 @@ The scan loop is:
 2. Parse local GitHub Actions workflow YAML files under `.github/workflows`.
 3. Build an in-memory evidence graph.
 4. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
-5. Add deterministic GitHub Actions workflow/job/action-use edges.
+5. Add deterministic GitHub Actions workflow/job/action-use edges and
+   graph-only OIDC token capability edges.
 6. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
    `PP-GHA-003`.
 7. Build advisory remediation plans from structured graph metadata for

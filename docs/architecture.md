@@ -91,19 +91,25 @@ and source references. It does not include Secret values, raw manifests, YAML
 snippets, or arbitrary metadata maps.
 
 Implemented GitHub Actions routing lives under
-`internal/routing/githubactions`. It builds only the graph needed for the
-current rules: `Workflow` nodes, `WorkflowJob` nodes, `GitHubAction` step-use
-nodes, `DefinesJob` edges, and `UsesAction` edges. `Workflow` node metadata
-stores sanitized workflow identity, `pull_request_target` trigger presence,
-and explicit workflow-level permission grants. `DefinesJob` metadata stores
-the same workflow identity plus job ID and explicit job-level permission
-grants. `UsesAction` metadata stores the workflow source reference, relative
-workflow file, workflow name or file fallback, `pull_request_target` trigger
-presence, job ID, step index, optional step name, canonical sanitized action
-display string, parsed owner, repo, path, and ref, and sanitized checkout
-PR-head selector matches when present. It does not model CI/CD identities,
-exact workflow permission inheritance or overrides, OIDC trust, reusable
-workflow calls, cloud trust, or runtime behavior.
+`internal/routing/githubactions`. It builds the graph needed for the current
+rules and graph-only OIDC capability modeling: `Workflow` nodes, `WorkflowJob`
+nodes, `GitHubAction` step-use nodes, `OIDCTokenCapability` nodes,
+`DefinesJob` edges, `UsesAction` edges, and `CanRequestOIDCToken` edges.
+`Workflow` node metadata stores sanitized workflow identity,
+`pull_request_target` trigger presence, and explicit workflow-level permission
+grants. `DefinesJob` metadata stores the same workflow identity plus job ID
+and explicit job-level permission grants. `UsesAction` metadata stores the
+workflow source reference, relative workflow file, workflow name or file
+fallback, `pull_request_target` trigger presence, job ID, step index, optional
+step name, canonical sanitized action display string, parsed owner, repo,
+path, and ref, and sanitized checkout PR-head selector matches when present.
+`CanRequestOIDCToken` edges are created only for explicit workflow-level or
+job-level `id-token: write`, including `permissions: write-all`, and preserve
+whether the capability came from explicit `id-token: write` or from
+`permissions: write-all` evidence. This OIDC modeling is static graph
+structure only and does not create a finding by itself. It does not model
+CI/CD identities, exact workflow permission inheritance or overrides, OIDC
+trust policies, reusable workflow calls, cloud trust, or runtime behavior.
 
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
 graph storage, routing construction, analysis, and CLI presentation remain
@@ -152,6 +158,12 @@ access values, omitted permissions, unknown values, and expression-based
 permission values do not produce findings. Exact GitHub permission
 inheritance/override modeling is future work.
 
+GitHub Actions OIDC token capability modeling is graph-only in this slice.
+The analyzer does not emit a finding for `CanRequestOIDCToken` alone because
+`id-token: write` is not necessarily vulnerable without additional unsafe
+trigger context or cloud trust-policy evidence. Existing `PP-GHA-003` behavior
+continues to report `id-token: write` under `pull_request_target`.
+
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
 redaction.
@@ -162,8 +174,9 @@ read-only: it consumes the graph and analysis findings, validates supported
 authorization metadata, and emits complete advisory options. It does not parse
 human-readable evidence prose and does not modify source manifests. The
 implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
-`NarrowBindingSubject`. `PP-GHA-001` and `PP-GHA-002` receive no remediation
-plan, patch preview, patch output, or validation result in this slice.
+`NarrowBindingSubject`. `PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003` receive
+no remediation plan, patch preview, patch output, or validation result in this
+slice.
 
 Optional patch preview generation lives under `internal/patchpreview`. It is
 also read-only: it consumes the scan root and remediation plans, resolves
@@ -217,7 +230,7 @@ because parser source tracking is currently file/document scoped.
 No live Kubernetes authorization evaluation, GitHub API integration, workflow
 execution, expression evaluation, reusable workflow resolution, action source
 inspection, exact GitHub workflow permission inheritance/override modeling,
-OIDC trust modeling, full CI/CD attack-path modeling, live validation,
-in-place patch application, persistence, AI, dashboard, plugin system,
-external service integration, pull request creation, or live Kubernetes cluster
-integration is implemented.
+OIDC trust-policy modeling, full CI/CD attack-path modeling, cloud provider
+integration, Terraform parsing, live validation, in-place patch application,
+persistence, AI, dashboard, plugin system, external service integration, pull
+request creation, or live Kubernetes cluster integration is implemented.

@@ -200,6 +200,53 @@ jobs:
 	assertString(t, "stdout", stdout, "Finding count: 0\nNo findings.\n")
 }
 
+func TestRunScanGitHubActionsOIDCTokenCapabilityOnlyReturnsNoFindings(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "oidc.yml", `name: OIDC only
+on: push
+permissions:
+  id-token: write
+env:
+  TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    steps:
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+
+	humanStdout, humanStderr, humanCode := runCommand("scan", dir)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", dir)
+	sarifStdout, sarifStderr, sarifCode := runCommand("scan", "--format=sarif", dir)
+
+	assertCode(t, humanCode, 0)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "human stdout", humanStdout, "Finding count: 0\nNo findings.\n")
+
+	assertCode(t, jsonCode, 0)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("JSON report = %#v, want no findings", report)
+	}
+	assertString(t, "json stdout", jsonStdout, "{\"findings\":[],\"finding_count\":0}\n")
+
+	assertCode(t, sarifCode, 0)
+	assertString(t, "sarif stderr", sarifStderr, "")
+	sarif := assertValidSARIFReport(t, sarifStdout)
+	if len(sarif.Runs[0].Results) != 0 {
+		t.Fatalf("SARIF results = %#v, want none", sarif.Runs[0].Results)
+	}
+
+	for _, output := range []string{humanStdout, jsonStdout, sarifStdout} {
+		for _, forbidden := range []string{"OIDCTokenCapability", "CanRequestOIDCToken", "github_actions_oidc", "id-token: write"} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("scan output contains graph-only OIDC text %q: %s", forbidden, output)
+			}
+		}
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, humanStdout, humanStderr, jsonStdout, jsonStderr, sarifStdout, sarifStderr)
+}
+
 func TestRunScanGitHubActionsUnpinnedWorkflowReturnsOneAndFindingOnly(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "unpinned.yml", `name: Unpinned

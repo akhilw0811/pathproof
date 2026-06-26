@@ -12,15 +12,16 @@ import (
 type NodeKind string
 
 const (
-	PublicEndpoint NodeKind = "PublicEndpoint"
-	Workload       NodeKind = "Workload"
-	ServiceAccount NodeKind = "ServiceAccount"
-	Role           NodeKind = "Role"
-	Permission     NodeKind = "Permission"
-	Secret         NodeKind = "Secret"
-	Workflow       NodeKind = "Workflow"
-	WorkflowJob    NodeKind = "WorkflowJob"
-	GitHubAction   NodeKind = "GitHubAction"
+	PublicEndpoint      NodeKind = "PublicEndpoint"
+	Workload            NodeKind = "Workload"
+	ServiceAccount      NodeKind = "ServiceAccount"
+	Role                NodeKind = "Role"
+	Permission          NodeKind = "Permission"
+	Secret              NodeKind = "Secret"
+	Workflow            NodeKind = "Workflow"
+	WorkflowJob         NodeKind = "WorkflowJob"
+	GitHubAction        NodeKind = "GitHubAction"
+	OIDCTokenCapability NodeKind = "OIDCTokenCapability"
 )
 
 type NodeID string
@@ -29,13 +30,14 @@ type EdgeID string
 type EdgeKind string
 
 const (
-	RoutesTo         EdgeKind = "RoutesTo"
-	RunsAs           EdgeKind = "RunsAs"
-	BoundTo          EdgeKind = "BoundTo"
-	GrantsPermission EdgeKind = "GrantsPermission"
-	CanRead          EdgeKind = "CanRead"
-	DefinesJob       EdgeKind = "DefinesJob"
-	UsesAction       EdgeKind = "UsesAction"
+	RoutesTo            EdgeKind = "RoutesTo"
+	RunsAs              EdgeKind = "RunsAs"
+	BoundTo             EdgeKind = "BoundTo"
+	GrantsPermission    EdgeKind = "GrantsPermission"
+	CanRead             EdgeKind = "CanRead"
+	DefinesJob          EdgeKind = "DefinesJob"
+	UsesAction          EdgeKind = "UsesAction"
+	CanRequestOIDCToken EdgeKind = "CanRequestOIDCToken"
 )
 
 var (
@@ -58,13 +60,15 @@ type SourceEvidence struct {
 }
 
 type NodeMetadata struct {
-	GitHubActionsWorkflow *GitHubActionsWorkflow `json:"github_actions_workflow,omitempty"`
+	GitHubActionsWorkflow            *GitHubActionsWorkflow            `json:"github_actions_workflow,omitempty"`
+	GitHubActionsOIDCTokenCapability *GitHubActionsOIDCTokenCapability `json:"github_actions_oidc_token_capability,omitempty"`
 }
 
 type EdgeMetadata struct {
 	KubernetesCanReadAuthorizations []KubernetesCanReadAuthorization `json:"kubernetes_can_read_authorizations,omitempty"`
 	GitHubActionUse                 *GitHubActionUse                 `json:"github_action_use,omitempty"`
 	GitHubActionsWorkflowJob        *GitHubActionsWorkflowJob        `json:"github_actions_workflow_job,omitempty"`
+	GitHubActionsOIDCTokenRequest   *GitHubActionsOIDCTokenRequest   `json:"github_actions_oidc_token_request,omitempty"`
 }
 
 type GitHubActionsWorkflow struct {
@@ -82,6 +86,26 @@ type GitHubActionsWorkflowJob struct {
 	TriggersPullRequestTarget bool                           `json:"triggers_pull_request_target,omitempty"`
 	JobID                     string                         `json:"job_id"`
 	PermissionGrants          []GitHubActionsPermissionGrant `json:"permission_grants,omitempty"`
+}
+
+type GitHubActionsOIDCTokenCapability struct {
+	Provider                string `json:"provider"`
+	WorkflowSourceReference string `json:"workflow_source_reference"`
+	WorkflowFile            string `json:"workflow_file"`
+	WorkflowName            string `json:"workflow_name,omitempty"`
+	Scope                   string `json:"scope"`
+	JobID                   string `json:"job_id,omitempty"`
+}
+
+type GitHubActionsOIDCTokenRequest struct {
+	Provider                string `json:"provider"`
+	WorkflowSourceReference string `json:"workflow_source_reference"`
+	WorkflowFile            string `json:"workflow_file"`
+	WorkflowName            string `json:"workflow_name,omitempty"`
+	Scope                   string `json:"scope"`
+	JobID                   string `json:"job_id,omitempty"`
+	Permission              string `json:"permission"`
+	Access                  string `json:"access"`
 }
 
 type GitHubActionsPermissionGrant struct {
@@ -351,6 +375,10 @@ func cloneNode(node Node) Node {
 			workflow.PermissionGrants = cloneGitHubActionsPermissionGrants(workflow.PermissionGrants)
 			metadata.GitHubActionsWorkflow = &workflow
 		}
+		if metadata.GitHubActionsOIDCTokenCapability != nil {
+			capability := *metadata.GitHubActionsOIDCTokenCapability
+			metadata.GitHubActionsOIDCTokenCapability = &capability
+		}
 		node.Metadata = &metadata
 	}
 	return node
@@ -378,6 +406,10 @@ func cloneEdge(edge Edge) Edge {
 		job := *metadata.GitHubActionsWorkflowJob
 		job.PermissionGrants = cloneGitHubActionsPermissionGrants(job.PermissionGrants)
 		metadata.GitHubActionsWorkflowJob = &job
+	}
+	if metadata.GitHubActionsOIDCTokenRequest != nil {
+		request := *metadata.GitHubActionsOIDCTokenRequest
+		metadata.GitHubActionsOIDCTokenRequest = &request
 	}
 	edge.Metadata = &metadata
 	return edge

@@ -28,10 +28,14 @@
   with values, secrets, token values, run scripts, expression-only `uses:`
   values, unknown or expression-based permission values, and raw workflow
   documents are not retained.
-- Minimal GitHub Actions workflow/job/action-use graph construction with
-  `Workflow`, `WorkflowJob`, `GitHubAction`, `DefinesJob`, and `UsesAction`.
-  `Workflow` and `DefinesJob` metadata preserve sanitized explicit permission
-  grants for the current GitHub Actions rules.
+- Minimal GitHub Actions graph construction with `Workflow`, `WorkflowJob`,
+  `GitHubAction`, `DefinesJob`, and `UsesAction`. `Workflow` and `DefinesJob`
+  metadata preserve sanitized explicit permission grants for the current
+  GitHub Actions rules.
+- Graph-only GitHub Actions OIDC token capability modeling with
+  `OIDCTokenCapability` nodes and `CanRequestOIDCToken` edges for explicit
+  workflow-level or job-level `id-token: write`, including
+  `permissions: write-all`. This does not create a finding by itself.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
@@ -79,6 +83,7 @@
 - Full CI/CD attack-path modeling.
 - Exact GitHub Actions workflow permission inheritance/override modeling.
 - GitHub Actions OIDC trust analysis.
+- Cloud trust-policy ingestion for GitHub Actions OIDC.
 - Reusable workflow resolution.
 - CI/CD-to-cloud path analysis.
 - Action source inspection.
