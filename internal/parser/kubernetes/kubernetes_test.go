@@ -1,6 +1,7 @@
 package kubernetes
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -134,6 +135,195 @@ automountServiceAccountToken: true
 	}
 	if !reflect.DeepEqual(resources.ServiceAccounts, want) {
 		t.Fatalf("service accounts = %#v, want %#v", resources.ServiceAccounts, want)
+	}
+}
+
+func TestParseDirParsesValidSecretMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "secret.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+  namespace: prod
+type: Opaque
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Secret{{
+		Namespace: "prod",
+		Name:      "database-password",
+		Source:    Source{Filename: path, Document: 1},
+	}}
+	if !reflect.DeepEqual(resources.Secrets, want) {
+		t.Fatalf("secrets = %#v, want %#v", resources.Secrets, want)
+	}
+}
+
+func TestParseDirDefaultsSecretNamespaceToDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "secret.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if got := resources.Secrets[0].Namespace; got != "default" {
+		t.Fatalf("namespace = %q, want default", got)
+	}
+}
+
+func TestParseDirIgnoresUnsupportedSecretBeforeTypedDecode(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "legacy-secret.yaml", `apiVersion: example.io/v1
+kind: Secret
+metadata:
+  name:
+  - unsupported
+data:
+  token:
+    nested: unsupported
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want unsupported Secret skipped", resources)
+	}
+}
+
+func TestParseDirSecretDataAndStringDataAreNotRetained(t *testing.T) {
+	dir := t.TempDir()
+	const fakeDataValue = "FAKE_SECRET_DATA_VALUE_DO_NOT_RETAIN"
+	const fakeStringDataValue = "FAKE_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN"
+	path := writeManifest(t, dir, "secret.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+  namespace: prod
+data:
+  password: FAKE_SECRET_DATA_VALUE_DO_NOT_RETAIN
+stringData:
+  token: FAKE_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Secret{{Namespace: "prod", Name: "database-password", Source: Source{Filename: path, Document: 1}}}
+	if !reflect.DeepEqual(resources.Secrets, want) {
+		t.Fatalf("secrets = %#v, want %#v", resources.Secrets, want)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, value := range []string{fakeDataValue, fakeStringDataValue, `"data"`, `"stringData"`, `"Data"`, `"StringData"`} {
+		if strings.Contains(string(data), value) {
+			t.Fatalf("serialized parser resources contain %q: %s", value, data)
+		}
+	}
+}
+
+func TestParseDirMalformedCoreV1SecretReturnsActionableErrorWithoutValues(t *testing.T) {
+	dir := t.TempDir()
+	const fakeValue = "FAKE_SECRET_VALUE_IN_BAD_FIXTURE"
+	path := writeManifest(t, dir, "bad-secret.yaml", `apiVersion: v1
+kind: Secret
+metadata: [
+data:
+  password: FAKE_SECRET_VALUE_IN_BAD_FIXTURE
+`)
+
+	resources, err := ParseDir(dir)
+	if err == nil {
+		t.Fatal("parse dir error = nil, want malformed Secret error")
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want empty result on error", resources)
+	}
+	if got := err.Error(); !strings.Contains(got, path) || !strings.Contains(got, "document 1") || strings.Contains(got, fakeValue) {
+		t.Fatalf("error = %q, want filename and document without secret value", got)
+	}
+}
+
+func TestParseDirSecretOrderingIsDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "z.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: z-secret
+  namespace: prod
+`)
+	writeManifest(t, dir, "a.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: a-secret
+  namespace: prod
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: default-secret
+`)
+
+	first, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir first: %v", err)
+	}
+	second, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir second: %v", err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("resources differ across repeated parse:\nfirst: %#v\nsecond: %#v", first, second)
+	}
+	if got := []string{
+		first.Secrets[0].Namespace + "/" + first.Secrets[0].Name,
+		first.Secrets[1].Namespace + "/" + first.Secrets[1].Name,
+		first.Secrets[2].Namespace + "/" + first.Secrets[2].Name,
+	}; !reflect.DeepEqual(got, []string{"default/default-secret", "prod/a-secret", "prod/z-secret"}) {
+		t.Fatalf("secret order = %#v, want sorted by resource identity", got)
+	}
+}
+
+func TestParseDirPreservesDuplicateSecretDocuments(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "secrets.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+`)
+
+	resources, err := ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Secret{
+		{Namespace: "default", Name: "database-password", Source: Source{Filename: path, Document: 1}},
+		{Namespace: "default", Name: "database-password", Source: Source{Filename: path, Document: 2}},
+	}
+	if !reflect.DeepEqual(resources.Secrets, want) {
+		t.Fatalf("secrets = %#v, want %#v", resources.Secrets, want)
 	}
 }
 

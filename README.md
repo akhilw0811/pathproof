@@ -16,6 +16,8 @@ Implemented Kubernetes support is intentionally small:
 
 - Parse `Service`, `Deployment`, `networking.k8s.io/v1` `Ingress`, and
   `ServiceAccount` manifests from local YAML files.
+- Parse core `v1` `Secret` metadata from local YAML files. Secret `data` and
+  `stringData` values are never ingested.
 - Parse `rbac.authorization.k8s.io/v1` `Role`, `ClusterRole`,
   `RoleBinding`, and `ClusterRoleBinding` manifests from local YAML files.
 - Resolve public Services and Ingresses to Deployment workloads.
@@ -23,6 +25,8 @@ Implemented Kubernetes support is intentionally small:
   ServiceAccount manifests when present and inferred accounts when missing.
 - Model ServiceAccount RBAC bindings to Roles or ClusterRoles and the
   deterministic resource permissions granted by reachable observed roles.
+- Model static RBAC-derived `CanRead` relationships from ServiceAccounts to
+  parsed Secrets when scoped rules allow supported Secret read access.
 
 ## Usage
 
@@ -50,7 +54,7 @@ The built binary is written to `bin/pathproof`.
 - Terraform parsing
 - GitHub Actions parsing
 - SBOM parsing
-- Kubernetes Secrets, live-cluster verification, or remediation
+- Kubernetes Secret values, live-cluster verification, or remediation
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
   ClusterRoles, and live authorization evaluation
 - AI agents

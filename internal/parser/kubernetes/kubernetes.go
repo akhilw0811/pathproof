@@ -16,6 +16,7 @@ type Resources struct {
 	Deployments         []Deployment
 	Ingresses           []Ingress
 	ServiceAccounts     []ServiceAccount
+	Secrets             []Secret
 	Roles               []Role
 	ClusterRoles        []ClusterRole
 	RoleBindings        []RoleBinding
@@ -60,6 +61,12 @@ type ServiceAccount struct {
 	Name                         string
 	AutomountServiceAccountToken *bool
 	Source                       Source
+}
+
+type Secret struct {
+	Namespace string
+	Name      string
+	Source    Source
 }
 
 type PolicyRule struct {
@@ -139,6 +146,7 @@ func ParseDir(dir string) (Resources, error) {
 		resources.Deployments = append(resources.Deployments, fileResources.Deployments...)
 		resources.Ingresses = append(resources.Ingresses, fileResources.Ingresses...)
 		resources.ServiceAccounts = append(resources.ServiceAccounts, fileResources.ServiceAccounts...)
+		resources.Secrets = append(resources.Secrets, fileResources.Secrets...)
 		resources.Roles = append(resources.Roles, fileResources.Roles...)
 		resources.ClusterRoles = append(resources.ClusterRoles, fileResources.ClusterRoles...)
 		resources.RoleBindings = append(resources.RoleBindings, fileResources.RoleBindings...)
@@ -235,6 +243,19 @@ func parseDocuments(r io.Reader, filename string) (Resources, error) {
 				AutomountServiceAccountToken: manifest.AutomountServiceAccountToken,
 				Source:                       source,
 			})
+		case "Secret":
+			if meta.APIVersion != "v1" {
+				continue
+			}
+			var manifest secretManifest
+			if err := documentNode.Decode(&manifest); err != nil {
+				return Resources{}, fmt.Errorf("parse kubernetes Secret %q document %d: %w", filename, document, err)
+			}
+			resources.Secrets = append(resources.Secrets, Secret{
+				Namespace: namespaceOrDefault(manifest.Metadata.Namespace),
+				Name:      manifest.Metadata.Name,
+				Source:    source,
+			})
 		case "Role":
 			if meta.APIVersion != "rbac.authorization.k8s.io/v1" {
 				continue
@@ -310,6 +331,9 @@ func sortResources(resources Resources) {
 	sort.SliceStable(resources.ServiceAccounts, func(i, j int) bool {
 		return serviceAccountLess(resources.ServiceAccounts[i], resources.ServiceAccounts[j])
 	})
+	sort.SliceStable(resources.Secrets, func(i, j int) bool {
+		return secretLess(resources.Secrets[i], resources.Secrets[j])
+	})
 	sort.SliceStable(resources.Roles, func(i, j int) bool {
 		return roleLess(resources.Roles[i], resources.Roles[j])
 	})
@@ -355,6 +379,16 @@ func ingressLess(a, b Ingress) bool {
 }
 
 func serviceAccountLess(a, b ServiceAccount) bool {
+	if a.Namespace != b.Namespace {
+		return a.Namespace < b.Namespace
+	}
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	return sourceLess(a.Source, b.Source)
+}
+
+func secretLess(a, b Secret) bool {
 	if a.Namespace != b.Namespace {
 		return a.Namespace < b.Namespace
 	}
@@ -560,6 +594,10 @@ type serviceAccountManifest struct {
 	AutomountServiceAccountToken *bool    `yaml:"automountServiceAccountToken"`
 }
 
+type secretManifest struct {
+	Metadata secretMetadata `yaml:"metadata"`
+}
+
 type roleManifest struct {
 	Metadata metadata             `yaml:"metadata"`
 	Rules    []policyRuleManifest `yaml:"rules"`
@@ -606,6 +644,11 @@ type metadata struct {
 	Name      string            `yaml:"name"`
 	Namespace string            `yaml:"namespace"`
 	Labels    map[string]string `yaml:"labels"`
+}
+
+type secretMetadata struct {
+	Name      string `yaml:"name"`
+	Namespace string `yaml:"namespace"`
 }
 
 type serviceSpec struct {

@@ -16,8 +16,9 @@ stable deterministic hashes of typed identities.
 - `Permission`: a canonical Kubernetes RBAC resource permission. Permission IDs
   are based on a SHA-256 hash of deterministic JSON containing `apiGroups`,
   `resources`, `resourceNames`, and `verbs`.
-- `Secret`: graph type exists for path tests; Kubernetes Secret parsing and
-  routing are not implemented.
+- `Secret`: a parsed Kubernetes core `v1` Secret metadata object. Secret node
+  names use `kubernetes://<namespace>/secret/<name>`. Secret values are never
+  ingested or represented in graph nodes.
 
 ## Edge Kinds
 
@@ -27,14 +28,19 @@ stable deterministic hashes of typed identities.
   RoleBinding or ClusterRoleBinding.
 - `GrantsPermission`: an observed Role or ClusterRole rule grants a canonical
   Permission.
-- `CanRead`: graph type exists for path tests; Kubernetes Secret read modeling
-  is not implemented.
+- `CanRead`: a ServiceAccount can read a parsed Secret under PathProof's static
+  RBAC authorization model.
 
 ## Evidence
 
 Nodes store source evidence entries. Edges store one source evidence entry.
 Kubernetes routing preserves deterministic source references using
 `filename#document=N`.
+
+Secret node evidence preserves every distinct source file and document index
+for duplicate manifests with the same namespace/name. Fully identical Secret
+source evidence records are deduplicated, and evidence is sorted
+deterministically. Secret `data`, `stringData`, and values are never included.
 
 Observed ServiceAccounts use ServiceAccount manifest evidence. Missing
 ServiceAccount manifests are represented by inferred ServiceAccount nodes with
@@ -70,6 +76,31 @@ Effective authorization requires combining the Permission reached through the
 role's `GrantsPermission` edge with the scope recorded on the ServiceAccount's
 `BoundTo` edge. PathProof does not evaluate live Kubernetes authorization.
 
+`CanRead` edges are created directly from canonical parsed RBAC rules, resolved
+binding type and scope, resolved ServiceAccount identity, and observed Secret
+metadata. Evidence is generated from that decision; evidence strings and
+serialized graph output are not inputs to authorization. One canonical
+`CanRead` edge is emitted per ServiceAccount/Secret pair. All independent
+authorization chains are aggregated into that edge as sorted, deduplicated
+evidence records. Each record identifies the binding, role, canonical
+permission hash and JSON, matched verb, effective scope, and all observed
+source records for the Secret.
+
+PathProof's static Secret read model is:
+
+- `get` or `*` with empty `resourceNames` matches every parsed Secret in the
+  effective scope.
+- `get` or `*` with nonempty `resourceNames` matches parsed Secrets whose names
+  exactly match one listed name.
+- `list` or `watch` with empty `resourceNames` matches every parsed Secret in
+  the effective scope.
+- `list` or `watch` with nonempty `resourceNames` creates no `CanRead` edge
+  because request field selectors are not modeled.
+- unrelated verbs create no Secret access.
+
+This is static authorization modeling only. It does not claim that a workload
+actually issued a Secret read request.
+
 Observed Roles or ClusterRoles with empty `rules` can still appear as reachable
 Role nodes and have `BoundTo` edges, but they create no Permission nodes and no
 `GrantsPermission` edges. Missing role references create unresolved Role nodes
@@ -84,5 +115,5 @@ resource rules in the same Role or ClusterRole are still modeled.
 ## Current Limitations
 
 The graph does not model Kubernetes User or Group RBAC subjects, non-resource
-URLs, aggregated ClusterRoles, Secrets, live-cluster state, remediation, or
-attack-path rules.
+URLs, aggregated ClusterRoles, Secret values, live-cluster state, remediation,
+or attack-path rules.

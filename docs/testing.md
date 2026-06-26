@@ -21,7 +21,11 @@ and `rbac.authorization.k8s.io/v1` RBAC parsing for Roles, ClusterRoles,
 RoleBindings, ClusterRoleBindings, ServiceAccount-only subjects, roleRefs, and
 canonical resource permission fields. Parser coverage also verifies
 deterministic parsing of unsupported `nonResourceURLs` so routing can skip
-those rules.
+those rules. Secret parser tests cover core `v1` metadata-only parsing,
+default namespaces, unsupported Secret API version skipping before typed
+decoding, deterministic ordering, duplicate source preservation, and regression
+checks that Secret `data`, `stringData`, and values are absent from serialized
+parser output and parse errors.
 
 Kubernetes routing tests cover deterministic graph construction, source
 evidence, duplicate conflict rejection before graph mutation, namespace-scoped
@@ -33,7 +37,12 @@ subjects, unsupported roleRefs, unresolved roles, scoped `BoundTo` evidence,
 canonical Permission IDs, shared Permission nodes, empty observed roles,
 multi-scope `BoundTo` evidence aggregation, skipped non-resource URL rules,
 empty-resource rules, semantic duplicate binding source preservation, and RBAC
-duplicate conflict handling.
+duplicate conflict handling. Secret access routing tests cover Secret node
+source aggregation, static RBAC `CanRead` authorization for `get`, `list`,
+`watch`, and `*`, `resourceNames` limits, RoleBinding and ClusterRoleBinding
+scope, unsupported inputs, deterministic evidence aggregation, duplicate
+evidence deduplication, conflict atomicity, and regression checks that Secret
+values are absent from graph JSON and evidence.
 
 Tests must cover positive and negative behavior for changed packages. Do not
 skip, remove, or weaken tests to make a change pass.

@@ -17,6 +17,7 @@ func AddRoutes(g *graph.Graph, resources parserkubernetes.Resources) error {
 	deployments := append([]parserkubernetes.Deployment(nil), resources.Deployments...)
 	ingresses := append([]parserkubernetes.Ingress(nil), resources.Ingresses...)
 	serviceAccounts := append([]parserkubernetes.ServiceAccount(nil), resources.ServiceAccounts...)
+	secrets := append([]parserkubernetes.Secret(nil), resources.Secrets...)
 	roles := append([]parserkubernetes.Role(nil), resources.Roles...)
 	clusterRoles := append([]parserkubernetes.ClusterRole(nil), resources.ClusterRoles...)
 	roleBindings := append([]parserkubernetes.RoleBinding(nil), resources.RoleBindings...)
@@ -25,15 +26,16 @@ func AddRoutes(g *graph.Graph, resources parserkubernetes.Resources) error {
 	sortDeployments(deployments)
 	sortIngresses(ingresses)
 	sortServiceAccounts(serviceAccounts)
+	sortSecrets(secrets)
 	sortRoles(roles)
 	sortClusterRoles(clusterRoles)
 	sortRoleBindings(roleBindings)
 	sortClusterRoleBindings(clusterRoleBindings)
-	if err := validateNoConflictingDuplicates(services, deployments, ingresses, serviceAccounts, roles, clusterRoles, roleBindings, clusterRoleBindings); err != nil {
+	if err := validateNoConflictingDuplicates(services, deployments, ingresses, serviceAccounts, secrets, roles, clusterRoles, roleBindings, clusterRoleBindings); err != nil {
 		return err
 	}
 
-	rbac, err := desiredRBACGraph(uniqueRoles(roles), uniqueClusterRoles(clusterRoles), roleBindings, clusterRoleBindings)
+	rbac, err := desiredRBACGraph(uniqueRoles(roles), uniqueClusterRoles(clusterRoles), roleBindings, clusterRoleBindings, secrets)
 	if err != nil {
 		return err
 	}
@@ -209,6 +211,12 @@ type resolvedBinding struct {
 	unresolved  bool
 }
 
+type observedSecret struct {
+	secret     parserkubernetes.Secret
+	node       graph.Node
+	sourceRefs []string
+}
+
 type canonicalPermission struct {
 	APIGroups     []string `json:"apiGroups"`
 	Resources     []string `json:"resources"`
@@ -218,7 +226,7 @@ type canonicalPermission struct {
 
 const rbacAPIGroup = "rbac.authorization.k8s.io"
 
-func desiredRBACGraph(roles []parserkubernetes.Role, clusterRoles []parserkubernetes.ClusterRole, roleBindings []parserkubernetes.RoleBinding, clusterRoleBindings []parserkubernetes.ClusterRoleBinding) (desiredGraph, error) {
+func desiredRBACGraph(roles []parserkubernetes.Role, clusterRoles []parserkubernetes.ClusterRole, roleBindings []parserkubernetes.RoleBinding, clusterRoleBindings []parserkubernetes.ClusterRoleBinding, secrets []parserkubernetes.Secret) (desiredGraph, error) {
 	desired := desiredGraph{
 		nodes: make(map[graph.NodeID]graph.Node),
 		edges: make(map[graph.EdgeID]graph.Edge),
@@ -296,6 +304,10 @@ func desiredRBACGraph(roles []parserkubernetes.Role, clusterRoles []parserkubern
 			desired.addNode(permission)
 			desired.addEdge(graph.NewEdge(graph.GrantsPermission, role.node.ID, permission.ID, grantsPermissionEvidence(role, hash)))
 		}
+	}
+
+	if err := addDesiredSecretsAndReads(&desired, bindings, secrets); err != nil {
+		return desiredGraph{}, err
 	}
 
 	return desired, nil
@@ -523,7 +535,24 @@ func clusterRoleName(name string) string {
 	return "kubernetes://cluster/clusterrole/" + name
 }
 
+func secretName(namespace, name string) string {
+	return "kubernetes://" + namespace + "/secret/" + name
+}
+
 func permissionNode(rule parserkubernetes.PolicyRule) (graph.Node, string, error) {
+	data, hash, err := canonicalPermissionData(rule)
+	if err != nil {
+		return graph.Node{}, "", err
+	}
+	node := graph.NewNode(graph.Permission, "kubernetes://permission/"+hash)
+	node.Evidence = []graph.SourceEvidence{{
+		Source: "canonical permission sha256:" + hash,
+		Detail: "kubernetes RBAC Permission " + string(data),
+	}}
+	return node, hash, nil
+}
+
+func canonicalPermissionData(rule parserkubernetes.PolicyRule) ([]byte, string, error) {
 	canonical := canonicalPermission{
 		APIGroups:     canonicalStrings(rule.APIGroups),
 		Resources:     canonicalStrings(rule.Resources),
@@ -532,16 +561,10 @@ func permissionNode(rule parserkubernetes.PolicyRule) (graph.Node, string, error
 	}
 	data, err := json.Marshal(canonical)
 	if err != nil {
-		return graph.Node{}, "", err
+		return nil, "", err
 	}
 	hashBytes := sha256.Sum256(data)
-	hash := hex.EncodeToString(hashBytes[:])
-	node := graph.NewNode(graph.Permission, "kubernetes://permission/"+hash)
-	node.Evidence = []graph.SourceEvidence{{
-		Source: "canonical permission sha256:" + hash,
-		Detail: "kubernetes RBAC Permission " + string(data),
-	}}
-	return node, hash, nil
+	return data, hex.EncodeToString(hashBytes[:]), nil
 }
 
 func canonicalStrings(values []string) []string {
@@ -602,6 +625,179 @@ func grantsPermissionEvidence(role observedRole, permissionHash string) graph.So
 	return graph.SourceEvidence{
 		Source: fmt.Sprintf("%s %s; permission sha256:%s", strings.ToLower(role.kind), sourceRef(role.source), permissionHash),
 		Detail: "kubernetes RBAC role rule grants permission",
+	}
+}
+
+func addDesiredSecretsAndReads(desired *desiredGraph, bindings []resolvedBinding, secrets []parserkubernetes.Secret) error {
+	secretObservations := observedSecretMetadata(secrets)
+	for _, secret := range secretObservations {
+		desired.addNode(secret.node)
+	}
+	if len(secretObservations) == 0 {
+		return nil
+	}
+
+	canReadEvidenceRecords := make(map[boundToKey]map[string]struct{})
+	for _, binding := range bindings {
+		if binding.unresolved || binding.roleSource == nil {
+			continue
+		}
+		serviceAccount := graph.NewNode(graph.ServiceAccount, serviceAccountName(binding.subject.Namespace, binding.subject.Name))
+		serviceAccount.Evidence = []graph.SourceEvidence{rbacInferredServiceAccountEvidence(binding.binding, binding.bindingKind, binding.subject)}
+		desired.addNode(serviceAccount)
+
+		for _, secret := range secretObservations {
+			if !bindingScopeMatchesSecret(binding, secret.secret) {
+				continue
+			}
+			for _, rule := range binding.rules {
+				matchedVerbs := secretReadMatchedVerbs(rule, secret.secret.Name)
+				if len(matchedVerbs) == 0 {
+					continue
+				}
+				permissionJSON, permissionHash, err := canonicalPermissionData(rule)
+				if err != nil {
+					return fmt.Errorf("canonicalize secret read permission for %s %s: %w", binding.roleKind, binding.role.Name, err)
+				}
+				key := boundToKey{from: serviceAccount.ID, to: secret.node.ID}
+				if canReadEvidenceRecords[key] == nil {
+					canReadEvidenceRecords[key] = make(map[string]struct{})
+				}
+				for _, verb := range matchedVerbs {
+					canReadEvidenceRecords[key][canReadEvidenceRecord(binding, permissionHash, string(permissionJSON), verb, secret)] = struct{}{}
+				}
+			}
+		}
+	}
+
+	keys := make([]boundToKey, 0, len(canReadEvidenceRecords))
+	for key := range canReadEvidenceRecords {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].from != keys[j].from {
+			return keys[i].from < keys[j].from
+		}
+		return keys[i].to < keys[j].to
+	})
+	for _, key := range keys {
+		records := make([]string, 0, len(canReadEvidenceRecords[key]))
+		for record := range canReadEvidenceRecords[key] {
+			records = append(records, record)
+		}
+		sort.Strings(records)
+		desired.addEdge(graph.NewEdge(graph.CanRead, key.from, key.to, aggregatedCanReadEvidence(records)))
+	}
+	return nil
+}
+
+func observedSecretMetadata(secrets []parserkubernetes.Secret) []observedSecret {
+	if len(secrets) == 0 {
+		return nil
+	}
+	secrets = append([]parserkubernetes.Secret(nil), secrets...)
+	sortSecrets(secrets)
+
+	var observed []observedSecret
+	seenEvidence := make(map[namespacedName]map[graph.SourceEvidence]struct{})
+	for _, secret := range secrets {
+		key := namespacedName{namespace: secret.Namespace, name: secret.Name}
+		if len(observed) == 0 || observed[len(observed)-1].secret.Namespace != secret.Namespace || observed[len(observed)-1].secret.Name != secret.Name {
+			node := graph.NewNode(graph.Secret, secretName(secret.Namespace, secret.Name))
+			observed = append(observed, observedSecret{secret: secret, node: node})
+		}
+		evidence := sourceEvidence(secret.Source, "kubernetes Secret metadata")
+		if seenEvidence[key] == nil {
+			seenEvidence[key] = make(map[graph.SourceEvidence]struct{})
+		}
+		if _, exists := seenEvidence[key][evidence]; exists {
+			continue
+		}
+		seenEvidence[key][evidence] = struct{}{}
+		current := &observed[len(observed)-1]
+		current.node.Evidence = append(current.node.Evidence, evidence)
+		current.sourceRefs = append(current.sourceRefs, sourceRef(secret.Source))
+	}
+	return observed
+}
+
+func bindingScopeMatchesSecret(binding resolvedBinding, secret parserkubernetes.Secret) bool {
+	switch binding.scopeKind {
+	case "cluster":
+		return true
+	case "namespace":
+		return binding.scopeName == secret.Namespace
+	default:
+		return false
+	}
+}
+
+func secretReadMatchedVerbs(rule parserkubernetes.PolicyRule, secretName string) []string {
+	if len(rule.NonResourceURLs) > 0 {
+		return nil
+	}
+	if !stringSliceContains(rule.APIGroups, "") && !stringSliceContains(rule.APIGroups, "*") {
+		return nil
+	}
+	if !stringSliceContains(rule.Resources, "secrets") && !stringSliceContains(rule.Resources, "*") {
+		return nil
+	}
+
+	namesMatch := len(rule.ResourceNames) == 0 || stringSliceContains(rule.ResourceNames, secretName)
+	var matched []string
+	for _, verb := range canonicalStrings(rule.Verbs) {
+		switch verb {
+		case "*", "get":
+			if namesMatch {
+				matched = append(matched, verb)
+			}
+		case "list", "watch":
+			if len(rule.ResourceNames) == 0 {
+				matched = append(matched, verb)
+			}
+		}
+	}
+	return matched
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func canReadEvidenceRecord(binding resolvedBinding, permissionHash, permissionJSON, matchedVerb string, secret observedSecret) string {
+	parts := []string{
+		"binding_kind=" + binding.bindingKind,
+		"binding_name=" + binding.bindingName,
+		"binding_source=" + sourceRef(binding.binding),
+		"matched_verb=" + matchedVerb,
+		"permission_sha256=" + permissionHash,
+		"permission_json=" + permissionJSON,
+		"role_kind=" + binding.roleKind,
+		"role_name=" + binding.role.Name,
+		"role_source=" + sourceRef(*binding.roleSource),
+		"scope_kind=" + binding.scopeKind,
+		"secret_name=" + secret.secret.Namespace + "/" + secret.secret.Name,
+		"secret_sources=" + strings.Join(secret.sourceRefs, ","),
+	}
+	if binding.bindingKind == "RoleBinding" {
+		parts = append(parts,
+			"binding_namespace="+binding.scopeName,
+			"scope_name="+binding.scopeName,
+		)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "; ")
+}
+
+func aggregatedCanReadEvidence(records []string) graph.SourceEvidence {
+	return graph.SourceEvidence{
+		Source: "kubernetes Secret read access: " + strings.Join(records, " | "),
+		Detail: strings.Join(records, " | "),
 	}
 }
 
@@ -868,7 +1064,7 @@ func dedupeSortedStrings(values []string) []string {
 	return deduped
 }
 
-func validateNoConflictingDuplicates(services []parserkubernetes.Service, deployments []parserkubernetes.Deployment, ingresses []parserkubernetes.Ingress, serviceAccounts []parserkubernetes.ServiceAccount, roles []parserkubernetes.Role, clusterRoles []parserkubernetes.ClusterRole, roleBindings []parserkubernetes.RoleBinding, clusterRoleBindings []parserkubernetes.ClusterRoleBinding) error {
+func validateNoConflictingDuplicates(services []parserkubernetes.Service, deployments []parserkubernetes.Deployment, ingresses []parserkubernetes.Ingress, serviceAccounts []parserkubernetes.ServiceAccount, secrets []parserkubernetes.Secret, roles []parserkubernetes.Role, clusterRoles []parserkubernetes.ClusterRole, roleBindings []parserkubernetes.RoleBinding, clusterRoleBindings []parserkubernetes.ClusterRoleBinding) error {
 	if err := validateDuplicateServices(services); err != nil {
 		return err
 	}
@@ -879,6 +1075,9 @@ func validateNoConflictingDuplicates(services []parserkubernetes.Service, deploy
 		return err
 	}
 	if err := validateDuplicateServiceAccounts(serviceAccounts); err != nil {
+		return err
+	}
+	if err := validateDuplicateSecrets(secrets); err != nil {
 		return err
 	}
 	if err := validateDuplicateRoles(roles); err != nil {
@@ -952,6 +1151,10 @@ func validateDuplicateServiceAccounts(serviceAccounts []parserkubernetes.Service
 			return duplicateConflictError("ServiceAccount", serviceAccount.Namespace, serviceAccount.Name, previous.Source, serviceAccount.Source)
 		}
 	}
+	return nil
+}
+
+func validateDuplicateSecrets(_ []parserkubernetes.Secret) error {
 	return nil
 }
 
@@ -1242,6 +1445,12 @@ func sortServiceAccounts(serviceAccounts []parserkubernetes.ServiceAccount) {
 	})
 }
 
+func sortSecrets(secrets []parserkubernetes.Secret) {
+	sort.SliceStable(secrets, func(i, j int) bool {
+		return secretLess(secrets[i], secrets[j])
+	})
+}
+
 func sortRoles(roles []parserkubernetes.Role) {
 	sort.SliceStable(roles, func(i, j int) bool {
 		return roleLess(roles[i], roles[j])
@@ -1297,6 +1506,16 @@ func ingressLess(a, b parserkubernetes.Ingress) bool {
 }
 
 func serviceAccountLess(a, b parserkubernetes.ServiceAccount) bool {
+	if a.Namespace != b.Namespace {
+		return a.Namespace < b.Namespace
+	}
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	return sourceLess(a.Source, b.Source)
+}
+
+func secretLess(a, b parserkubernetes.Secret) bool {
 	if a.Namespace != b.Namespace {
 		return a.Namespace < b.Namespace
 	}
