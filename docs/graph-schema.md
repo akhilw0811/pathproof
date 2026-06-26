@@ -419,6 +419,16 @@ Implemented rules are:
   workflow-level grants use `Workflow`; job-level grants use
   `Workflow --DefinesJob--> WorkflowJob`
 
+- Rule ID: `PP-XDOMAIN-001`
+- Title:
+  `Risky GitHub Actions workflow can assume AWS IAM role`
+- Severity: fixed `High`
+- Required path:
+  workflow-level OIDC uses
+  `Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole`;
+  job-level OIDC uses
+  `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole`
+
 `PP-K8S-001` is emitted only when all four Kubernetes nodes exist with the
 expected kinds and all three directed edges exist with the expected kinds. The
 ordered finding chain stores the four node IDs followed by the three edge IDs
@@ -459,6 +469,22 @@ permission inheritance/override modeling is future work.
 represented only as graph structure until PathProof has modeled cloud trust
 policies or another deterministic unsafe condition.
 
+`PP-XDOMAIN-001` is emitted only when all of the following are true: the
+workflow-level or job-level OIDC path exists in the graph, the OIDC capability
+has a `CanAssumeRole` edge to an `AWSIAMRole`, and the workflow/job has a
+structured risk signal equivalent to `PP-GHA-002` or `PP-GHA-003`. `PP-GHA-001`
+alone does not trigger this rule. Workflow-level dangerous permission risk
+pairs only with workflow-level OIDC. Job-level dangerous permission risk pairs
+only with same-job OIDC. Unsafe checkout risk is attached to a job/step and
+pairs with same-job OIDC when modeled; it may also pair with explicitly modeled
+workflow-level OIDC. PathProof does not infer exact GitHub permission
+inheritance or override behavior. For this first cross-domain rule, the
+`CanAssumeRole` edge metadata must identify the pull request subject candidate
+(`repo:OWNER/REPO:pull_request`) because the supported risk signals are
+`pull_request_target`-based. A role trust match for a different subject, such
+as `repo:OWNER/REPO:ref:refs/heads/main`, is not enough to emit
+`PP-XDOMAIN-001`.
+
 Finding IDs are deterministic and stable. `PP-K8S-001` IDs are SHA-256 hashes of a
 canonical JSON identity containing only fixed field names for `rule_id`,
 ordered `node_ids`, and ordered `edge_ids`. Evidence, source references,
@@ -472,11 +498,48 @@ and ordered selector field/expression identities.
 `PP-GHA-003` IDs are SHA-256 hashes of a canonical JSON identity containing
 `rule_id`, workflow file, scope, job ID when scope is `job`, permission name,
 and access value.
+`PP-XDOMAIN-001` IDs are SHA-256 hashes of canonical JSON containing `rule_id`,
+ordered path node IDs, ordered path edge IDs, risk signal kind (`PP-GHA-002` or
+`PP-GHA-003`), risk signal identity, and AWS role node ID. Unsafe checkout risk
+identity includes workflow file, job ID, step index, and ordered selector
+field/expression identities. Dangerous permission risk identity includes
+workflow file, scope, job ID when present, permission, and access. Evidence,
+source-reference display paths, summaries, and prose are not part of identity.
 
 Finding evidence preserves the complete ordered edge evidence for the matched
 path. `source_references` are derived from those edge evidence sources in
 chain order, omit empty strings, and deduplicate exact repeated references
 while preserving first appearance. They are not globally sorted.
+
+`PP-XDOMAIN-001` keeps only the actual cross-domain graph path in `node_ids`,
+`edge_ids`, and ordered evidence. Non-path risk evidence is represented in an
+optional structured `risk_signal` field:
+
+```json
+{
+  "risk_signal": {
+    "rule_id": "PP-GHA-002",
+    "source_reference": ".github/workflows/unsafe.yml#document=1",
+    "workflow_file": ".github/workflows/unsafe.yml",
+    "job_id": "deploy",
+    "step_index": 0,
+    "selectors": [
+      {
+        "field": "ref",
+        "matched_expression": "github.event.pull_request.head.sha"
+      }
+    ],
+    "summary": "unsafe checkout selector ref=github.event.pull_request.head.sha under pull_request_target"
+  }
+}
+```
+
+For `PP-GHA-003` risk, `risk_signal` uses `permission` and `access` instead of
+`step_index` and `selectors`. The field is omitted from findings for
+`PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003`. It contains only
+sanitized structured fields and never raw workflow YAML, raw Terraform, raw
+trust policy JSON, env values, arbitrary `with` values, run scripts, secrets,
+token values, provider credentials, or raw evidence blobs.
 
 Secret values are absent from findings because Secret values are never
 ingested into parser output or graph evidence. GitHub Actions env, arbitrary
@@ -504,7 +567,8 @@ shape:
 SARIF scan output is also a private CLI projection, not a graph schema. It is
 selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
 with one PathProof run, deterministic rule entries for `PP-K8S-001`,
-`PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003`, and one result per finding.
+`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`, and one result
+per finding.
 Result properties include finding ID, severity, ordered node IDs, ordered edge
 IDs, and clean display source references when available.
 
@@ -697,10 +761,10 @@ The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
 workflow execution, GitHub API state, expression evaluation, workflow
 permissions, reusable workflow resolution, action source inspection,
-CI/CD-to-cloud findings, in-place patch application, live validation, or
-attack-path rules beyond `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
-`PP-GHA-003`. Terraform support is limited to graph-only static
-`aws_iam_role` GitHub Actions OIDC trust metadata and optional
+CI/CD-to-cloud findings beyond `PP-XDOMAIN-001`, in-place patch application,
+live validation, or attack-path rules beyond `PP-K8S-001`, `PP-GHA-001`,
+`PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`. Terraform support is limited
+to static `aws_iam_role` GitHub Actions OIDC trust metadata and optional
 `CanAssumeRole` edges when `--repo OWNER/REPO` is supplied; PathProof does not
 execute Terraform, evaluate modules or variables, call AWS or GitHub, validate
 cloud state, or simulate IAM. The

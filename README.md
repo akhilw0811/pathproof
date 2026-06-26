@@ -11,7 +11,9 @@ patched copies, and validates the fix with a rescan. It also detects
 40-character commit SHA, `PP-GHA-002` when a `pull_request_target` workflow
 checks out untrusted pull request head code with `actions/checkout`, and
 `PP-GHA-003` when a `pull_request_target` workflow explicitly grants dangerous
-workflow-level or job-level token permissions.
+workflow-level or job-level token permissions, and detects `PP-XDOMAIN-001`
+when one of those risky GitHub Actions conditions has a modeled OIDC path to a
+locally parsed AWS IAM role trust.
 
 PathProof is currently a defensive Go CLI focused on two small, tested local
 slices. It scans local YAML manifests and workflows, builds an in-memory graph,
@@ -24,14 +26,17 @@ models explicit GitHub Actions OIDC token request capability in the internal
 graph when a workflow or job grants `id-token: write` or
 `permissions: write-all`; this graph-only capability can be connected to a
 statically parsed AWS IAM role trust policy when `--repo OWNER/REPO` is
-supplied. This cross-domain graph edge does not produce a finding by itself.
+supplied. A matched AWS role trust edge does not produce a finding by itself;
+`PP-XDOMAIN-001` requires the GitHub Actions workflow or job to also have a
+modeled `PP-GHA-002` or `PP-GHA-003` risk signal.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
 Terraform execution, module or variable evaluation, reusable workflow
 resolution, action source inspection, broader sensitive-resource types, live
-cluster scanning, cloud validation, IAM simulation, cross-domain findings,
-pull request creation, AI/ML ranking, and dashboards are not implemented.
+cluster scanning, cloud validation, IAM simulation, broad cross-domain
+analysis, pull request creation, AI/ML ranking, and dashboards are not
+implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, and internal scan errors exit `2`.
@@ -174,6 +179,22 @@ Title: GitHub Actions workflow uses an action that is not pinned to a full commi
 Severity: Medium
 ```
 
+Scan the cross-domain GitHub Actions OIDC to AWS IAM role demo fixture:
+
+```sh
+./bin/pathproof scan --repo owner/repo ./examples/cross-domain/github-oidc-aws-role
+```
+
+Expected shape:
+
+```text
+Finding count: 2
+Rule: PP-GHA-003
+Rule: PP-XDOMAIN-001
+Title: Risky GitHub Actions workflow can assume AWS IAM role
+Severity: High
+```
+
 ## GitHub Actions Security
 
 PathProof currently implements three small local GitHub Actions checks:
@@ -191,7 +212,10 @@ PathProof currently implements three small local GitHub Actions checks:
   `permissions: write-all`.
 - Graph-only OIDC capability modeling: workflow-level or job-level
   `id-token: write`, including `permissions: write-all`, is represented as an
-  internal OIDC token request capability for future path analysis.
+  internal OIDC token request capability.
+- `PP-XDOMAIN-001`: a risky `pull_request_target` workflow or job with a
+  `PP-GHA-002` or `PP-GHA-003` risk signal has a modeled local OIDC path to a
+  statically parsed AWS IAM role trust.
 
 These checks are static and local. PathProof does not execute workflows, call
 GitHub APIs, evaluate expressions, inspect action source, model workflow
@@ -208,15 +232,18 @@ Go's standard library and records sanitized AWS IAM role trust metadata for
 GitHub Actions OIDC trust statements.
 
 When `pathproof scan --repo OWNER/REPO <directory>` is used, PathProof can add
-a graph-only `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edge if a
+a graph `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edge if a
 parsed workflow/job OIDC capability has a static subject candidate that
 matches the role trust conditions. Without `--repo`, Terraform trust metadata
 is still modeled, but cross-domain `CanAssumeRole` edges are not created.
+`PP-XDOMAIN-001` is emitted only when that edge is reachable from an explicitly
+modeled workflow-level or job-level OIDC capability and the same workflow/job
+has a modeled PP-GHA-002 or PP-GHA-003 risk signal.
 
 This slice does not execute Terraform, parse modules, evaluate variables,
 locals, functions, `jsonencode`, interpolations, or
 `aws_iam_policy_document`, call AWS or GitHub APIs, verify ARNs or accounts,
-simulate IAM, emit findings, or provide remediation.
+simulate IAM permissions, inspect role policies, or provide remediation.
 
 ## CI / SARIF
 
@@ -264,6 +291,9 @@ only publishes the SARIF file as an artifact.
   grant dangerous workflow-level or job-level token permissions.
 - Internal graph-only modeling for GitHub Actions OIDC token request
   capability from explicit `id-token: write` or `permissions: write-all`.
+- `PP-XDOMAIN-001` detection for the first local cross-domain GitHub Actions
+  OIDC to AWS IAM role trust path, gated by modeled PP-GHA-002 or PP-GHA-003
+  risk signals.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -281,12 +311,12 @@ The scan loop is:
 5. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
 6. Add deterministic GitHub Actions workflow/job/action-use edges and
    graph-only OIDC token capability edges.
-7. Add deterministic graph-only AWS IAM role trust nodes and optional
-   `CanAssumeRole` edges when `--repo OWNER/REPO` supplies repository
-   identity for static subject matching.
+7. Add deterministic AWS IAM role trust nodes and optional `CanAssumeRole`
+   edges when `--repo OWNER/REPO` supplies repository identity for static
+   subject matching.
 8. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
-   `PP-GHA-003`.
-7. Build advisory remediation plans from structured graph metadata for
+   `PP-GHA-003`, and `PP-XDOMAIN-001`.
+9. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
 8. Optionally generate read-only `NarrowBindingSubject` patch previews.
 9. Optionally write patched copies to a separate output directory.

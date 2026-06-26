@@ -1,0 +1,8 @@
+name: Cross-domain unsafe
+on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "deploy"
