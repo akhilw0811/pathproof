@@ -105,6 +105,7 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 						Rules: []sarifRule{
 							sarifPublicWorkloadCanReadSecretRule(),
 							sarifGitHubActionsUnpinnedActionRule(),
+							sarifGitHubActionsUnsafePullRequestTargetCheckoutRule(),
 						},
 					},
 				},
@@ -142,6 +143,20 @@ func sarifGitHubActionsUnpinnedActionRule() sarifRule {
 	}
 }
 
+func sarifGitHubActionsUnsafePullRequestTargetCheckoutRule() sarifRule {
+	const title = "pull_request_target workflow checks out untrusted pull request head code"
+	return sarifRule{
+		ID:               string(analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects GitHub Actions pull_request_target workflows where actions/checkout is configured to check out pull request head code."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "error",
+		},
+		Help: sarifMessage{Text: "Avoid checking out untrusted pull request head code in pull_request_target workflows. Use pull_request for untrusted code, or check out a trusted base ref before privileged operations."},
+	}
+}
+
 func newSARIFResult(root string, finding scanFinding) sarifResult {
 	sourceReferences := sarifSourceReferences(root, finding)
 	locations := make([]sarifLocation, 0, len(sourceReferences))
@@ -174,6 +189,9 @@ func newSARIFResult(root string, finding scanFinding) sarifResult {
 }
 
 func sarifFindingMessage(finding scanFinding) string {
+	if finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout && finding.Summary != "" {
+		return finding.Summary
+	}
 	parts := make([]string, 0, len(finding.Path))
 	for _, node := range finding.Path {
 		parts = append(parts, string(node.Kind)+" "+node.Name)

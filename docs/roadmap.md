@@ -21,9 +21,11 @@
   RBAC-derived ServiceAccount `CanRead` edges. Secret values are never
   ingested.
 - Local GitHub Actions workflow parsing under `.github/workflows` for
-  workflow name, job IDs, step indexes, optional step names, and static
-  `uses:` values. Workflow env values, with values, secrets, token values, run
-  scripts, and raw workflow documents are not retained.
+  workflow name, `pull_request_target` trigger presence, job IDs, step
+  indexes, optional step names, sanitized static action identities, and
+  sanitized `actions/checkout` PR-head selector matches. Workflow env values,
+  arbitrary with values, secrets, token values, run scripts, expression-only
+  `uses:` values, and raw workflow documents are not retained.
 - Minimal GitHub Actions workflow/job/action-use graph construction with
   `Workflow`, `WorkflowJob`, `GitHubAction`, `DefinesJob`, and `UsesAction`.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
@@ -32,6 +34,10 @@
 - Read-only deterministic GitHub Actions analysis for `PP-GHA-001`: workflow
   action references not pinned to exactly 40 hexadecimal commit characters,
   with fixed rule-based `Medium` severity and deterministic finding IDs.
+- Read-only deterministic GitHub Actions analysis for `PP-GHA-002`:
+  `pull_request_target` workflows that configure `actions/checkout` to check
+  out pull request head code, with fixed rule-based `High` severity and
+  deterministic finding IDs.
 - Read-only deterministic remediation planning for `PP-K8S-001`, using typed
   structured `CanRead` authorization metadata. Implemented advisory actions are
   `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
@@ -53,9 +59,9 @@
   `pathproof scan <directory>` with human-readable finding, supported
   Kubernetes remediation and optional patch preview output, JSON output, SARIF
   2.1.0 finding output, and stable exit codes.
-- Local findings-only SARIF export for `PP-K8S-001` and `PP-GHA-001`. SARIF
-  artifact locations use safe relative URIs when clean structured source
-  references are available.
+- Local findings-only SARIF export for `PP-K8S-001`, `PP-GHA-001`, and
+  `PP-GHA-002`. SARIF artifact locations use safe relative URIs when clean
+  structured source references are available.
 
 ## Later
 
@@ -67,6 +73,8 @@
 - Reusable workflow resolution.
 - Action source inspection.
 - Automatic GitHub Actions action pinning patches.
+- Automatic GitHub Actions remediation for unsafe `pull_request_target`
+  checkout patterns.
 - Remediation verification.
 - In-place patch application, live validation, force/clobber behavior, Git
   commits, and pull request creation.

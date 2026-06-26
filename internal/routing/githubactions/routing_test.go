@@ -26,6 +26,9 @@ func TestAddRoutesBuildsWorkflowJobAndActionGraph(t *testing.T) {
 				Index: 0,
 				Name:  "Checkout",
 				Uses:  "actions/checkout@v4",
+				Owner: "actions",
+				Repo:  "checkout",
+				Ref:   "v4",
 			}},
 		}},
 	}}}
@@ -83,8 +86,8 @@ func TestAddRoutesKeepsRepeatedActionUsesDistinctByStep(t *testing.T) {
 		Jobs: []parsergithubactions.Job{{
 			ID: "test",
 			Steps: []parsergithubactions.Step{
-				{Index: 0, Uses: "owner/repo@main"},
-				{Index: 1, Uses: "owner/repo@main"},
+				{Index: 0, Uses: "owner/repo@main", Owner: "owner", Repo: "repo", Ref: "main"},
+				{Index: 1, Uses: "owner/repo@main", Owner: "owner", Repo: "repo", Ref: "main"},
 			},
 		}},
 	}}}
@@ -155,28 +158,60 @@ func writeWorkflowForRoutingTest(t *testing.T, root, name, content string) {
 	}
 }
 
-func TestParseActionReferenceStaticForms(t *testing.T) {
-	tests := []struct {
-		name string
-		uses string
-		want actionReference
-	}{
-		{name: "owner repo ref", uses: "owner/repo@main", want: actionReference{owner: "owner", repo: "repo", ref: "main"}},
-		{name: "owner repo path ref", uses: "owner/repo/path/to/action@v1", want: actionReference{owner: "owner", repo: "repo", path: "path/to/action", ref: "v1"}},
-		{name: "owner repo path no ref", uses: "owner/repo/path", want: actionReference{owner: "owner", repo: "repo", path: "path"}},
-		{name: "local", uses: "./local-action", want: actionReference{}},
-		{name: "docker", uses: "docker://alpine:3.19", want: actionReference{}},
-		{name: "entire expression", uses: "${{ matrix.action }}", want: actionReference{}},
-		{name: "expression ref", uses: "owner/repo@${{ matrix.ref }}", want: actionReference{owner: "owner", repo: "repo", ref: "${{ matrix.ref }}"}},
-		{name: "expression owner", uses: "${{ matrix.owner }}/repo@main", want: actionReference{}},
+func TestAddRoutesPreservesPullRequestTargetCheckoutSelectorMetadata(t *testing.T) {
+	resources := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
+		Name: "Unsafe",
+		Source: parsergithubactions.Source{
+			Filename:     "/repo/.github/workflows/unsafe.yml",
+			RelativePath: ".github/workflows/unsafe.yml",
+			Document:     1,
+		},
+		TriggersPullRequestTarget: true,
+		Jobs: []parsergithubactions.Job{{
+			ID: "test",
+			Steps: []parsergithubactions.Step{{
+				Index: 0,
+				Name:  "Checkout",
+				Uses:  "actions/checkout@v4",
+				Owner: "actions",
+				Repo:  "checkout",
+				Ref:   "v4",
+				CheckoutHeadSelectors: []parsergithubactions.CheckoutHeadSelector{{
+					Field:             "ref",
+					MatchedExpression: "github.event.pull_request.head.sha",
+				}},
+			}},
+		}},
+	}}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := parseActionReference(tt.uses)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("parseActionReference(%q) = %#v, want %#v", tt.uses, got, tt.want)
-			}
-		})
+	workflow := graph.NewNode(graph.Workflow, "githubactions://.github/workflows/unsafe.yml")
+	job := graph.NewNode(graph.WorkflowJob, "githubactions://.github/workflows/unsafe.yml/job/test")
+	action := graph.NewNode(graph.GitHubAction, "githubactions://.github/workflows/unsafe.yml/job/test/step/0/action/actions/checkout@v4")
+	uses := graph.NewEdge(graph.UsesAction, job.ID, action.ID, graph.SourceEvidence{})
+	gotUses, ok := g.Edge(uses.ID)
+	if !ok {
+		t.Fatalf("missing UsesAction edge %q", uses.ID)
+	}
+	if _, ok := g.Node(workflow.ID); !ok {
+		t.Fatalf("missing workflow node %s", workflow.ID)
+	}
+	actionUse := gotUses.Metadata.GitHubActionUse
+	if actionUse == nil || !actionUse.TriggersPullRequestTarget {
+		t.Fatalf("action metadata = %#v, want pull_request_target", gotUses.Metadata)
+	}
+	wantSelectors := []graph.GitHubActionsCheckoutHeadSelector{{
+		Field:             "ref",
+		MatchedExpression: "github.event.pull_request.head.sha",
+	}}
+	if !reflect.DeepEqual(actionUse.CheckoutHeadSelectors, wantSelectors) {
+		t.Fatalf("selectors = %#v, want %#v", actionUse.CheckoutHeadSelectors, wantSelectors)
+	}
+	if !strings.Contains(gotUses.Evidence.Detail, "ref=github.event.pull_request.head.sha") {
+		t.Fatalf("evidence detail = %q, want sanitized selector", gotUses.Evidence.Detail)
 	}
 }

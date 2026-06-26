@@ -15,14 +15,16 @@ type RuleID string
 type Severity string
 
 const (
-	RulePublicWorkloadCanReadSecret RuleID   = "PP-K8S-001"
-	RuleGitHubActionsUnpinnedAction RuleID   = "PP-GHA-001"
-	SeverityHigh                    Severity = "High"
-	SeverityMedium                  Severity = "Medium"
+	RulePublicWorkloadCanReadSecret                  RuleID   = "PP-K8S-001"
+	RuleGitHubActionsUnpinnedAction                  RuleID   = "PP-GHA-001"
+	RuleGitHubActionsUnsafePullRequestTargetCheckout RuleID   = "PP-GHA-002"
+	SeverityHigh                                     Severity = "High"
+	SeverityMedium                                   Severity = "Medium"
 )
 
 const publicWorkloadCanReadSecretTitle = "Public workload can read Kubernetes Secret"
 const githubActionsUnpinnedActionTitle = "GitHub Actions workflow uses an action that is not pinned to a full commit SHA"
+const githubActionsUnsafePullRequestTargetCheckoutTitle = "pull_request_target workflow checks out untrusted pull request head code"
 
 type Finding struct {
 	ID               FindingID         `json:"id"`
@@ -57,6 +59,23 @@ type githubActionsFindingIdentity struct {
 	Repo         string `json:"repo"`
 	Path         string `json:"path,omitempty"`
 	Ref          string `json:"ref,omitempty"`
+}
+
+type githubActionsUnsafeCheckoutFindingIdentity struct {
+	RuleID       RuleID                          `json:"rule_id"`
+	WorkflowFile string                          `json:"workflow_file"`
+	JobID        string                          `json:"job_id"`
+	StepIndex    int                             `json:"step_index"`
+	Owner        string                          `json:"owner"`
+	Repo         string                          `json:"repo"`
+	Path         string                          `json:"path,omitempty"`
+	Ref          string                          `json:"ref,omitempty"`
+	Selectors    []githubActionsSelectorIdentity `json:"selectors"`
+}
+
+type githubActionsSelectorIdentity struct {
+	Field             string `json:"field"`
+	MatchedExpression string `json:"matched_expression"`
 }
 
 func Analyze(g *graph.Graph) []Finding {
@@ -134,6 +153,10 @@ func Analyze(g *graph.Graph) []Finding {
 			if ok {
 				findings = append(findings, finding)
 			}
+			finding, ok = newGitHubActionsUnsafePullRequestTargetCheckoutFinding(workflow, job, action, defines, uses)
+			if ok {
+				findings = append(findings, finding)
+			}
 		}
 	}
 
@@ -191,6 +214,79 @@ func stableGitHubActionsFindingID(actionUse graph.GitHubActionUse) (FindingID, e
 	}
 	sum := sha256.Sum256(data)
 	return FindingID("finding:" + string(RuleGitHubActionsUnpinnedAction) + ":" + hex.EncodeToString(sum[:])), nil
+}
+
+func newGitHubActionsUnsafePullRequestTargetCheckoutFinding(workflow, job, action graph.Node, definesJob, usesAction graph.Edge) (Finding, bool) {
+	if usesAction.Metadata == nil || usesAction.Metadata.GitHubActionUse == nil {
+		return Finding{}, false
+	}
+	actionUse := *usesAction.Metadata.GitHubActionUse
+	if !actionUse.TriggersPullRequestTarget || actionUse.Owner != "actions" || actionUse.Repo != "checkout" || actionUse.Path != "" || len(actionUse.CheckoutHeadSelectors) == 0 {
+		return Finding{}, false
+	}
+
+	nodeIDs := []graph.NodeID{workflow.ID, job.ID, action.ID}
+	edgeIDs := []graph.EdgeID{definesJob.ID, usesAction.ID}
+	id, err := stableGitHubActionsUnsafeCheckoutFindingID(actionUse)
+	if err != nil {
+		return Finding{}, false
+	}
+	evidence := []FindingEvidence{
+		findingEvidence(definesJob),
+		findingEvidence(usesAction),
+	}
+	return Finding{
+		ID:               id,
+		RuleID:           RuleGitHubActionsUnsafePullRequestTargetCheckout,
+		Title:            githubActionsUnsafePullRequestTargetCheckoutTitle,
+		Severity:         SeverityHigh,
+		NodeIDs:          append([]graph.NodeID(nil), nodeIDs...),
+		EdgeIDs:          append([]graph.EdgeID(nil), edgeIDs...),
+		Summary:          "GitHub Actions workflow " + actionUse.WorkflowFile + " job " + actionUse.JobID + " step " + stepIndexString(actionUse.StepIndex) + " uses " + actionUse.Uses + " in pull_request_target with " + githubActionsSelectorSummary(actionUse.CheckoutHeadSelectors) + ".",
+		Evidence:         cloneFindingEvidence(evidence),
+		SourceReferences: sourceReferences(evidence),
+	}, true
+}
+
+func stableGitHubActionsUnsafeCheckoutFindingID(actionUse graph.GitHubActionUse) (FindingID, error) {
+	data, err := json.Marshal(githubActionsUnsafeCheckoutFindingIdentity{
+		RuleID:       RuleGitHubActionsUnsafePullRequestTargetCheckout,
+		WorkflowFile: actionUse.WorkflowFile,
+		JobID:        actionUse.JobID,
+		StepIndex:    actionUse.StepIndex,
+		Owner:        actionUse.Owner,
+		Repo:         actionUse.Repo,
+		Path:         actionUse.Path,
+		Ref:          actionUse.Ref,
+		Selectors:    githubActionsSelectorIdentities(actionUse.CheckoutHeadSelectors),
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return FindingID("finding:" + string(RuleGitHubActionsUnsafePullRequestTargetCheckout) + ":" + hex.EncodeToString(sum[:])), nil
+}
+
+func githubActionsSelectorIdentities(selectors []graph.GitHubActionsCheckoutHeadSelector) []githubActionsSelectorIdentity {
+	out := make([]githubActionsSelectorIdentity, 0, len(selectors))
+	for _, selector := range selectors {
+		out = append(out, githubActionsSelectorIdentity{
+			Field:             selector.Field,
+			MatchedExpression: selector.MatchedExpression,
+		})
+	}
+	return out
+}
+
+func githubActionsSelectorSummary(selectors []graph.GitHubActionsCheckoutHeadSelector) string {
+	out := ""
+	for i, selector := range selectors {
+		if i > 0 {
+			out += ", "
+		}
+		out += selector.Field + "=" + selector.MatchedExpression
+	}
+	return out
 }
 
 func isFullCommitSHA(value string) bool {

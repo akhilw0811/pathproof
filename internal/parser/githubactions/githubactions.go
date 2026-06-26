@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,9 +23,10 @@ type Source struct {
 }
 
 type Workflow struct {
-	Name   string `json:"name,omitempty"`
-	Source Source `json:"source"`
-	Jobs   []Job  `json:"jobs,omitempty"`
+	Name                      string `json:"name,omitempty"`
+	Source                    Source `json:"source"`
+	TriggersPullRequestTarget bool   `json:"triggers_pull_request_target,omitempty"`
+	Jobs                      []Job  `json:"jobs,omitempty"`
 }
 
 type Job struct {
@@ -33,9 +35,19 @@ type Job struct {
 }
 
 type Step struct {
-	Index int    `json:"index"`
-	Name  string `json:"name,omitempty"`
-	Uses  string `json:"uses"`
+	Index                 int                    `json:"index"`
+	Name                  string                 `json:"name,omitempty"`
+	Uses                  string                 `json:"uses"`
+	Owner                 string                 `json:"owner"`
+	Repo                  string                 `json:"repo"`
+	Path                  string                 `json:"path,omitempty"`
+	Ref                   string                 `json:"ref,omitempty"`
+	CheckoutHeadSelectors []CheckoutHeadSelector `json:"checkout_head_selectors,omitempty"`
+}
+
+type CheckoutHeadSelector struct {
+	Field             string `json:"field"`
+	MatchedExpression string `json:"matched_expression"`
 }
 
 func ParseDir(root string) (Resources, error) {
@@ -122,6 +134,9 @@ func parseWorkflow(r io.Reader, root, filename string) (Workflow, error) {
 	if name := scalarMappingValue(&document, "name"); name != nil {
 		workflow.Name = name.Value
 	}
+	if on := mappingValue(&document, "on"); on != nil {
+		workflow.TriggersPullRequestTarget = hasPullRequestTargetTrigger(on)
+	}
 	if jobs := mappingValue(&document, "jobs"); jobs != nil && jobs.Kind == yaml.MappingNode {
 		workflow.Jobs = parseJobs(jobs)
 	}
@@ -169,16 +184,169 @@ func parseSteps(steps *yaml.Node) []Step {
 		if uses == nil || uses.Value == "" {
 			continue
 		}
+		ref, ok := parseActionReference(uses.Value)
+		if !ok {
+			continue
+		}
 		step := Step{
 			Index: i,
-			Uses:  uses.Value,
+			Uses:  ref.canonicalUses(),
+			Owner: ref.owner,
+			Repo:  ref.repo,
+			Path:  ref.path,
+			Ref:   ref.ref,
 		}
 		if name := scalarMappingValue(stepNode, "name"); name != nil {
 			step.Name = name.Value
 		}
+		if ref.owner == "actions" && ref.repo == "checkout" && ref.path == "" {
+			step.CheckoutHeadSelectors = parseCheckoutHeadSelectors(stepNode)
+		}
 		out = append(out, step)
 	}
 	return out
+}
+
+func hasPullRequestTargetTrigger(on *yaml.Node) bool {
+	switch on.Kind {
+	case yaml.ScalarNode:
+		return on.Value == "pull_request_target"
+	case yaml.SequenceNode:
+		for _, item := range on.Content {
+			if item.Kind == yaml.ScalarNode && item.Value == "pull_request_target" {
+				return true
+			}
+		}
+	case yaml.MappingNode:
+		return mappingValue(on, "pull_request_target") != nil
+	}
+	return false
+}
+
+func parseCheckoutHeadSelectors(stepNode *yaml.Node) []CheckoutHeadSelector {
+	with := mappingValue(stepNode, "with")
+	if with == nil || with.Kind != yaml.MappingNode {
+		return nil
+	}
+	expressionsByField := map[string][]string{
+		"ref": {
+			"github.event.pull_request.head.sha",
+			"github.event.pull_request.head.ref",
+			"github.head_ref",
+		},
+		"repository": {
+			"github.event.pull_request.head.repo.full_name",
+		},
+	}
+	var selectors []CheckoutHeadSelector
+	seen := make(map[CheckoutHeadSelector]struct{})
+	for _, field := range []string{"ref", "repository"} {
+		value := scalarMappingValue(with, field)
+		if value == nil {
+			continue
+		}
+		actualExpressions := githubExpressionBodies(value.Value)
+		for _, expression := range expressionsByField[field] {
+			if !containsString(actualExpressions, expression) {
+				continue
+			}
+			selector := CheckoutHeadSelector{Field: field, MatchedExpression: expression}
+			if _, ok := seen[selector]; ok {
+				continue
+			}
+			seen[selector] = struct{}{}
+			selectors = append(selectors, selector)
+		}
+	}
+	return selectors
+}
+
+func githubExpressionBodies(value string) []string {
+	var expressions []string
+	offset := 0
+	for {
+		start := strings.Index(value[offset:], "${{")
+		if start < 0 {
+			return expressions
+		}
+		start += offset
+		bodyStart := start + len("${{")
+		end := strings.Index(value[bodyStart:], "}}")
+		if end < 0 {
+			return expressions
+		}
+		end += bodyStart
+		expressions = append(expressions, strings.TrimSpace(value[bodyStart:end]))
+		offset = end + len("}}")
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+type actionReference struct {
+	owner string
+	repo  string
+	path  string
+	ref   string
+}
+
+func parseActionReference(uses string) (actionReference, bool) {
+	value := strings.TrimSpace(uses)
+	if value == "" || strings.HasPrefix(value, "./") || strings.HasPrefix(value, "docker://") || isEntireExpression(value) {
+		return actionReference{}, false
+	}
+
+	target, ref, _ := strings.Cut(value, "@")
+	if strings.Contains(target, "${{") || strings.Contains(target, "}}") {
+		return actionReference{}, false
+	}
+	parts := strings.Split(target, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return actionReference{}, false
+	}
+	if strings.ContainsAny(parts[0], " \t\r\n:") || strings.ContainsAny(parts[1], " \t\r\n:") {
+		return actionReference{}, false
+	}
+	path := ""
+	if len(parts) > 2 {
+		path = strings.Join(parts[2:], "/")
+	}
+	if strings.Contains(ref, "${{") || strings.Contains(ref, "}}") {
+		ref = "<expression>"
+	}
+	return actionReference{
+		owner: parts[0],
+		repo:  parts[1],
+		path:  path,
+		ref:   ref,
+	}, true
+}
+
+func (ref actionReference) canonicalUses() string {
+	var out strings.Builder
+	out.WriteString(ref.owner)
+	out.WriteString("/")
+	out.WriteString(ref.repo)
+	if ref.path != "" {
+		out.WriteString("/")
+		out.WriteString(ref.path)
+	}
+	if ref.ref != "" {
+		out.WriteString("@")
+		out.WriteString(ref.ref)
+	}
+	return out.String()
+}
+
+func isEntireExpression(value string) bool {
+	return strings.HasPrefix(value, "${{") && strings.HasSuffix(value, "}}")
 }
 
 func mappingValue(node *yaml.Node, key string) *yaml.Node {

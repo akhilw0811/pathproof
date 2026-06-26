@@ -34,6 +34,9 @@ jobs:
 				Index: 0,
 				Name:  "Checkout",
 				Uses:  "actions/checkout@v4",
+				Owner: "actions",
+				Repo:  "checkout",
+				Ref:   "v4",
 			}},
 		}},
 	}}}
@@ -97,8 +100,219 @@ func TestParseDirIgnoresRunOnlySteps(t *testing.T) {
 	}
 
 	steps := resources.Workflows[0].Jobs[0].Steps
-	if len(steps) != 1 || steps[0].Index != 1 || steps[0].Uses != "actions/setup-go@v5" {
+	if len(steps) != 1 || steps[0].Index != 1 || steps[0].Uses != "actions/setup-go@v5" || steps[0].Owner != "actions" || steps[0].Repo != "setup-go" {
 		t.Fatalf("steps = %#v, want only uses step at original index 1", steps)
+	}
+}
+
+func TestParseDirDetectsPullRequestTargetTriggers(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name: "unquoted scalar on",
+			content: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`,
+			want: true,
+		},
+		{
+			name: "quoted scalar on",
+			content: `"on": pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`,
+			want: true,
+		},
+		{
+			name: "sequence on",
+			content: `on: [pull_request_target, push]
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`,
+			want: true,
+		},
+		{
+			name: "mapping on",
+			content: `on:
+  pull_request_target:
+    branches: [main]
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`,
+			want: true,
+		},
+		{
+			name: "pull request is not pull request target",
+			content: `on: pull_request
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeWorkflow(t, root, "workflow.yml", tt.content)
+
+			resources, err := ParseDir(root)
+			if err != nil {
+				t.Fatalf("parse dir: %v", err)
+			}
+			got := resources.Workflows[0].TriggersPullRequestTarget
+			if got != tt.want {
+				t.Fatalf("TriggersPullRequestTarget = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseDirParsesSanitizedCheckoutHeadSelectors(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "unsafe.yml", `on:
+  pull_request_target:
+jobs:
+  test:
+    steps:
+      - name: Head SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          token: FAKE_GHA_WITH_SECRET_DO_NOT_RETAIN
+      - name: Head ref
+        uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.head_ref }}
+      - name: Head repository and ref
+        uses: actions/checkout
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	steps := resources.Workflows[0].Jobs[0].Steps
+	if len(steps) != 3 {
+		t.Fatalf("step count = %d, want 3: %#v", len(steps), steps)
+	}
+	want := [][]CheckoutHeadSelector{
+		{{Field: "ref", MatchedExpression: "github.event.pull_request.head.sha"}},
+		{{Field: "ref", MatchedExpression: "github.head_ref"}},
+		{
+			{Field: "ref", MatchedExpression: "github.event.pull_request.head.ref"},
+			{Field: "repository", MatchedExpression: "github.event.pull_request.head.repo.full_name"},
+		},
+	}
+	for i := range want {
+		if !reflect.DeepEqual(steps[i].CheckoutHeadSelectors, want[i]) {
+			t.Fatalf("step %d selectors = %#v, want %#v", i, steps[i].CheckoutHeadSelectors, want[i])
+		}
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"FAKE_GHA_WITH_SECRET_DO_NOT_RETAIN", "token"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestParseDirDoesNotParseLiteralOrFieldMismatchedCheckoutHeadSelectors(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "safe.yml", `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - name: Literal ref text
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/github.event.pull_request.head.sha
+      - name: SHA is not repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.sha }}
+      - name: Repository is not ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.repo.full_name }}
+      - name: Larger expression is not selector identity
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Whitespace around exact selector is accepted
+        uses: actions/checkout@v4
+        with:
+          ref: refs/heads/${{   github.head_ref   }}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	steps := resources.Workflows[0].Jobs[0].Steps
+	if len(steps) != 5 {
+		t.Fatalf("step count = %d, want 5: %#v", len(steps), steps)
+	}
+	for i := 0; i < 4; i++ {
+		if len(steps[i].CheckoutHeadSelectors) != 0 {
+			t.Fatalf("step %d selectors = %#v, want none", i, steps[i].CheckoutHeadSelectors)
+		}
+	}
+	want := []CheckoutHeadSelector{{Field: "ref", MatchedExpression: "github.head_ref"}}
+	if !reflect.DeepEqual(steps[4].CheckoutHeadSelectors, want) {
+		t.Fatalf("step 4 selectors = %#v, want %#v", steps[4].CheckoutHeadSelectors, want)
+	}
+}
+
+func TestParseDirDoesNotRetainExpressionOnlyUsesValues(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "expression.yml", `jobs:
+  test:
+    steps:
+      - uses: ${{ secrets.ACTION_REF }}
+      - uses: ${{ matrix.action }}
+      - uses: owner/repo@${{ matrix.ref }}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	steps := resources.Workflows[0].Jobs[0].Steps
+	if len(steps) != 1 {
+		t.Fatalf("step count = %d, want only static owner/repo expression-ref step: %#v", len(steps), steps)
+	}
+	if got := steps[0].Uses; got != "owner/repo@<expression>" {
+		t.Fatalf("uses = %q, want sanitized expression ref", got)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"secrets.ACTION_REF", "matrix.action", "matrix.ref", "${{"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
 	}
 }
 
@@ -116,7 +330,7 @@ jobs:
       - name: Run secret-like command
         run: echo FAKE_GHA_RUN_SECRET_DO_NOT_RETAIN
       - name: Login
-        uses: docker/login-action@v3
+        uses: owner/repo@main
         with:
           password: FAKE_GHA_WITH_SECRET_DO_NOT_RETAIN
         env:
@@ -136,7 +350,7 @@ jobs:
 			t.Fatalf("parser output contains %q: %s", forbidden, data)
 		}
 	}
-	if !strings.Contains(string(data), "docker/login-action@v3") {
+	if !strings.Contains(string(data), "owner/repo@main") {
 		t.Fatalf("parser output does not contain uses value: %s", data)
 	}
 }

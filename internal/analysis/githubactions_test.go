@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -57,8 +58,12 @@ func TestAnalyzeGitHubActionsUnpinnedActionFindings(t *testing.T) {
 				if len(finding.NodeIDs) != 3 || len(finding.EdgeIDs) != 2 || len(finding.Evidence) != 2 {
 					t.Fatalf("finding path/evidence shape = %#v/%#v/%#v, want 3 nodes, 2 edges, 2 evidence", finding.NodeIDs, finding.EdgeIDs, finding.Evidence)
 				}
-				if !strings.Contains(finding.Summary, tt.uses) {
-					t.Fatalf("summary = %q, want raw uses %q", finding.Summary, tt.uses)
+				wantUses := tt.uses
+				if strings.Contains(wantUses, "${{") {
+					wantUses = "owner/repo@<expression>"
+				}
+				if !strings.Contains(finding.Summary, wantUses) {
+					t.Fatalf("summary = %q, want sanitized uses %q", finding.Summary, wantUses)
 				}
 				return
 			}
@@ -66,6 +71,243 @@ func TestAnalyzeGitHubActionsUnpinnedActionFindings(t *testing.T) {
 				t.Fatalf("finding count = %d, want 0: %#v", len(findings), findings)
 			}
 		})
+	}
+}
+
+func TestAnalyzeGitHubActionsUnsafePullRequestTargetCheckoutFindings(t *testing.T) {
+	tests := []struct {
+		name     string
+		workflow string
+		want     bool
+	}{
+		{
+			name: "head sha",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`,
+			want: true,
+		},
+		{
+			name: "head ref",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.head_ref }}
+`,
+			want: true,
+		},
+		{
+			name: "head repository and ref",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+`,
+			want: true,
+		},
+		{
+			name: "pull request only",
+			workflow: `on: pull_request
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`,
+		},
+		{
+			name: "checkout without head override",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+`,
+		},
+		{
+			name: "non checkout action with head override",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: evil/action@v1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`,
+		},
+		{
+			name: "literal selector text",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: refs/heads/github.event.pull_request.head.sha
+`,
+		},
+		{
+			name: "head sha is not repository selector",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          repository: ${{ github.event.pull_request.head.sha }}
+`,
+		},
+		{
+			name: "head repository is not ref selector",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.repo.full_name }}
+`,
+		},
+		{
+			name: "larger expression is not selector identity",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+`,
+		},
+		{
+			name: "expression only uses",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: ${{ secrets.ACTION_REF }}
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`,
+		},
+		{
+			name: "no checkout step",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - run: echo test
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := Analyze(githubActionsGraphFromWorkflow(t, tt.workflow))
+			got := countFindingsByRule(findings, RuleGitHubActionsUnsafePullRequestTargetCheckout)
+			if tt.want && got != 1 {
+				t.Fatalf("PP-GHA-002 count = %d, want 1: %#v", got, findings)
+			}
+			if !tt.want && got != 0 {
+				t.Fatalf("PP-GHA-002 count = %d, want 0: %#v", got, findings)
+			}
+		})
+	}
+}
+
+func TestAnalyzeGitHubActionsNonCheckoutHeadSelectorCanStillEmitUnpinnedOnly(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: evil/action@v1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`))
+
+	if got := countFindingsByRule(findings, RuleGitHubActionsUnsafePullRequestTargetCheckout); got != 0 {
+		t.Fatalf("PP-GHA-002 count = %d, want 0: %#v", got, findings)
+	}
+	if got := countFindingsByRule(findings, RuleGitHubActionsUnpinnedAction); got != 1 {
+		t.Fatalf("PP-GHA-001 count = %d, want 1: %#v", got, findings)
+	}
+}
+
+func TestAnalyzeGitHubActionsUnsafeCheckoutFindingIDsAreStableAndSelectorSensitive(t *testing.T) {
+	first := Analyze(githubActionsGraphFromWorkflow(t, unsafeCheckoutWorkflow("github.event.pull_request.head.sha")))
+	second := Analyze(githubActionsGraphFromWorkflow(t, unsafeCheckoutWorkflow("github.event.pull_request.head.sha")))
+	changed := Analyze(githubActionsGraphFromWorkflow(t, unsafeCheckoutWorkflow("github.head_ref")))
+
+	firstFinding := onlyFindingByRule(t, first, RuleGitHubActionsUnsafePullRequestTargetCheckout)
+	secondFinding := onlyFindingByRule(t, second, RuleGitHubActionsUnsafePullRequestTargetCheckout)
+	changedFinding := onlyFindingByRule(t, changed, RuleGitHubActionsUnsafePullRequestTargetCheckout)
+	if firstFinding.ID != secondFinding.ID {
+		t.Fatalf("finding ID changed across repeated analysis: %q vs %q", firstFinding.ID, secondFinding.ID)
+	}
+	if firstFinding.ID == changedFinding.ID {
+		t.Fatalf("finding ID did not change when selector changed: %q", firstFinding.ID)
+	}
+}
+
+func TestAnalyzeGitHubActionsUnsafeCheckoutFindingExcludesSecretLikeWorkflowValues(t *testing.T) {
+	const envSecret = "FAKE_ANALYSIS_GHA_ENV_SECRET_DO_NOT_RETAIN"
+	const withSecret = "FAKE_ANALYSIS_GHA_WITH_SECRET_DO_NOT_RETAIN"
+	const runSecret = "FAKE_ANALYSIS_GHA_RUN_SECRET_DO_NOT_RETAIN"
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+env:
+  TOKEN: FAKE_ANALYSIS_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_ANALYSIS_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: actions/checkout@v4
+        with:
+          token: FAKE_ANALYSIS_GHA_WITH_SECRET_DO_NOT_RETAIN
+          ref: ${{ github.event.pull_request.head.sha }}
+`))
+
+	if countFindingsByRule(findings, RuleGitHubActionsUnsafePullRequestTargetCheckout) != 1 {
+		t.Fatalf("findings = %#v, want PP-GHA-002", findings)
+	}
+	data, err := json.Marshal(findings)
+	if err != nil {
+		t.Fatalf("marshal findings: %v", err)
+	}
+	for _, forbidden := range []string{envSecret, withSecret, runSecret, "token:", "run:", "${{"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("finding JSON contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestAnalyzeGitHubActionsUnpinnedAndUnsafeCheckoutBothFire(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`))
+
+	if got := countFindingsByRule(findings, RuleGitHubActionsUnpinnedAction); got != 1 {
+		t.Fatalf("PP-GHA-001 count = %d, want 1: %#v", got, findings)
+	}
+	if got := countFindingsByRule(findings, RuleGitHubActionsUnsafePullRequestTargetCheckout); got != 1 {
+		t.Fatalf("PP-GHA-002 count = %d, want 1: %#v", got, findings)
 	}
 }
 
@@ -141,27 +383,63 @@ jobs:
 
 func githubActionsGraphFromUses(t *testing.T, uses string) *graph.Graph {
 	t.Helper()
-	resources := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
-		Name: "Build",
-		Source: parsergithubactions.Source{
-			Filename:     ".github/workflows/build.yml",
-			RelativePath: ".github/workflows/build.yml",
-			Document:     1,
-		},
-		Jobs: []parsergithubactions.Job{{
-			ID: "test",
-			Steps: []parsergithubactions.Step{{
-				Index: 0,
-				Name:  "Use action",
-				Uses:  uses,
-			}},
-		}},
-	}}}
+	return githubActionsGraphFromWorkflow(t, fmt.Sprintf(`name: Build
+jobs:
+  test:
+    steps:
+      - name: Use action
+        uses: %s
+`, uses))
+}
+
+func githubActionsGraphFromWorkflow(t *testing.T, workflow string) *graph.Graph {
+	t.Helper()
+	root := t.TempDir()
+	writeWorkflowForAnalysisTest(t, root, "build.yml", workflow)
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
 	g := graph.New()
 	if err := routinggithubactions.AddRoutes(g, resources); err != nil {
 		t.Fatalf("add routes: %v", err)
 	}
 	return g
+}
+
+func unsafeCheckoutWorkflow(selector string) string {
+	return fmt.Sprintf(`on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ %s }}
+`, selector)
+}
+
+func countFindingsByRule(findings []Finding, ruleID RuleID) int {
+	count := 0
+	for _, finding := range findings {
+		if finding.RuleID == ruleID {
+			count++
+		}
+	}
+	return count
+}
+
+func onlyFindingByRule(t *testing.T, findings []Finding, ruleID RuleID) Finding {
+	t.Helper()
+	var out []Finding
+	for _, finding := range findings {
+		if finding.RuleID == ruleID {
+			out = append(out, finding)
+		}
+	}
+	if len(out) != 1 {
+		t.Fatalf("%s finding count = %d, want 1: %#v", ruleID, len(out), findings)
+	}
+	return out[0]
 }
 
 func writeWorkflowForAnalysisTest(t *testing.T, root, name, content string) {

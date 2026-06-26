@@ -62,17 +62,24 @@ type EdgeMetadata struct {
 }
 
 type GitHubActionUse struct {
-	WorkflowSourceReference string `json:"workflow_source_reference"`
-	WorkflowFile            string `json:"workflow_file"`
-	WorkflowName            string `json:"workflow_name,omitempty"`
-	JobID                   string `json:"job_id"`
-	StepIndex               int    `json:"step_index"`
-	StepName                string `json:"step_name,omitempty"`
-	Uses                    string `json:"uses"`
-	Owner                   string `json:"owner,omitempty"`
-	Repo                    string `json:"repo,omitempty"`
-	Path                    string `json:"path,omitempty"`
-	Ref                     string `json:"ref,omitempty"`
+	WorkflowSourceReference   string                              `json:"workflow_source_reference"`
+	WorkflowFile              string                              `json:"workflow_file"`
+	WorkflowName              string                              `json:"workflow_name,omitempty"`
+	TriggersPullRequestTarget bool                                `json:"triggers_pull_request_target,omitempty"`
+	JobID                     string                              `json:"job_id"`
+	StepIndex                 int                                 `json:"step_index"`
+	StepName                  string                              `json:"step_name,omitempty"`
+	Uses                      string                              `json:"uses"`
+	Owner                     string                              `json:"owner,omitempty"`
+	Repo                      string                              `json:"repo,omitempty"`
+	Path                      string                              `json:"path,omitempty"`
+	Ref                       string                              `json:"ref,omitempty"`
+	CheckoutHeadSelectors     []GitHubActionsCheckoutHeadSelector `json:"checkout_head_selectors,omitempty"`
+}
+
+type GitHubActionsCheckoutHeadSelector struct {
+	Field             string `json:"field"`
+	MatchedExpression string `json:"matched_expression"`
 }
 
 type KubernetesCanReadAuthorization struct {
@@ -325,6 +332,7 @@ func cloneEdge(edge Edge) Edge {
 	metadata.KubernetesCanReadAuthorizations = cloneKubernetesCanReadAuthorizations(metadata.KubernetesCanReadAuthorizations)
 	if metadata.GitHubActionUse != nil {
 		actionUse := *metadata.GitHubActionUse
+		actionUse.CheckoutHeadSelectors = cloneGitHubActionsCheckoutHeadSelectors(actionUse.CheckoutHeadSelectors)
 		metadata.GitHubActionUse = &actionUse
 	}
 	edge.Metadata = &metadata
@@ -352,6 +360,13 @@ func cloneStrings(values []string) []string {
 		return nil
 	}
 	return append([]string(nil), values...)
+}
+
+func cloneGitHubActionsCheckoutHeadSelectors(selectors []GitHubActionsCheckoutHeadSelector) []GitHubActionsCheckoutHeadSelector {
+	if selectors == nil {
+		return nil
+	}
+	return append([]GitHubActionsCheckoutHeadSelector(nil), selectors...)
 }
 
 func nodeID(kind NodeKind, name string) NodeID {
