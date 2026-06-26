@@ -484,7 +484,10 @@ func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scan
 	if len(finding.NodeIDs) == 0 {
 		return scanFinding{}, fmt.Errorf("finding %q has 0 path nodes, want at least 1", finding.ID)
 	}
-	if len(finding.EdgeIDs) != len(finding.NodeIDs)-1 {
+	if len(finding.NodeIDs) == 1 && len(finding.EdgeIDs) != 0 {
+		return scanFinding{}, fmt.Errorf("finding %q has one path node and edge count %d, want 0", finding.ID, len(finding.EdgeIDs))
+	}
+	if len(finding.NodeIDs) > 1 && len(finding.EdgeIDs) != len(finding.NodeIDs)-1 {
 		return scanFinding{}, fmt.Errorf("finding %q has edge count %d, want %d for %d path nodes", finding.ID, len(finding.EdgeIDs), len(finding.NodeIDs)-1, len(finding.NodeIDs))
 	}
 	if len(finding.EdgeIDs) != len(finding.Evidence) {
@@ -794,6 +797,11 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 		}
 		if _, err := fmt.Fprintf(w, "Severity: %s\n", finding.Severity); err != nil {
 			return err
+		}
+		if finding.Summary != "" {
+			if _, err := fmt.Fprintf(w, "Summary: %s\n", finding.Summary); err != nil {
+				return err
+			}
 		}
 		if _, err := fmt.Fprintln(w, "Path:"); err != nil {
 			return err

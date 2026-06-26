@@ -111,8 +111,8 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	}
 	run := report.Runs[0]
 	assertString(t, "driver name", run.Tool.Driver.Name, "PathProof")
-	if len(run.Tool.Driver.Rules) != 3 {
-		t.Fatalf("rules len = %d, want 3", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 4 {
+		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-K8S-001")
 	assertString(t, "rule id", rule.ID, "PP-K8S-001")
@@ -181,8 +181,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 3 {
-		t.Fatalf("rules len = %d, want 3", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 4 {
+		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-001")
 	assertString(t, "rule id", rule.ID, "PP-GHA-001")
@@ -246,8 +246,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 3 {
-		t.Fatalf("rules len = %d, want 3", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 4 {
+		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-002")
 	assertString(t, "rule id", rule.ID, "PP-GHA-002")
@@ -279,6 +279,68 @@ jobs:
 	}
 	if strings.Contains(stdout, "${{") {
 		t.Fatalf("SARIF output contains raw expression: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsDangerousPermissionsSARIFOutputShapeAndFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "dangerous permissions.yml", `name: Dangerous permissions
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: owner/repo@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	run := report.Runs[0]
+	if len(run.Tool.Driver.Rules) != 4 {
+		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
+	}
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-003")
+	assertString(t, "rule id", rule.ID, "PP-GHA-003")
+	assertString(t, "rule name", rule.Name, "pull_request_target workflow grants dangerous token permissions")
+	assertContains(t, rule.FullDescription.Text, "pull_request_target")
+	assertContains(t, rule.FullDescription.Text, "workflow-level")
+	assertContains(t, rule.FullDescription.Text, "job-level")
+	assertString(t, "rule default level", rule.DefaultConfiguration.Level, "error")
+	assertContains(t, rule.Help.Text, "inheritance")
+	if len(run.Results) != 1 {
+		t.Fatalf("results len = %d, want 1: %#v", len(run.Results), run.Results)
+	}
+	result := run.Results[0]
+	assertString(t, "ruleId", result.RuleID, "PP-GHA-003")
+	assertString(t, "level", result.Level, "error")
+	assertContains(t, result.Message.Text, "Dangerous permissions")
+	assertContains(t, result.Message.Text, ".github/workflows/dangerous permissions.yml")
+	assertContains(t, result.Message.Text, "workflow scope")
+	assertContains(t, result.Message.Text, "permissions: write-all")
+	assertContains(t, result.Message.Text, "pull_request_target")
+	if strings.Contains(result.Message.Text, "all: write") || strings.Contains(result.Message.Text, "${{") {
+		t.Fatalf("SARIF message contains confusing or raw text: %q", result.Message.Text)
+	}
+	if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+		t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+	}
+	assertString(t, "severity", result.Properties.Severity, "High")
+	if len(result.Properties.NodeIDs) != 1 || len(result.Properties.EdgeIDs) != 0 {
+		t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want 1/0", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+	}
+	gotURIs := locationURIs(result.Locations)
+	wantURIs := []string{".github/workflows/dangerous%20permissions.yml#document=1"}
+	if !reflectDeepEqualStrings(gotURIs, wantURIs) {
+		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
 	}
 	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
 }

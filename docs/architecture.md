@@ -48,18 +48,20 @@ logged, serialized, or exposed by parser or graph output.
 Implemented GitHub Actions parsing lives under
 `internal/parser/githubactions`. It reads only `.github/workflows/*.yml` and
 `.github/workflows/*.yaml` under the scan root and emits explicit Go types for
-workflow name, workflow source, `pull_request_target` trigger presence, job
-IDs, step indexes, optional step names, and sanitized static action identity
-components. For `actions/checkout` steps only, it also records sanitized
-matches for the PR-head selector expressions used by `PP-GHA-002`. It does not
-require a Git repository, call GitHub APIs, execute workflows, evaluate
-expressions, resolve reusable workflows, inspect action source code, parse
-workflow permissions, expand matrices, or retain `env`, arbitrary `with`
-values, `secrets`, token values, run scripts, expression-only `uses:` values,
-or raw workflow documents. A `uses:` value that is entirely an expression is
-ignored because it is not a statically recognizable action reference. If a
-`uses:` value has a static `owner/repo` shape but an expression in the ref, the
-ref is stored as a sanitized expression marker and treated as unpinned.
+workflow name, workflow source, `pull_request_target` trigger presence,
+sanitized workflow-level and job-level permission grants, job IDs, step
+indexes, optional step names, and sanitized static action identity components.
+For `actions/checkout` steps only, it also records sanitized matches for the
+PR-head selector expressions used by `PP-GHA-002`. It does not require a Git
+repository, call GitHub APIs, execute workflows, evaluate expressions, resolve
+reusable workflows, inspect action source code, model exact workflow
+permission inheritance or overrides, expand matrices, or retain `env`,
+arbitrary `with` values, `secrets`, token values, run scripts,
+expression-only `uses:` values, unknown permission values, or raw workflow
+documents. A `uses:` value that is entirely an expression is ignored because it
+is not a statically recognizable action reference. If a `uses:` value has a
+static `owner/repo` shape but an expression in the ref, the ref is stored as a
+sanitized expression marker and treated as unpinned.
 
 Implemented Kubernetes routing lives under `internal/routing/kubernetes`.
 It builds deterministic graph relationships for:
@@ -90,14 +92,18 @@ snippets, or arbitrary metadata maps.
 
 Implemented GitHub Actions routing lives under
 `internal/routing/githubactions`. It builds only the graph needed for the
-current rule: `Workflow` nodes, `WorkflowJob` nodes, `GitHubAction` step-use
-nodes, `DefinesJob` edges, and `UsesAction` edges. `UsesAction` metadata
-stores the workflow source reference, relative workflow file, workflow name or
-file fallback, `pull_request_target` trigger presence, job ID, step index,
-optional step name, canonical sanitized action display string, parsed owner,
-repo, path, and ref, and sanitized checkout PR-head selector matches when
-present. It does not model CI/CD identities, workflow permissions, OIDC trust,
-reusable workflow calls, cloud trust, or runtime behavior.
+current rules: `Workflow` nodes, `WorkflowJob` nodes, `GitHubAction` step-use
+nodes, `DefinesJob` edges, and `UsesAction` edges. `Workflow` node metadata
+stores sanitized workflow identity, `pull_request_target` trigger presence,
+and explicit workflow-level permission grants. `DefinesJob` metadata stores
+the same workflow identity plus job ID and explicit job-level permission
+grants. `UsesAction` metadata stores the workflow source reference, relative
+workflow file, workflow name or file fallback, `pull_request_target` trigger
+presence, job ID, step index, optional step name, canonical sanitized action
+display string, parsed owner, repo, path, and ref, and sanitized checkout
+PR-head selector matches when present. It does not model CI/CD identities,
+exact workflow permission inheritance or overrides, OIDC trust, reusable
+workflow calls, cloud trust, or runtime behavior.
 
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
 graph storage, routing construction, analysis, and CLI presentation remain
@@ -134,6 +140,17 @@ identity is exactly `actions/checkout`, and the checkout step has at least one
 sanitized PR-head selector match in `with.ref` or `with.repository`. Severity
 is fixed at `High`. The rule does not evaluate expressions, inspect run
 scripts, execute workflows, or require the checkout action to be unpinned.
+
+`PP-GHA-003` requires a `Workflow` node with sanitized workflow metadata or a
+`Workflow --DefinesJob--> WorkflowJob` path with sanitized job metadata. It
+requires `pull_request_target` and one explicit dangerous permission grant:
+`contents: write`, `pull-requests: write`, `actions: write`, `checks: write`,
+`deployments: write`, `id-token: write`, `security-events: write`, or
+`permissions: write-all`. Workflow-level and job-level dangerous grants are
+reported independently. `permissions: read-all`, `permissions: {}`, read/none
+access values, omitted permissions, unknown values, and expression-based
+permission values do not produce findings. Exact GitHub permission
+inheritance/override modeling is future work.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
@@ -184,7 +201,8 @@ output directory, and never prints temporary paths or manifest contents.
 
 SARIF output is a findings-only CLI projection. `pathproof scan --format sarif`
 emits SARIF 2.1.0 with one PathProof tool driver, deterministic rule entries
-for `PP-K8S-001`, `PP-GHA-001`, and `PP-GHA-002`, and one result per finding.
+for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003`, and one result
+per finding.
 SARIF stdout
 omits patch previews, patch output
 summaries, validation results, unified diffs, patched file contents, temporary
@@ -198,7 +216,8 @@ because parser source tracking is currently file/document scoped.
 
 No live Kubernetes authorization evaluation, GitHub API integration, workflow
 execution, expression evaluation, reusable workflow resolution, action source
-inspection, workflow permission modeling, OIDC trust modeling, full CI/CD
-attack-path modeling, live validation, in-place patch application,
-persistence, AI, dashboard, plugin system, external service integration, pull
-request creation, or live Kubernetes cluster integration is implemented.
+inspection, exact GitHub workflow permission inheritance/override modeling,
+OIDC trust modeling, full CI/CD attack-path modeling, live validation,
+in-place patch application, persistence, AI, dashboard, plugin system,
+external service integration, pull request creation, or live Kubernetes cluster
+integration is implemented.

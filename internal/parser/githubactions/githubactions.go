@@ -23,15 +23,17 @@ type Source struct {
 }
 
 type Workflow struct {
-	Name                      string `json:"name,omitempty"`
-	Source                    Source `json:"source"`
-	TriggersPullRequestTarget bool   `json:"triggers_pull_request_target,omitempty"`
-	Jobs                      []Job  `json:"jobs,omitempty"`
+	Name                      string            `json:"name,omitempty"`
+	Source                    Source            `json:"source"`
+	TriggersPullRequestTarget bool              `json:"triggers_pull_request_target,omitempty"`
+	PermissionGrants          []PermissionGrant `json:"permission_grants,omitempty"`
+	Jobs                      []Job             `json:"jobs,omitempty"`
 }
 
 type Job struct {
-	ID    string `json:"id"`
-	Steps []Step `json:"steps,omitempty"`
+	ID               string            `json:"id"`
+	PermissionGrants []PermissionGrant `json:"permission_grants,omitempty"`
+	Steps            []Step            `json:"steps,omitempty"`
 }
 
 type Step struct {
@@ -48,6 +50,13 @@ type Step struct {
 type CheckoutHeadSelector struct {
 	Field             string `json:"field"`
 	MatchedExpression string `json:"matched_expression"`
+}
+
+type PermissionGrant struct {
+	Scope      string `json:"scope"`
+	JobID      string `json:"job_id,omitempty"`
+	Permission string `json:"permission"`
+	Access     string `json:"access"`
 }
 
 func ParseDir(root string) (Resources, error) {
@@ -137,6 +146,9 @@ func parseWorkflow(r io.Reader, root, filename string) (Workflow, error) {
 	if on := mappingValue(&document, "on"); on != nil {
 		workflow.TriggersPullRequestTarget = hasPullRequestTargetTrigger(on)
 	}
+	if permissions := mappingValue(&document, "permissions"); permissions != nil {
+		workflow.PermissionGrants = parsePermissionGrants(permissions, "workflow", "")
+	}
 	if jobs := mappingValue(&document, "jobs"); jobs != nil && jobs.Kind == yaml.MappingNode {
 		workflow.Jobs = parseJobs(jobs)
 	}
@@ -165,6 +177,9 @@ func parseJobs(jobs *yaml.Node) []Job {
 			continue
 		}
 		job := Job{ID: key.Value}
+		if permissions := mappingValue(value, "permissions"); permissions != nil {
+			job.PermissionGrants = parsePermissionGrants(permissions, "job", job.ID)
+		}
 		if steps := mappingValue(value, "steps"); steps != nil && steps.Kind == yaml.SequenceNode {
 			job.Steps = parseSteps(steps)
 		}
@@ -205,6 +220,79 @@ func parseSteps(steps *yaml.Node) []Step {
 		out = append(out, step)
 	}
 	return out
+}
+
+func parsePermissionGrants(node *yaml.Node, scope, jobID string) []PermissionGrant {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		access := sanitizeScalarPermissionAccess(node.Value)
+		if access != "write-all" && access != "read-all" {
+			return nil
+		}
+		return []PermissionGrant{{
+			Scope:      scope,
+			JobID:      jobID,
+			Permission: "all",
+			Access:     access,
+		}}
+	case yaml.MappingNode:
+		grants := make([]PermissionGrant, 0, len(node.Content)/2)
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			value := node.Content[i+1]
+			if key.Kind != yaml.ScalarNode || value.Kind != yaml.ScalarNode {
+				continue
+			}
+			permission := sanitizePermissionName(key.Value)
+			access := sanitizeMapPermissionAccess(value.Value)
+			if permission == "" || access == "" {
+				continue
+			}
+			grants = append(grants, PermissionGrant{
+				Scope:      scope,
+				JobID:      jobID,
+				Permission: permission,
+				Access:     access,
+			})
+		}
+		sortPermissionGrants(grants)
+		return grants
+	default:
+		return nil
+	}
+}
+
+func sanitizePermissionName(value string) string {
+	switch value {
+	case "contents", "pull-requests", "actions", "checks", "deployments", "id-token", "security-events":
+		return value
+	default:
+		return ""
+	}
+}
+
+func sanitizeScalarPermissionAccess(value string) string {
+	if strings.Contains(value, "${{") || strings.Contains(value, "}}") {
+		return ""
+	}
+	switch value {
+	case "write-all", "read-all":
+		return value
+	default:
+		return ""
+	}
+}
+
+func sanitizeMapPermissionAccess(value string) string {
+	if strings.Contains(value, "${{") || strings.Contains(value, "}}") {
+		return ""
+	}
+	switch value {
+	case "write", "read", "none":
+		return value
+	default:
+		return ""
+	}
 }
 
 func hasPullRequestTargetTrigger(on *yaml.Node) bool {
@@ -378,5 +466,20 @@ func sortWorkflows(workflows []Workflow) {
 func sortJobs(jobs []Job) {
 	sort.SliceStable(jobs, func(i, j int) bool {
 		return jobs[i].ID < jobs[j].ID
+	})
+}
+
+func sortPermissionGrants(grants []PermissionGrant) {
+	sort.SliceStable(grants, func(i, j int) bool {
+		if grants[i].Scope != grants[j].Scope {
+			return grants[i].Scope < grants[j].Scope
+		}
+		if grants[i].JobID != grants[j].JobID {
+			return grants[i].JobID < grants[j].JobID
+		}
+		if grants[i].Permission != grants[j].Permission {
+			return grants[i].Permission < grants[j].Permission
+		}
+		return grants[i].Access < grants[j].Access
 	})
 }

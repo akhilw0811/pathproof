@@ -177,6 +177,64 @@ expressions. A `uses:` value that is entirely an expression is not modeled as a
 static action reference; a static `owner/repo` with an expression in the ref is
 modeled with a sanitized expression marker and treated as unpinned.
 
+`Workflow` nodes include optional typed GitHub Actions metadata:
+
+```json
+{
+  "metadata": {
+    "github_actions_workflow": {
+      "workflow_source_reference": ".github/workflows/build.yml#document=1",
+      "workflow_file": ".github/workflows/build.yml",
+      "workflow_name": "Build",
+      "triggers_pull_request_target": true,
+      "permission_grants": [
+        {
+          "scope": "workflow",
+          "permission": "all",
+          "access": "write-all"
+        }
+      ]
+    }
+  }
+}
+```
+
+`DefinesJob` edges include optional typed GitHub Actions job metadata:
+
+```json
+{
+  "metadata": {
+    "github_actions_workflow_job": {
+      "workflow_source_reference": ".github/workflows/build.yml#document=1",
+      "workflow_file": ".github/workflows/build.yml",
+      "workflow_name": "Build",
+      "triggers_pull_request_target": true,
+      "job_id": "test",
+      "permission_grants": [
+        {
+          "scope": "job",
+          "job_id": "test",
+          "permission": "contents",
+          "access": "write"
+        }
+      ]
+    }
+  }
+}
+```
+
+This metadata is the input for `PP-GHA-003`. It contains only deterministic
+workflow source identity, `pull_request_target` trigger presence, job identity
+when applicable, and sanitized permission key/access pairs. Scalar
+`permissions: write-all` is represented as `permission="all"` and
+`access="write-all"`; `permissions: read-all` is represented as
+`permission="all"` and `access="read-all"`. User-facing summaries and SARIF
+messages render these scalar forms as `permissions: write-all` or
+`permissions: read-all`, not as `all: write`. GitHub Actions parsing does not
+retain or serialize unknown permission values, expression-based permission
+values, `env`, arbitrary `with`, `secrets`, token values, run scripts, or raw
+workflow documents.
+
 PathProof's static Secret read model is:
 
 - `get` or `*` with empty `resourceNames` matches every parsed Secret in the
@@ -217,6 +275,14 @@ Implemented rules are:
 - Required path:
   `Workflow --DefinesJob--> WorkflowJob --UsesAction--> GitHubAction`
 
+- Rule ID: `PP-GHA-003`
+- Title:
+  `pull_request_target workflow grants dangerous token permissions`
+- Severity: fixed `High`
+- Required path:
+  workflow-level grants use `Workflow`; job-level grants use
+  `Workflow --DefinesJob--> WorkflowJob`
+
 `PP-K8S-001` is emitted only when all four Kubernetes nodes exist with the
 expected kinds and all three directed edges exist with the expected kinds. The
 ordered finding chain stores the four node IDs followed by the three edge IDs
@@ -242,6 +308,17 @@ includes `pull_request_target`, the static action identity is exactly
 selector matches from `with.ref` or `with.repository`. Non-checkout actions
 with PR-head-looking `with` fields do not create PP-GHA-002 findings.
 
+`PP-GHA-003` is emitted only when the workflow trigger includes
+`pull_request_target` and sanitized workflow-level or job-level metadata
+contains an explicit dangerous grant: `contents: write`,
+`pull-requests: write`, `actions: write`, `checks: write`,
+`deployments: write`, `id-token: write`, `security-events: write`, or
+`permissions: write-all`. PathProof reports explicit workflow-level and
+job-level dangerous permission grants independently. It does not flag
+`permissions: read-all`, `permissions: {}`, read/none access values, omitted
+permissions, unknown values, or expression-based values. Exact GitHub
+permission inheritance/override modeling is future work.
+
 Finding IDs are deterministic and stable. `PP-K8S-001` IDs are SHA-256 hashes of a
 canonical JSON identity containing only fixed field names for `rule_id`,
 ordered `node_ids`, and ordered `edge_ids`. Evidence, source references,
@@ -252,6 +329,9 @@ ref.
 `PP-GHA-002` IDs are SHA-256 hashes of a canonical JSON identity containing
 `rule_id`, workflow file, job ID, step index, action owner, repo, path, ref,
 and ordered selector field/expression identities.
+`PP-GHA-003` IDs are SHA-256 hashes of a canonical JSON identity containing
+`rule_id`, workflow file, scope, job ID when scope is `job`, permission name,
+and access value.
 
 Finding evidence preserves the complete ordered edge evidence for the matched
 path. `source_references` are derived from those edge evidence sources in
@@ -264,8 +344,11 @@ with, secret, token, run, and expression-only uses values are absent from
 findings because they are never retained by the workflow parser or graph
 builder. PP-GHA-002 evidence includes only workflow source references, job ID,
 step index, sanitized action identity, selector field names, and matched
-expression names. The analyzer does not redact arbitrary strings from graph
-evidence.
+expression names. PP-GHA-003 evidence and summaries include only workflow
+source references, workflow name or file fallback, scope, job ID when
+applicable, sanitized permission name, sanitized access value, and the
+`pull_request_target` trigger. The analyzer does not redact arbitrary strings
+from graph evidence.
 
 The scan CLI uses a private presentation projection and does not change the
 internal graph or analysis schemas. JSON scan output has this stable top-level
@@ -281,10 +364,9 @@ shape:
 SARIF scan output is also a private CLI projection, not a graph schema. It is
 selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
 with one PathProof run, deterministic rule entries for `PP-K8S-001`,
-`PP-GHA-001`, and `PP-GHA-002`, and one result per finding. Result properties
-include finding
-ID, severity, ordered node IDs, ordered edge IDs, and clean display source
-references when available.
+`PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003`, and one result per finding.
+Result properties include finding ID, severity, ordered node IDs, ordered edge
+IDs, and clean display source references when available.
 
 SARIF locations are derived only from structured source-reference fields whose
 entire value is a clean `filename#document=N` reference. PathProof does not

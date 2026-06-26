@@ -105,6 +105,213 @@ func TestParseDirIgnoresRunOnlySteps(t *testing.T) {
 	}
 }
 
+func TestParseDirParsesWorkflowLevelPermissionsMap(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "permissions.yml", `permissions:
+  pull-requests: read
+  contents: write
+  id-token: none
+  packages: write
+  actions: ${{ matrix.access }}
+jobs:
+  test:
+    steps:
+      - uses: owner/repo@main
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []PermissionGrant{
+		{Scope: "workflow", Permission: "contents", Access: "write"},
+		{Scope: "workflow", Permission: "id-token", Access: "none"},
+		{Scope: "workflow", Permission: "pull-requests", Access: "read"},
+	}
+	if !reflect.DeepEqual(resources.Workflows[0].PermissionGrants, want) {
+		t.Fatalf("permission grants = %#v, want %#v", resources.Workflows[0].PermissionGrants, want)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"packages", "matrix.access", "${{"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestParseDirParsesJobLevelPermissionsMap(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "permissions.yml", `jobs:
+  test:
+    permissions:
+      checks: write
+      deployments: read
+      id-token: none
+    steps:
+      - uses: owner/repo@main
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []PermissionGrant{
+		{Scope: "job", JobID: "test", Permission: "checks", Access: "write"},
+		{Scope: "job", JobID: "test", Permission: "deployments", Access: "read"},
+		{Scope: "job", JobID: "test", Permission: "id-token", Access: "none"},
+	}
+	if !reflect.DeepEqual(resources.Workflows[0].Jobs[0].PermissionGrants, want) {
+		t.Fatalf("job permission grants = %#v, want %#v", resources.Workflows[0].Jobs[0].PermissionGrants, want)
+	}
+}
+
+func TestParseDirIgnoresInvalidMapPermissionAccessValues(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "permissions.yml", `permissions:
+  contents: write-all
+  actions: unknown
+  checks: ${{ inputs.permission }}
+  deployments: ""
+jobs:
+  test:
+    permissions:
+      contents: read-all
+      id-token: ${{ inputs.job_permission }}
+      security-events: admin
+    steps:
+      - uses: owner/repo@main
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	if len(resources.Workflows[0].PermissionGrants) != 0 {
+		t.Fatalf("workflow permission grants = %#v, want none", resources.Workflows[0].PermissionGrants)
+	}
+	if len(resources.Workflows[0].Jobs[0].PermissionGrants) != 0 {
+		t.Fatalf("job permission grants = %#v, want none", resources.Workflows[0].Jobs[0].PermissionGrants)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"write-all", "read-all", "unknown", "inputs.permission", "inputs.job_permission", "${{", "admin"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestParseDirParsesScalarPermissions(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		access  string
+		wantLen int
+	}{
+		{name: "write all", value: "write-all", access: "write-all", wantLen: 1},
+		{name: "read all", value: "read-all", access: "read-all", wantLen: 1},
+		{name: "unknown", value: "admin-all", wantLen: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeWorkflow(t, root, "permissions.yml", `permissions: `+tt.value+`
+jobs:
+  test:
+    steps:
+      - uses: owner/repo@main
+`)
+
+			resources, err := ParseDir(root)
+			if err != nil {
+				t.Fatalf("parse dir: %v", err)
+			}
+			grants := resources.Workflows[0].PermissionGrants
+			if len(grants) != tt.wantLen {
+				t.Fatalf("grant count = %d, want %d: %#v", len(grants), tt.wantLen, grants)
+			}
+			if tt.wantLen == 0 {
+				return
+			}
+			want := PermissionGrant{Scope: "workflow", Permission: "all", Access: tt.access}
+			if !reflect.DeepEqual(grants[0], want) {
+				t.Fatalf("grant = %#v, want %#v", grants[0], want)
+			}
+		})
+	}
+}
+
+func TestParseDirEmptyPermissionsMapProducesNoGrants(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "permissions.yml", `permissions: {}
+jobs:
+  test:
+    permissions: {}
+    steps:
+      - uses: owner/repo@main
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.Workflows[0].PermissionGrants) != 0 {
+		t.Fatalf("workflow grants = %#v, want none", resources.Workflows[0].PermissionGrants)
+	}
+	if len(resources.Workflows[0].Jobs[0].PermissionGrants) != 0 {
+		t.Fatalf("job grants = %#v, want none", resources.Workflows[0].Jobs[0].PermissionGrants)
+	}
+}
+
+func TestParseDirPermissionGrantsAreDeterministic(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "permissions.yml", `permissions:
+  security-events: write
+  contents: read
+  actions: write
+jobs:
+  z:
+    permissions:
+      id-token: write
+  a:
+    permissions:
+      deployments: write
+`)
+
+	first, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse first: %v", err)
+	}
+	second, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse second: %v", err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("parse output differs:\nfirst=%#v\nsecond=%#v", first, second)
+	}
+	wantWorkflow := []PermissionGrant{
+		{Scope: "workflow", Permission: "actions", Access: "write"},
+		{Scope: "workflow", Permission: "contents", Access: "read"},
+		{Scope: "workflow", Permission: "security-events", Access: "write"},
+	}
+	if !reflect.DeepEqual(first.Workflows[0].PermissionGrants, wantWorkflow) {
+		t.Fatalf("workflow grants = %#v, want %#v", first.Workflows[0].PermissionGrants, wantWorkflow)
+	}
+	gotJobs := []string{first.Workflows[0].Jobs[0].ID, first.Workflows[0].Jobs[1].ID}
+	if !reflect.DeepEqual(gotJobs, []string{"a", "z"}) {
+		t.Fatalf("jobs = %#v, want sorted IDs", gotJobs)
+	}
+}
+
 func TestParseDirDetectsPullRequestTargetTriggers(t *testing.T) {
 	tests := []struct {
 		name    string

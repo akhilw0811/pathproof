@@ -10,7 +10,9 @@ import (
 func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 	for _, workflow := range resources.Workflows {
 		workflowNode := graph.NewNode(graph.Workflow, workflowName(workflow))
-		workflowNode.Evidence = []graph.SourceEvidence{sourceEvidence(workflow.Source, "github actions workflow")}
+		workflowNode.Evidence = []graph.SourceEvidence{sourceEvidence(workflow.Source, workflowEvidenceDetail(workflow))}
+		workflowMetadata := buildWorkflowMetadata(workflow)
+		workflowNode.Metadata = &graph.NodeMetadata{GitHubActionsWorkflow: &workflowMetadata}
 		addedWorkflow, err := g.AddNode(workflowNode)
 		if err != nil {
 			return fmt.Errorf("add workflow %s: %w", workflow.Source.RelativePath, err)
@@ -25,8 +27,10 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 			}
 			definesJob := graph.NewEdge(graph.DefinesJob, addedWorkflow.ID, addedJob.ID, graph.SourceEvidence{
 				Source: sourceRef(workflow.Source),
-				Detail: "github actions workflow defines job " + job.ID,
+				Detail: definesJobEvidenceDetail(job),
 			})
+			jobMetadata := buildWorkflowJobMetadata(workflow, job)
+			definesJob.Metadata = &graph.EdgeMetadata{GitHubActionsWorkflowJob: &jobMetadata}
 			if _, err := g.AddEdge(definesJob); err != nil {
 				return fmt.Errorf("add workflow job edge %s %s: %w", workflow.Source.RelativePath, job.ID, err)
 			}
@@ -56,6 +60,27 @@ func AddRoutes(g *graph.Graph, resources parsergithubactions.Resources) error {
 	return nil
 }
 
+func buildWorkflowMetadata(workflow parsergithubactions.Workflow) graph.GitHubActionsWorkflow {
+	return graph.GitHubActionsWorkflow{
+		WorkflowSourceReference:   sourceRef(workflow.Source),
+		WorkflowFile:              workflow.Source.RelativePath,
+		WorkflowName:              workflowDisplayName(workflow),
+		TriggersPullRequestTarget: workflow.TriggersPullRequestTarget,
+		PermissionGrants:          permissionGrants(workflow.PermissionGrants),
+	}
+}
+
+func buildWorkflowJobMetadata(workflow parsergithubactions.Workflow, job parsergithubactions.Job) graph.GitHubActionsWorkflowJob {
+	return graph.GitHubActionsWorkflowJob{
+		WorkflowSourceReference:   sourceRef(workflow.Source),
+		WorkflowFile:              workflow.Source.RelativePath,
+		WorkflowName:              workflowDisplayName(workflow),
+		TriggersPullRequestTarget: workflow.TriggersPullRequestTarget,
+		JobID:                     job.ID,
+		PermissionGrants:          permissionGrants(job.PermissionGrants),
+	}
+}
+
 func actionUseMetadata(workflow parsergithubactions.Workflow, job parsergithubactions.Job, step parsergithubactions.Step) (graph.GitHubActionUse, bool) {
 	if step.Owner == "" || step.Repo == "" || step.Uses == "" {
 		return graph.GitHubActionUse{}, false
@@ -77,6 +102,22 @@ func actionUseMetadata(workflow parsergithubactions.Workflow, job parsergithubac
 	}, true
 }
 
+func permissionGrants(grants []parsergithubactions.PermissionGrant) []graph.GitHubActionsPermissionGrant {
+	if len(grants) == 0 {
+		return nil
+	}
+	out := make([]graph.GitHubActionsPermissionGrant, 0, len(grants))
+	for _, grant := range grants {
+		out = append(out, graph.GitHubActionsPermissionGrant{
+			Scope:      grant.Scope,
+			JobID:      grant.JobID,
+			Permission: grant.Permission,
+			Access:     grant.Access,
+		})
+	}
+	return out
+}
+
 func checkoutHeadSelectors(selectors []parsergithubactions.CheckoutHeadSelector) []graph.GitHubActionsCheckoutHeadSelector {
 	if len(selectors) == 0 {
 		return nil
@@ -91,12 +132,42 @@ func checkoutHeadSelectors(selectors []parsergithubactions.CheckoutHeadSelector)
 	return out
 }
 
+func definesJobEvidenceDetail(job parsergithubactions.Job) string {
+	return "github actions workflow defines job " + job.ID
+}
+
+func workflowEvidenceDetail(workflow parsergithubactions.Workflow) string {
+	detail := "github actions workflow"
+	if len(workflow.PermissionGrants) == 0 {
+		return detail
+	}
+	return detail + " with " + permissionGrantListEvidence(permissionGrants(workflow.PermissionGrants))
+}
+
 func actionUseEvidenceDetail(actionUse graph.GitHubActionUse) string {
 	detail := fmt.Sprintf("github actions job %s step %d uses %s", actionUse.JobID, actionUse.StepIndex, actionUse.Uses)
 	if !actionUse.TriggersPullRequestTarget || len(actionUse.CheckoutHeadSelectors) == 0 {
 		return detail
 	}
 	return detail + " in pull_request_target with " + selectorEvidence(actionUse.CheckoutHeadSelectors)
+}
+
+func permissionGrantListEvidence(grants []graph.GitHubActionsPermissionGrant) string {
+	out := ""
+	for i, grant := range grants {
+		if i > 0 {
+			out += ", "
+		}
+		out += permissionGrantEvidence(grant)
+	}
+	return out
+}
+
+func permissionGrantEvidence(grant graph.GitHubActionsPermissionGrant) string {
+	if grant.Permission == "all" && (grant.Access == "write-all" || grant.Access == "read-all") {
+		return "permissions: " + grant.Access
+	}
+	return grant.Permission + ": " + grant.Access
 }
 
 func selectorEvidence(selectors []graph.GitHubActionsCheckoutHeadSelector) string {

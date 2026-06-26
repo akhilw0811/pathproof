@@ -18,6 +18,7 @@ const (
 	RulePublicWorkloadCanReadSecret                  RuleID   = "PP-K8S-001"
 	RuleGitHubActionsUnpinnedAction                  RuleID   = "PP-GHA-001"
 	RuleGitHubActionsUnsafePullRequestTargetCheckout RuleID   = "PP-GHA-002"
+	RuleGitHubActionsDangerousPermissions            RuleID   = "PP-GHA-003"
 	SeverityHigh                                     Severity = "High"
 	SeverityMedium                                   Severity = "Medium"
 )
@@ -25,6 +26,7 @@ const (
 const publicWorkloadCanReadSecretTitle = "Public workload can read Kubernetes Secret"
 const githubActionsUnpinnedActionTitle = "GitHub Actions workflow uses an action that is not pinned to a full commit SHA"
 const githubActionsUnsafePullRequestTargetCheckoutTitle = "pull_request_target workflow checks out untrusted pull request head code"
+const githubActionsDangerousPermissionsTitle = "pull_request_target workflow grants dangerous token permissions"
 
 type Finding struct {
 	ID               FindingID         `json:"id"`
@@ -73,6 +75,15 @@ type githubActionsUnsafeCheckoutFindingIdentity struct {
 	Selectors    []githubActionsSelectorIdentity `json:"selectors"`
 }
 
+type githubActionsDangerousPermissionsFindingIdentity struct {
+	RuleID       RuleID `json:"rule_id"`
+	WorkflowFile string `json:"workflow_file"`
+	Scope        string `json:"scope"`
+	JobID        string `json:"job_id,omitempty"`
+	Permission   string `json:"permission"`
+	Access       string `json:"access"`
+}
+
 type githubActionsSelectorIdentity struct {
 	Field             string `json:"field"`
 	MatchedExpression string `json:"matched_expression"`
@@ -102,6 +113,13 @@ func Analyze(g *graph.Graph) []Finding {
 		case graph.UsesAction:
 			usesActionByJob[edge.From] = append(usesActionByJob[edge.From], edge)
 		}
+	}
+
+	for _, node := range g.Nodes() {
+		if node.Kind != graph.Workflow {
+			continue
+		}
+		findings = append(findings, newGitHubActionsDangerousWorkflowPermissionFindings(node)...)
 	}
 
 	for _, route := range routesTo {
@@ -144,6 +162,7 @@ func Analyze(g *graph.Graph) []Finding {
 		if !ok {
 			continue
 		}
+		findings = append(findings, newGitHubActionsDangerousJobPermissionFindings(workflow, job, defines)...)
 		for _, uses := range usesActionByJob[job.ID] {
 			action, ok := nodeOfKind(g, uses.To, graph.GitHubAction)
 			if !ok {
@@ -164,6 +183,118 @@ func Analyze(g *graph.Graph) []Finding {
 		return findings[i].ID < findings[j].ID
 	})
 	return findings
+}
+
+func newGitHubActionsDangerousWorkflowPermissionFindings(workflow graph.Node) []Finding {
+	if workflow.Metadata == nil || workflow.Metadata.GitHubActionsWorkflow == nil {
+		return nil
+	}
+	workflowMetadata := *workflow.Metadata.GitHubActionsWorkflow
+	if !workflowMetadata.TriggersPullRequestTarget {
+		return nil
+	}
+
+	findings := make([]Finding, 0)
+	for _, grant := range workflowMetadata.PermissionGrants {
+		if !isDangerousGitHubActionsPermissionGrant(grant) {
+			continue
+		}
+		id, err := stableGitHubActionsDangerousPermissionsFindingID(workflowMetadata.WorkflowFile, grant)
+		if err != nil {
+			continue
+		}
+		findings = append(findings, Finding{
+			ID:               id,
+			RuleID:           RuleGitHubActionsDangerousPermissions,
+			Title:            githubActionsDangerousPermissionsTitle,
+			Severity:         SeverityHigh,
+			NodeIDs:          []graph.NodeID{workflow.ID},
+			EdgeIDs:          nil,
+			Summary:          "GitHub Actions workflow " + workflowDisplay(workflowMetadata.WorkflowName, workflowMetadata.WorkflowFile) + " grants " + githubActionsPermissionGrantSummary(grant) + " at workflow scope under pull_request_target.",
+			Evidence:         nil,
+			SourceReferences: sourceReferencesFromValues(workflowMetadata.WorkflowSourceReference),
+		})
+	}
+	return findings
+}
+
+func newGitHubActionsDangerousJobPermissionFindings(workflow, job graph.Node, definesJob graph.Edge) []Finding {
+	if definesJob.Metadata == nil || definesJob.Metadata.GitHubActionsWorkflowJob == nil {
+		return nil
+	}
+	jobMetadata := *definesJob.Metadata.GitHubActionsWorkflowJob
+	if !jobMetadata.TriggersPullRequestTarget {
+		return nil
+	}
+
+	evidence := []FindingEvidence{findingEvidence(definesJob)}
+	findings := make([]Finding, 0)
+	for _, grant := range jobMetadata.PermissionGrants {
+		if !isDangerousGitHubActionsPermissionGrant(grant) {
+			continue
+		}
+		id, err := stableGitHubActionsDangerousPermissionsFindingID(jobMetadata.WorkflowFile, grant)
+		if err != nil {
+			continue
+		}
+		findings = append(findings, Finding{
+			ID:               id,
+			RuleID:           RuleGitHubActionsDangerousPermissions,
+			Title:            githubActionsDangerousPermissionsTitle,
+			Severity:         SeverityHigh,
+			NodeIDs:          []graph.NodeID{workflow.ID, job.ID},
+			EdgeIDs:          []graph.EdgeID{definesJob.ID},
+			Summary:          "GitHub Actions workflow " + workflowDisplay(jobMetadata.WorkflowName, jobMetadata.WorkflowFile) + " job " + jobMetadata.JobID + " grants " + githubActionsPermissionGrantSummary(grant) + " under pull_request_target.",
+			Evidence:         cloneFindingEvidence(evidence),
+			SourceReferences: sourceReferences(evidence),
+		})
+	}
+	return findings
+}
+
+func isDangerousGitHubActionsPermissionGrant(grant graph.GitHubActionsPermissionGrant) bool {
+	if grant.Permission == "all" && grant.Access == "write-all" {
+		return true
+	}
+	if grant.Access != "write" {
+		return false
+	}
+	switch grant.Permission {
+	case "contents", "pull-requests", "actions", "checks", "deployments", "id-token", "security-events":
+		return true
+	default:
+		return false
+	}
+}
+
+func stableGitHubActionsDangerousPermissionsFindingID(workflowFile string, grant graph.GitHubActionsPermissionGrant) (FindingID, error) {
+	data, err := json.Marshal(githubActionsDangerousPermissionsFindingIdentity{
+		RuleID:       RuleGitHubActionsDangerousPermissions,
+		WorkflowFile: workflowFile,
+		Scope:        grant.Scope,
+		JobID:        grant.JobID,
+		Permission:   grant.Permission,
+		Access:       grant.Access,
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return FindingID("finding:" + string(RuleGitHubActionsDangerousPermissions) + ":" + hex.EncodeToString(sum[:])), nil
+}
+
+func githubActionsPermissionGrantSummary(grant graph.GitHubActionsPermissionGrant) string {
+	if grant.Permission == "all" && (grant.Access == "write-all" || grant.Access == "read-all") {
+		return "permissions: " + grant.Access
+	}
+	return grant.Permission + ": " + grant.Access
+}
+
+func workflowDisplay(name, file string) string {
+	if name == "" || name == file {
+		return file
+	}
+	return name + " (" + file + ")"
 }
 
 func newGitHubActionsUnpinnedActionFinding(workflow, job, action graph.Node, definesJob, usesAction graph.Edge) (Finding, bool) {
@@ -381,6 +512,22 @@ func sourceReferences(evidence []FindingEvidence) []string {
 		}
 		seen[ref] = struct{}{}
 		refs = append(refs, ref)
+	}
+	return refs
+}
+
+func sourceReferencesFromValues(values ...string) []string {
+	refs := make([]string, 0, len(values))
+	seen := make(map[string]struct{})
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		refs = append(refs, value)
 	}
 	return refs
 }

@@ -21,13 +21,17 @@
   RBAC-derived ServiceAccount `CanRead` edges. Secret values are never
   ingested.
 - Local GitHub Actions workflow parsing under `.github/workflows` for
-  workflow name, `pull_request_target` trigger presence, job IDs, step
-  indexes, optional step names, sanitized static action identities, and
-  sanitized `actions/checkout` PR-head selector matches. Workflow env values,
-  arbitrary with values, secrets, token values, run scripts, expression-only
-  `uses:` values, and raw workflow documents are not retained.
+  workflow name, `pull_request_target` trigger presence, sanitized
+  workflow-level and job-level permission grants, job IDs, step indexes,
+  optional step names, sanitized static action identities, and sanitized
+  `actions/checkout` PR-head selector matches. Workflow env values, arbitrary
+  with values, secrets, token values, run scripts, expression-only `uses:`
+  values, unknown or expression-based permission values, and raw workflow
+  documents are not retained.
 - Minimal GitHub Actions workflow/job/action-use graph construction with
   `Workflow`, `WorkflowJob`, `GitHubAction`, `DefinesJob`, and `UsesAction`.
+  `Workflow` and `DefinesJob` metadata preserve sanitized explicit permission
+  grants for the current GitHub Actions rules.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
@@ -38,6 +42,11 @@
   `pull_request_target` workflows that configure `actions/checkout` to check
   out pull request head code, with fixed rule-based `High` severity and
   deterministic finding IDs.
+- Read-only deterministic GitHub Actions analysis for `PP-GHA-003`:
+  `pull_request_target` workflows that explicitly grant dangerous
+  workflow-level or job-level token permissions, with fixed rule-based `High`
+  severity and deterministic finding IDs. Exact GitHub permission
+  inheritance/override modeling is not implemented.
 - Read-only deterministic remediation planning for `PP-K8S-001`, using typed
   structured `CanRead` authorization metadata. Implemented advisory actions are
   `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
@@ -60,21 +69,23 @@
   Kubernetes remediation and optional patch preview output, JSON output, SARIF
   2.1.0 finding output, and stable exit codes.
 - Local findings-only SARIF export for `PP-K8S-001`, `PP-GHA-001`, and
-  `PP-GHA-002`. SARIF artifact locations use safe relative URIs when clean
-  structured source references are available.
+  `PP-GHA-002`, and `PP-GHA-003`. SARIF artifact locations use safe relative
+  URIs when clean structured source references are available.
 
 ## Later
 
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Full CI/CD attack-path modeling.
-- GitHub Actions workflow permissions analysis.
+- Exact GitHub Actions workflow permission inheritance/override modeling.
 - GitHub Actions OIDC trust analysis.
 - Reusable workflow resolution.
+- CI/CD-to-cloud path analysis.
 - Action source inspection.
 - Automatic GitHub Actions action pinning patches.
 - Automatic GitHub Actions remediation for unsafe `pull_request_target`
   checkout patterns.
+- Automatic GitHub Actions remediation for dangerous workflow permissions.
 - Remediation verification.
 - In-place patch application, live validation, force/clobber behavior, Git
   commits, and pull request creation.

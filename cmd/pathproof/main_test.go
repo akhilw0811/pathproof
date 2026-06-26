@@ -16,11 +16,12 @@ import (
 )
 
 const (
-	safeFixture       = "testdata/scan-safe"
-	vulnerableFixture = "testdata/scan-vulnerable"
-	invalidFixture    = "testdata/scan-invalid"
-	publicDemoFixture = "../../examples/kubernetes/public-secret-path"
-	ghaDemoFixture    = "../../examples/github-actions/unpinned-action"
+	safeFixture                        = "testdata/scan-safe"
+	vulnerableFixture                  = "testdata/scan-vulnerable"
+	invalidFixture                     = "testdata/scan-invalid"
+	publicDemoFixture                  = "../../examples/kubernetes/public-secret-path"
+	ghaDemoFixture                     = "../../examples/github-actions/unpinned-action"
+	ghaDangerousPermissionsDemoFixture = "../../examples/github-actions/dangerous-permissions"
 )
 
 func TestRunVersion(t *testing.T) {
@@ -349,6 +350,74 @@ jobs:
 	}
 }
 
+func TestRunScanGitHubActionsDangerousPermissionsHumanOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "permissions.yml", `name: Dangerous permissions
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: owner/repo@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 1\n")
+	assertContains(t, stdout, "Rule: PP-GHA-003\n")
+	assertContains(t, stdout, "Title: pull_request_target workflow grants dangerous token permissions\n")
+	assertContains(t, stdout, "Severity: High\n")
+	assertContains(t, stdout, "Summary: GitHub Actions workflow Dangerous permissions (.github/workflows/permissions.yml) grants permissions: write-all at workflow scope under pull_request_target.\n")
+	assertContains(t, stdout, "Workflow githubactions://.github/workflows/permissions.yml")
+	if strings.Contains(stdout, "all: write") || strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-GHA-003 output contains unsupported or confusing text: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsDangerousPermissionsJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "permissions.yml", `on:
+  pull_request_target:
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+    steps:
+      - uses: owner/repo@0123456789abcdef0123456789abcdef01234567
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=json", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 {
+		t.Fatalf("finding count = %d len = %d, want 1", report.FindingCount, len(report.Findings))
+	}
+	finding := report.Findings[0]
+	if finding.RuleID != "PP-GHA-003" || finding.Severity != "High" {
+		t.Fatalf("finding = %#v, want PP-GHA-003 High", finding)
+	}
+	if finding.Remediation != nil {
+		t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+	}
+	if len(finding.Path) != 2 || len(finding.Evidence) != 1 {
+		t.Fatalf("path/evidence lengths = %d/%d, want 2/1", len(finding.Path), len(finding.Evidence))
+	}
+	assertContains(t, stdout, "job deploy")
+	assertContains(t, stdout, "id-token: write")
+	assertContains(t, stdout, "pull_request_target")
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
 func TestRunScanGitHubActionsExpressionOnlyUsesValueIsNotRetained(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "expression.yml", `on: pull_request_target
@@ -406,9 +475,11 @@ jobs:
 	}
 }
 
-func TestRunScanGitHubActionsUnpinnedUnsafeCheckoutFindingsAreDeterministic(t *testing.T) {
+func TestRunScanGitHubActionsMixedFindingsAreDeterministic(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `on: pull_request_target
+permissions:
+  contents: write
 jobs:
   test:
     steps:
@@ -426,8 +497,8 @@ jobs:
 	assertString(t, "second stderr", secondErr, "")
 	assertString(t, "stdout", secondOut, firstOut)
 	report := assertValidJSONReport(t, firstOut)
-	if report.FindingCount != 2 || len(report.Findings) != 2 {
-		t.Fatalf("finding count = %d len = %d, want 2", report.FindingCount, len(report.Findings))
+	if report.FindingCount != 3 || len(report.Findings) != 3 {
+		t.Fatalf("finding count = %d len = %d, want 3", report.FindingCount, len(report.Findings))
 	}
 	seen := map[string]bool{}
 	for i, finding := range report.Findings {
@@ -439,8 +510,132 @@ jobs:
 			t.Fatalf("findings are not sorted by deterministic ID: %#v", report.Findings)
 		}
 	}
-	if !seen["PP-GHA-001"] || !seen["PP-GHA-002"] {
-		t.Fatalf("rules seen = %#v, want PP-GHA-001 and PP-GHA-002", seen)
+	if !seen["PP-GHA-001"] || !seen["PP-GHA-002"] || !seen["PP-GHA-003"] {
+		t.Fatalf("rules seen = %#v, want PP-GHA-001, PP-GHA-002, and PP-GHA-003", seen)
+	}
+}
+
+func TestRunScanGitHubActionsInvalidPermissionMapValuesAreIgnoredAndExcluded(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "permissions.yml", `on: pull_request_target
+permissions:
+  contents: write-all
+  actions: ${{ inputs.permission }}
+jobs:
+  test:
+    permissions:
+      contents: read-all
+      checks: unknown
+`)
+
+	for _, args := range [][]string{
+		{"scan", dir},
+		{"scan", "--format=json", dir},
+		{"scan", "--format=sarif", dir},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			stdout, stderr, code := runCommand(args...)
+
+			assertCode(t, code, 0)
+			assertString(t, "stderr", stderr, "")
+			for _, forbidden := range []string{"contents: write-all", "contents: read-all", "inputs.permission", "${{", "unknown"} {
+				if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+					t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+				}
+			}
+		})
+	}
+}
+
+func TestRunScanGitHubActionsExistingFindingsDoNotIncludeJobPermissionEvidence(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `on: pull_request_target
+jobs:
+  test:
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+
+	humanStdout, humanStderr, humanCode := runCommand("scan", dir)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", dir)
+	sarifStdout, sarifStderr, sarifCode := runCommand("scan", "--format=sarif", dir)
+
+	assertCode(t, humanCode, 1)
+	assertString(t, "human stderr", humanStderr, "")
+	for _, block := range strings.Split(humanStdout, "\nFinding:") {
+		if strings.Contains(block, "Rule: PP-GHA-001") || strings.Contains(block, "Rule: PP-GHA-002") {
+			if strings.Contains(block, "contents: write") {
+				t.Fatalf("existing GitHub Actions finding block contains permission text:\n%s", block)
+			}
+		}
+	}
+	assertContains(t, humanStdout, "Rule: PP-GHA-003\n")
+	assertContains(t, humanStdout, "contents: write")
+
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	for _, finding := range report.Findings {
+		if finding.RuleID == "PP-GHA-001" || finding.RuleID == "PP-GHA-002" {
+			data, err := json.Marshal(finding)
+			if err != nil {
+				t.Fatalf("marshal finding: %v", err)
+			}
+			if strings.Contains(string(data), "contents: write") {
+				t.Fatalf("%s JSON finding contains permission text: %s", finding.RuleID, data)
+			}
+		}
+		if finding.RuleID == "PP-GHA-003" && !strings.Contains(finding.Summary, "contents: write") {
+			t.Fatalf("PP-GHA-003 summary = %q, want permission text", finding.Summary)
+		}
+	}
+
+	assertCode(t, sarifCode, 1)
+	assertString(t, "sarif stderr", sarifStderr, "")
+	sarif := assertValidSARIFReport(t, sarifStdout)
+	for _, result := range sarif.Runs[0].Results {
+		if result.RuleID == "PP-GHA-001" || result.RuleID == "PP-GHA-002" {
+			data, err := json.Marshal(result)
+			if err != nil {
+				t.Fatalf("marshal SARIF result: %v", err)
+			}
+			if strings.Contains(string(data), "contents: write") {
+				t.Fatalf("%s SARIF result contains permission text: %s", result.RuleID, data)
+			}
+		}
+		if result.RuleID == "PP-GHA-003" && !strings.Contains(result.Message.Text, "contents: write") {
+			t.Fatalf("PP-GHA-003 SARIF message = %q, want permission text", result.Message.Text)
+		}
+	}
+}
+
+func TestRunScanGitHubActionsDangerousPermissionsPatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("mkdir scan root: %v", err)
+	}
+	writeGitHubActionsWorkflowForTest(t, root, "permissions.yml", `on: pull_request_target
+permissions:
+  contents: write
+`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-GHA-003\n")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 0")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-GHA-003 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
 	}
 }
 
@@ -703,6 +898,24 @@ func TestRunScanGitHubActionsDemoFixture(t *testing.T) {
 	assertContains(t, stdout, "actions/checkout@v4")
 	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) || strings.Contains(stdout, "Remediation:") {
 		t.Fatalf("GitHub Actions demo output contains unsupported text: %s", stdout)
+	}
+}
+
+func TestRunScanGitHubActionsDangerousPermissionsDemoFixture(t *testing.T) {
+	demoDir, err := filepath.Abs(ghaDangerousPermissionsDemoFixture)
+	if err != nil {
+		t.Fatalf("resolve GitHub Actions dangerous permissions demo fixture: %v", err)
+	}
+
+	stdout, stderr, code := runCommand("scan", demoDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 1\n")
+	assertContains(t, stdout, "Rule: PP-GHA-003\n")
+	assertContains(t, stdout, "permissions: write-all")
+	if strings.Contains(stdout, "all: write") || strings.Contains(stdout, "Remediation:") {
+		t.Fatalf("GitHub Actions dangerous permissions demo output contains unsupported text: %s", stdout)
 	}
 }
 
@@ -1791,6 +2004,88 @@ func TestWriteScanResultRejectsEdgeCountMismatchWithEmptyStdout(t *testing.T) {
 	assertString(t, "stdout", stdout, "")
 	assertOneLineStderr(t, stderr)
 	assertContains(t, stderr, "path edges")
+}
+
+func TestWriteScanResultValidOneNodeFindingProjectsInHumanJSONAndSARIF(t *testing.T) {
+	g := graph.New()
+	workflow := graph.NewNode(graph.Workflow, "githubactions://.github/workflows/permissions.yml")
+	workflow.Evidence = []graph.SourceEvidence{{Source: "/repo/.github/workflows/permissions.yml#document=1", Detail: "github actions workflow"}}
+	workflow = mustAddNode(t, g, workflow)
+	finding := analysis.Finding{
+		ID:               "finding:PP-GHA-003:test",
+		RuleID:           analysis.RuleGitHubActionsDangerousPermissions,
+		Title:            "pull_request_target workflow grants dangerous token permissions",
+		Severity:         analysis.SeverityHigh,
+		Summary:          "GitHub Actions workflow .github/workflows/permissions.yml grants permissions: write-all at workflow scope under pull_request_target.",
+		NodeIDs:          []graph.NodeID{workflow.ID},
+		EdgeIDs:          nil,
+		Evidence:         nil,
+		SourceReferences: []string{"/repo/.github/workflows/permissions.yml#document=1"},
+	}
+
+	humanStdout, humanStderr, humanCode := writeScanResultForTest([]analysis.Finding{finding}, g, scanFormatHuman)
+	jsonStdout, jsonStderr, jsonCode := writeScanResultForTest([]analysis.Finding{finding}, g, scanFormatJSON)
+	sarifStdout, sarifStderr, sarifCode := writeScanResultForTest([]analysis.Finding{finding}, g, scanFormatSARIF)
+
+	assertCode(t, humanCode, 1)
+	assertString(t, "human stderr", humanStderr, "")
+	assertContains(t, humanStdout, "Rule: PP-GHA-003\n")
+	assertContains(t, humanStdout, "permissions: write-all")
+	assertContains(t, humanStdout, "Workflow githubactions://.github/workflows/permissions.yml")
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	if len(report.Findings) != 1 || len(report.Findings[0].Path) != 1 || len(report.Findings[0].Evidence) != 0 {
+		t.Fatalf("JSON one-node finding = %#v, want one path node and no evidence", report.Findings)
+	}
+	assertCode(t, sarifCode, 1)
+	assertString(t, "sarif stderr", sarifStderr, "")
+	sarif := assertValidSARIFReport(t, sarifStdout)
+	if len(sarif.Runs[0].Results) != 1 {
+		t.Fatalf("SARIF results = %#v, want one", sarif.Runs[0].Results)
+	}
+	if got := sarif.Runs[0].Results[0].RuleID; got != "PP-GHA-003" {
+		t.Fatalf("SARIF ruleId = %q, want PP-GHA-003", got)
+	}
+}
+
+func TestWriteScanResultRejectsMissingNodeForOneNodeFindingWithEmptyStdout(t *testing.T) {
+	g := graph.New()
+	finding := analysis.Finding{
+		ID:      "finding:PP-GHA-003:test",
+		RuleID:  analysis.RuleGitHubActionsDangerousPermissions,
+		NodeIDs: []graph.NodeID{graph.NodeID("node:missing-workflow")},
+	}
+
+	stdout, stderr, code := writeScanResultForTest([]analysis.Finding{finding}, g, scanFormatHuman)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "internal scan error")
+	assertContains(t, stderr, "missing node")
+}
+
+func TestWriteScanResultRejectsOneNodeFindingWithUnexpectedEdgeWithEmptyStdout(t *testing.T) {
+	g := graph.New()
+	workflow := mustAddNode(t, g, graph.NewNode(graph.Workflow, "githubactions://.github/workflows/permissions.yml"))
+	job := mustAddNode(t, g, graph.NewNode(graph.WorkflowJob, "githubactions://.github/workflows/permissions.yml/job/test"))
+	defines := mustAddEdge(t, g, graph.NewEdge(graph.DefinesJob, workflow.ID, job.ID, graph.SourceEvidence{Source: "permissions.yml", Detail: "defines"}))
+	finding := analysis.Finding{
+		ID:       "finding:PP-GHA-003:test",
+		RuleID:   analysis.RuleGitHubActionsDangerousPermissions,
+		NodeIDs:  []graph.NodeID{workflow.ID},
+		EdgeIDs:  []graph.EdgeID{defines.ID},
+		Evidence: []analysis.FindingEvidence{{EdgeID: defines.ID, Kind: defines.Kind, Source: defines.Evidence}},
+	}
+
+	stdout, stderr, code := writeScanResultForTest([]analysis.Finding{finding}, g, scanFormatHuman)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "internal scan error")
+	assertContains(t, stderr, "one path node")
 }
 
 func TestWriteScanResultValidFindingProjectsInHumanAndJSON(t *testing.T) {
