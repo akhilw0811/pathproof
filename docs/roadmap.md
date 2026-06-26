@@ -31,6 +31,10 @@
   ServiceAccount subject removal from the referenced RoleBinding or
   ClusterRoleBinding source document. Secret-bearing source files are
   intentionally unsupported for previews.
+- Opt-in patch output for generated `NarrowBindingSubject` previews. Patched
+  copies are written only to a separate new or empty output directory, input
+  files are never modified, unsupported actions are reported but not written,
+  and Secret-bearing source files are not copied or written.
 - Local Kubernetes YAML scan CLI for `pathproof scan <directory>` with
   human-readable finding, remediation, and optional patch preview output, JSON
   output, and stable exit codes.
@@ -40,8 +44,13 @@
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Remediation verification.
-- Patch application, validation rescans, and pull request creation.
+- In-place patch application, validation rescans, force/clobber behavior, Git
+  commits, and pull request creation.
 - Patch previews for RBAC rule edits, wildcard resources or verbs,
+  multi-resource rule splitting, API-group splitting, ClusterRoleBinding scope
+  changes, `resourceNames`, Secret-bearing source files, and broader patch
+  types.
+- Patch output for RBAC rule edits, wildcard resources or verbs,
   multi-resource rule splitting, API-group splitting, ClusterRoleBinding scope
   changes, `resourceNames`, Secret-bearing source files, and broader patch
   types.

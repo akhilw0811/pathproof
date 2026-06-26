@@ -8,15 +8,18 @@ and local Kubernetes YAML directory scans with:
 - `pathproof scan --format json <directory>`
 - `pathproof scan --format=json <directory>`
 - `pathproof scan --preview-patches <directory>`
+- `pathproof scan --write-patches <output-directory> <directory>`
 
 The scan command is intentionally only an orchestration layer. It validates the
 local directory input, parses Kubernetes manifests, constructs the in-memory
 graph, runs deterministic analysis, builds advisory remediation plans for
 supported findings, optionally builds read-only patch previews for supported
-remediation changes, projects findings, plans, and previews into a private CLI
-report shape, and writes either human-readable output or JSON. It does not
-persist the graph or expose graph internals beyond the ordered finding path,
-evidence, remediation plan fields, and optional preview fields.
+remediation changes, optionally writes patched copies for supported generated
+previews to a separate output directory, projects findings, plans, previews,
+and patch output summaries into a private CLI report shape, and writes either
+human-readable output or JSON. It does not persist the graph or expose graph
+internals beyond the ordered finding path, evidence, remediation plan fields,
+optional preview fields, and optional patch output summaries.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -104,7 +107,22 @@ never writes source files. Unsupported actions, mismatched source references,
 namespace-less subjects, single-subject bindings, and source files containing
 core `v1` Secret payload fields produce `unsupported` preview entries.
 
-No live Kubernetes authorization evaluation, verification rescans, patch
-application, persistence, AI, dashboard, plugin system, external service
+Optional patch output generation also lives under `internal/patchpreview`. It
+uses the same in-memory YAML edit logic as preview generation, groups
+compatible generated `NarrowBindingSubject` changes by source-relative path,
+and writes one patched copy per changed source file under a separate output
+directory. It validates input/output directory relationships before preparing
+patches, resolving symlinks and nearest existing parents so output paths cannot
+write into or under the scan root. It prepares all patched file contents before
+creating output files and does not create the output directory when no
+generated patch files exist. Source references may be absolute internally, but
+scan-root-local source references are projected as stable relative paths across
+the CLI report, including findings, evidence, remediation changes, previews,
+and patch output summaries. Unsupported previews are reported but not written.
+Source files containing core `v1` Secret payload fields are not copied or
+written.
+
+No live Kubernetes authorization evaluation, verification rescans, in-place
+patch application, persistence, AI, dashboard, plugin system, external service
 integration, pull request creation, or live Kubernetes cluster integration is
 implemented.

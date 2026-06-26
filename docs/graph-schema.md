@@ -251,6 +251,32 @@ Generated previews contain relative file paths and timestamp-free unified
 diffs. Unsupported previews use `status: "unsupported"` with a deterministic
 `reason` and no `diff`.
 
+When `pathproof scan --write-patches <output-directory>` is used, CLI JSON
+also includes top-level `patch_outputs`. This is a CLI projection, not part of
+the graph schema, and it never includes patched file contents:
+
+```json
+{
+  "patch_outputs": [
+    {
+      "source": "resources.yaml",
+      "output": "patched/resources.yaml",
+      "status": "generated"
+    },
+    {
+      "source": "",
+      "status": "unsupported",
+      "reason": "patch previews support only NarrowBindingSubject"
+    }
+  ]
+}
+```
+
+`source` is the source-relative path. `output` is a display-safe relative path
+for written files. Unsupported entries omit `output` and explain why no file
+was written. If no supported patches exist, `patch_outputs` is present when
+write mode is requested but no patch files are written.
+
 Implemented remediation actions are:
 
 - `RemoveSecretsResource`
@@ -269,7 +295,7 @@ prefers `RemoveSecretsResource` split/remove guidance when that guidance is
 complete, otherwise it omits the unsafe option. Future patch planning may add
 explicit API-group split/narrow guidance.
 
-Plans are advisory and read-only. They do not edit YAML, apply changes, rescan
+Plans are advisory. The planner does not edit YAML, apply changes, rescan
 files, or create pull requests. The planner returns only complete options:
 applying all changes in one option would break the modeled `CanRead` edge for
 that finding. If multiple independent authorization chains contribute to one
@@ -311,7 +337,8 @@ resource rules in the same Role or ClusterRole are still modeled.
 
 The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
-patch application, validation rescans, or attack-path rules beyond
+in-place patch application, validation rescans, or attack-path rules beyond
 `PP-K8S-001`. The scan CLI currently supports local Kubernetes YAML
-directories only. Patch previews are limited to `NarrowBindingSubject` and do
-not cover RBAC rule edits or broader YAML patch types.
+directories only. Patch previews and patch output are limited to
+`NarrowBindingSubject` and do not cover RBAC rule edits, Secret-bearing source
+files, or broader YAML patch types.

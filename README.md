@@ -30,11 +30,15 @@ Implemented Kubernetes support is intentionally small:
   Kubernetes endpoint routes to a workload, that workload runs as a
   ServiceAccount, and that ServiceAccount can read a parsed Secret.
 - Build deterministic, evidence-backed remediation plans for `PP-K8S-001`
-  findings. Plans are advisory and read-only. They do not edit YAML, apply
-  patches, open pull requests, or rescan modified files.
+  findings. Plans are advisory. They do not edit source YAML in place, open
+  pull requests, or rescan modified files.
 - Optionally generate read-only unified diff previews for the
   `NarrowBindingSubject` remediation action. Patch previews are not applied,
   and source files are never modified.
+- Optionally write patched copies for generated `NarrowBindingSubject`
+  previews to a separate new or empty output directory. Source files are never
+  modified, unsupported patch actions are reported but not written, and files
+  with Secret payload fields are not copied or written.
 - Run the local scan pipeline from the CLI for Kubernetes YAML directories.
 
 `PP-K8S-001` findings use fixed rule-based `High` severity. Finding IDs are
@@ -50,6 +54,8 @@ go run ./cmd/pathproof scan ./cmd/pathproof/testdata/scan-safe
 go run ./cmd/pathproof scan --format json ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --format=json ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --preview-patches ./cmd/pathproof/testdata/scan-vulnerable
+go run ./cmd/pathproof scan --write-patches ./patched-yaml ./cmd/pathproof/testdata/scan-vulnerable
+go run ./cmd/pathproof scan --preview-patches --write-patches ./patched-yaml ./cmd/pathproof/testdata/scan-vulnerable
 ```
 
 `pathproof scan` currently supports only local directories containing
@@ -98,6 +104,19 @@ does not write the file. Unsupported actions and unsafe cases are reported as
 `v1` Secret with payload fields are intentionally unsupported for previews so
 diff context cannot expose Secret values.
 
+Patch output is opt-in with `--write-patches <output-directory>`. It uses the
+same supported `NarrowBindingSubject` YAML edit logic as patch previews, writes
+only patched copies to the output directory, and never modifies input files.
+The output directory must be missing or empty, must not be the input directory,
+and must not contain or be contained by the input directory after symlinks are
+resolved. PathProof creates the output directory only when at least one
+generated patch file will be written. If every preview is unsupported, no patch
+files are written and the scan exit code still depends only on whether findings
+exist. Internal source references may be absolute, but scan-root-local source
+references are displayed relative to the scan root in human and JSON output.
+Unsupported actions such as `RemoveSecretsResource` and `RemoveSecretReadVerb`
+are reported but not written.
+
 Scan exit codes are stable:
 
 - `0`: scan succeeded and found zero findings.
@@ -118,9 +137,12 @@ The built binary is written to `bin/pathproof`.
 - Terraform parsing
 - GitHub Actions parsing
 - SBOM parsing
-- Kubernetes Secret values, live-cluster verification, patch application,
-  validation rescans, or pull request creation
+- Kubernetes Secret values, live-cluster verification, in-place patch
+  application, validation rescans, or pull request creation
 - Patch previews for RBAC rule edits, Secret-bearing source files, wildcard
+  resources or verbs, API-group splitting, ClusterRoleBinding scope changes,
+  `resourceNames`, or namespace-less binding subjects
+- Patch output for RBAC rule edits, Secret-bearing source files, wildcard
   resources or verbs, API-group splitting, ClusterRoleBinding scope changes,
   `resourceNames`, or namespace-less binding subjects
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated

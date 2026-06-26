@@ -381,7 +381,7 @@ func TestWriteScanResultPreviewBuilderDoesNotRunWithoutFlag(t *testing.T) {
 	fixture := projectionFixtureWithValidFinding(t)
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, false, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, false, "", &stdout, &stderr)
 
 	assertCode(t, code, 1)
 	assertString(t, "stderr", stderr.String(), "")
@@ -395,7 +395,7 @@ func TestWriteScanResultPreviewInternalErrorLeavesStdoutEmpty(t *testing.T) {
 	fixture := projectionFixtureWithValidFinding(t)
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, true, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, true, "", &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -423,6 +423,482 @@ func TestRunScanPreviewPatchesOutputIsDeterministicAndExcludesSecretValues(t *te
 		}
 	}
 	assertContains(t, firstOut, "Status: unsupported")
+}
+
+func TestRunScanWritePatchesRequiresOutputAndInputDirectories(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing output value", args: []string{"scan", "--write-patches"}, want: "flag needs an argument"},
+		{name: "missing input", args: []string{"scan", "--write-patches", "patched"}, want: "got 0"},
+		{name: "extra input", args: []string{"scan", "--write-patches", "patched", safeFixture, vulnerableFixture}, want: "got 2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, code := runCommand(tt.args...)
+
+			assertCode(t, code, 2)
+			assertString(t, "stdout", stdout, "")
+			assertOneLineStderr(t, stderr)
+			assertContains(t, stderr, tt.want)
+		})
+	}
+}
+
+func TestRunScanWritePatchesRejectsUnsafeOutputDirectories(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	nonEmpty := filepath.Join(parent, "non-empty")
+	if err := os.Mkdir(nonEmpty, 0o700); err != nil {
+		t.Fatalf("mkdir non-empty: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmpty, "existing.yaml"), []byte("kind: ConfigMap\n"), 0o600); err != nil {
+		t.Fatalf("write existing output: %v", err)
+	}
+	fileOutput := filepath.Join(parent, "file-output")
+	if err := os.WriteFile(fileOutput, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write file output: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		output string
+		input  string
+		want   string
+	}{
+		{name: "same as input", output: "scan-preview", input: "scan-preview", want: "differ"},
+		{name: "output inside input", output: filepath.Join("scan-preview", "patched"), input: "scan-preview", want: "must not be inside scan"},
+		{name: "input inside output", output: ".", input: "scan-preview", want: "scan directory must not be inside"},
+		{name: "file output", output: "file-output", input: "scan-preview", want: "not a directory"},
+		{name: "non-empty output", output: "non-empty", input: "scan-preview", want: "must be empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", tt.output, tt.input)
+
+			assertCode(t, code, 2)
+			assertString(t, "stdout", stdout, "")
+			assertOneLineStderr(t, stderr)
+			assertContains(t, stderr, tt.want)
+			if strings.Contains(stderr, parent) {
+				t.Fatalf("stderr contains temp directory prefix: %q", stderr)
+			}
+		})
+	}
+}
+
+func TestRunScanWritePatchesSupportedNarrowBindingSubject(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	inputPath := filepath.Join(parent, "scan-preview", "resources.yaml")
+	original, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatalf("read input fixture: %v", err)
+	}
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", "patched", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 1")
+	assertContains(t, stdout, "Source: resources.yaml")
+	assertContains(t, stdout, "Output: patched/resources.yaml")
+	if strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Diff:") {
+		t.Fatalf("write-only output contains preview diff text: %s", stdout)
+	}
+	if strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("output contains temp directory prefix\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	patched, err := os.ReadFile(filepath.Join(parent, "patched", "resources.yaml"))
+	if err != nil {
+		t.Fatalf("read patched output: %v", err)
+	}
+	if strings.Contains(string(patched), "    name: api\n    namespace: prod") {
+		t.Fatalf("patched output still contains removed ServiceAccount subject:\n%s", patched)
+	}
+	assertContains(t, string(patched), "name: worker")
+	after, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatalf("read input after scan: %v", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("input file changed:\nafter:\n%s\nbefore:\n%s", after, original)
+	}
+}
+
+func TestRunScanWriteAndPreviewPatchesIncludesDiffAndOutputSummary(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--preview-patches", "--write-patches", "patched", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Preview:")
+	assertContains(t, stdout, "Diff:")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 1")
+}
+
+func TestRunScanWritePatchesUnsupportedOnlyWritesNoFiles(t *testing.T) {
+	parent := t.TempDir()
+	outputRoot := filepath.Join(parent, "patched")
+
+	stdout, stderr, code := runCommand("scan", "--write-patches", outputRoot, vulnerableFixture)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 0")
+	assertContains(t, stdout, "Status: unsupported")
+	if _, err := os.Stat(outputRoot); !os.IsNotExist(err) {
+		t.Fatalf("outputRoot stat err = %v, want not exist", err)
+	}
+	if strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("output contains temp directory prefix\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+}
+
+func TestRunScanWritePatchesSafeScanWritesNoFiles(t *testing.T) {
+	parent := t.TempDir()
+	outputRoot := filepath.Join(parent, "patched")
+
+	stdout, stderr, code := runCommand("scan", "--write-patches", outputRoot, safeFixture)
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 0\nNo findings.\n")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 0")
+	if _, err := os.Stat(outputRoot); !os.IsNotExist(err) {
+		t.Fatalf("outputRoot stat err = %v, want not exist", err)
+	}
+}
+
+func TestRunScanPreviewPatchesAloneDoesNotWriteFiles(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--preview-patches", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Preview:")
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected patched directory stat err = %v", err)
+	}
+}
+
+func TestRunScanWritePatchesJSONOutputIncludesPatchOutputsOnlyWhenRequested(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--write-patches", "patched", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.PatchOutputs == nil {
+		t.Fatal("patch_outputs = nil, want output summaries")
+	}
+	generatedCount := 0
+	for _, output := range *report.PatchOutputs {
+		if output.Status == "generated" {
+			generatedCount++
+			if output.Source != "resources.yaml" || output.Output != "patched/resources.yaml" {
+				t.Fatalf("generated patch output = %#v, want resources output", output)
+			}
+		}
+	}
+	if generatedCount != 1 {
+		t.Fatalf("generated patch output count = %d, want 1: %#v", generatedCount, *report.PatchOutputs)
+	}
+	if strings.Contains(stdout, `"patch_previews"`) || strings.Contains(stdout, `"diff"`) {
+		t.Fatalf("write-only JSON contains patch previews or diffs: %s", stdout)
+	}
+	if strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("JSON output contains temp directory prefix\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+
+	defaultStdout, _, _ := runCommandInDir(t, parent, "scan", "--format=json", "scan-preview")
+	if strings.Contains(defaultStdout, "patch_outputs") {
+		t.Fatalf("default JSON contains patch_outputs: %s", defaultStdout)
+	}
+}
+
+func TestRunScanWritePatchesWithAbsoluteInputDirectory(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	inputDir := filepath.Join(parent, "scan-preview")
+	outputDir := filepath.Join(parent, "patched")
+
+	stdout, stderr, code := runCommand("scan", "--write-patches", outputDir, inputDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 1")
+	assertContains(t, stdout, "Source: resources.yaml")
+	assertContains(t, stdout, "Output: patched/resources.yaml")
+	if strings.Contains(stdout, inputDir) || strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	assertContains(t, stdout, "[resources.yaml#document=6]")
+	patched, err := os.ReadFile(filepath.Join(outputDir, "resources.yaml"))
+	if err != nil {
+		t.Fatalf("read patched output: %v", err)
+	}
+	if strings.Contains(string(patched), "    name: api\n    namespace: prod") {
+		t.Fatalf("patched output still contains removed subject:\n%s", patched)
+	}
+}
+
+func TestRunScanWritePatchesJSONWithAbsoluteInputDirectoryUsesRelativeSources(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	inputDir := filepath.Join(parent, "scan-preview")
+	outputDir := filepath.Join(parent, "patched")
+
+	stdout, stderr, code := runCommand("scan", "--format=json", "--write-patches", outputDir, inputDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	if strings.Contains(stdout, inputDir) || strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("JSON output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	report := assertValidJSONReport(t, stdout)
+	if len(report.Findings) != 1 || report.Findings[0].Remediation == nil {
+		t.Fatalf("report missing finding/remediation: %#v", report)
+	}
+	for _, source := range report.Findings[0].SourceReferences {
+		if strings.Contains(source, inputDir) || !strings.Contains(source, "resources.yaml#document=") {
+			t.Fatalf("source reference not relative: %q", source)
+		}
+	}
+	for _, evidence := range report.Findings[0].Evidence {
+		if strings.Contains(evidence.Source, inputDir) || strings.Contains(evidence.Detail, inputDir) {
+			t.Fatalf("evidence contains absolute input path: %#v", evidence)
+		}
+	}
+	for _, option := range report.Findings[0].Remediation.Options {
+		for _, change := range option.Changes {
+			if strings.Contains(change.SourceReference, inputDir) || !strings.Contains(change.SourceReference, "resources.yaml#document=") {
+				t.Fatalf("change source reference not relative: %#v", change)
+			}
+		}
+	}
+	if report.PatchOutputs == nil {
+		t.Fatal("patch_outputs = nil")
+	}
+	for _, output := range *report.PatchOutputs {
+		if strings.Contains(output.Source, inputDir) || strings.Contains(output.Output, inputDir) {
+			t.Fatalf("patch output contains absolute input path: %#v", output)
+		}
+	}
+}
+
+func TestRunScanWritePatchesWithAbsoluteInputDirectoryAndSpacedFilenameUsesRelativeSources(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	renameFixtureFile(t, filepath.Join(parent, "scan-preview"), "resources.yaml", "resources file.yaml")
+	inputDir := filepath.Join(parent, "scan-preview")
+	outputDir := filepath.Join(parent, "patched")
+
+	stdout, stderr, code := runCommand("scan", "--write-patches", outputDir, inputDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	if strings.Contains(stdout, inputDir) || strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	assertContains(t, stdout, "Source: resources file.yaml")
+	assertContains(t, stdout, "Output: patched/resources file.yaml")
+	assertContains(t, stdout, "[resources file.yaml#document=6]")
+	if _, err := os.Stat(filepath.Join(outputDir, "resources file.yaml")); err != nil {
+		t.Fatalf("stat spaced patched output: %v", err)
+	}
+
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", "--write-patches", filepath.Join(parent, "patched-json"), inputDir)
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	if strings.Contains(jsonStdout, inputDir) || strings.Contains(jsonStdout, parent) || strings.Contains(jsonStderr, parent) {
+		t.Fatalf("JSON output contains absolute temp path\nstdout:%s\nstderr:%s", jsonStdout, jsonStderr)
+	}
+	report := assertValidJSONReport(t, jsonStdout)
+	if len(report.Findings) != 1 || report.Findings[0].Remediation == nil {
+		t.Fatalf("report missing finding/remediation: %#v", report)
+	}
+	for _, source := range report.Findings[0].SourceReferences {
+		if strings.Contains(source, inputDir) || !strings.Contains(source, "resources file.yaml#document=") {
+			t.Fatalf("source reference not relative for spaced filename: %q", source)
+		}
+	}
+	for _, option := range report.Findings[0].Remediation.Options {
+		for _, change := range option.Changes {
+			if strings.Contains(change.SourceReference, inputDir) || !strings.Contains(change.SourceReference, "resources file.yaml#document=") {
+				t.Fatalf("change source reference not relative for spaced filename: %#v", change)
+			}
+		}
+	}
+}
+
+func TestRunScanPreviewPatchesWithAbsoluteInputDirectoryUsesRelativeSources(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	inputDir := filepath.Join(parent, "scan-preview")
+
+	stdout, stderr, code := runCommand("scan", "--preview-patches", inputDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	if strings.Contains(stdout, inputDir) || strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("preview output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	assertContains(t, stdout, "File: resources.yaml")
+	assertContains(t, stdout, "--- resources.yaml\n")
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected patched directory stat err = %v", err)
+	}
+
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", "--preview-patches", inputDir)
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	if strings.Contains(jsonStdout, inputDir) || strings.Contains(jsonStdout, parent) || strings.Contains(jsonStderr, parent) {
+		t.Fatalf("preview JSON contains absolute temp path\nstdout:%s\nstderr:%s", jsonStdout, jsonStderr)
+	}
+	report := assertValidJSONReport(t, jsonStdout)
+	previewCount := 0
+	for _, option := range report.Findings[0].Remediation.Options {
+		for _, preview := range option.PatchPreviews {
+			previewCount++
+			if preview.File != "" && preview.File != "resources.yaml" {
+				t.Fatalf("preview file not relative: %#v", preview)
+			}
+		}
+	}
+	if previewCount == 0 {
+		t.Fatalf("no previews in absolute-input report: %#v", report.Findings[0].Remediation)
+	}
+}
+
+func TestRunScanPreviewPatchesWithAbsoluteInputDirectoryAndSpacedFilenameUsesRelativeSources(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	renameFixtureFile(t, filepath.Join(parent, "scan-preview"), "resources.yaml", "resources file.yaml")
+	inputDir := filepath.Join(parent, "scan-preview")
+
+	stdout, stderr, code := runCommand("scan", "--preview-patches", inputDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	if strings.Contains(stdout, inputDir) || strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("preview output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	assertContains(t, stdout, "File: resources file.yaml")
+	assertContains(t, stdout, "--- resources file.yaml\n")
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected patched directory stat err = %v", err)
+	}
+
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", "--preview-patches", inputDir)
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	if strings.Contains(jsonStdout, inputDir) || strings.Contains(jsonStdout, parent) || strings.Contains(jsonStderr, parent) {
+		t.Fatalf("preview JSON contains absolute temp path\nstdout:%s\nstderr:%s", jsonStdout, jsonStderr)
+	}
+	report := assertValidJSONReport(t, jsonStdout)
+	previewCount := 0
+	for _, option := range report.Findings[0].Remediation.Options {
+		for _, preview := range option.PatchPreviews {
+			previewCount++
+			if preview.File != "" && preview.File != "resources file.yaml" {
+				t.Fatalf("preview file not relative for spaced filename: %#v", preview)
+			}
+		}
+	}
+	if previewCount == 0 {
+		t.Fatalf("no previews in spaced absolute-input report: %#v", report.Findings[0].Remediation)
+	}
+}
+
+func TestRunScanDefaultWithAbsoluteInputDirectoryUsesRelativeSources(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	inputDir := filepath.Join(parent, "scan-preview")
+
+	stdout, stderr, code := runCommand("scan", inputDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	if strings.Contains(stdout, inputDir) || strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("default output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	assertContains(t, stdout, "resources.yaml#document=6")
+	if strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Patch Output:") {
+		t.Fatalf("default absolute-input output contains patch sections: %s", stdout)
+	}
+
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", inputDir)
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	if strings.Contains(jsonStdout, inputDir) || strings.Contains(jsonStdout, parent) || strings.Contains(jsonStderr, parent) {
+		t.Fatalf("default JSON contains absolute temp path\nstdout:%s\nstderr:%s", jsonStdout, jsonStderr)
+	}
+	if strings.Contains(jsonStdout, "patch_outputs") || strings.Contains(jsonStdout, "patch_previews") {
+		t.Fatalf("default JSON contains patch fields: %s", jsonStdout)
+	}
+}
+
+func TestNormalizeDisplaySourceReferencesLeavesMalformedAndOutsideReferencesUnchanged(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writePreviewFixture(t, parent, "scan", false)
+	outside := filepath.Join(parent, "outside.yaml")
+	if err := os.WriteFile(outside, []byte("kind: ConfigMap\n"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	values := []string{
+		outside + "#document=1",
+		filepath.Join(root, "resources.yaml") + "#document=1x",
+		filepath.Join(root, "resources.yaml") + "#document=1#extra",
+		filepath.Join(root, "resources.yaml") + "#document=",
+		filepath.Join(root, "resources.yaml") + "#document=-1",
+		filepath.Join(root, "resources.yaml") + "#document=0",
+		filepath.Join(root, "resources.yaml") + "#document=999999999999999999999999999999",
+	}
+	input := strings.Join(values, " ")
+
+	got := normalizeDisplaySourceReferences(root, input)
+
+	assertString(t, "normalized", got, input)
+}
+
+func TestNormalizeDisplaySourceReferencesNormalizesAbsoluteAndRootPrefixedRelativeSources(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan", false)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(parent); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	}()
+
+	input := "absolute=" + filepath.Join(parent, "scan", "resources.yaml") + "#document=1 relative=scan/resources.yaml#document=2 spaced=" + filepath.Join(parent, "scan", "resources file.yaml") + "#document=12"
+	if err := os.WriteFile(filepath.Join(parent, "scan", "resources file.yaml"), []byte("kind: ConfigMap\n"), 0o600); err != nil {
+		t.Fatalf("write spaced file: %v", err)
+	}
+	got := normalizeDisplaySourceReferences("scan", input)
+
+	assertString(t, "normalized", got, "absolute=resources.yaml#document=1 relative=resources.yaml#document=2 spaced=resources file.yaml#document=12")
 }
 
 func TestRunScanReversedInputFileCreationOrderIsDeterministic(t *testing.T) {
@@ -508,7 +984,7 @@ func TestProjectFindingRejectsMissingNode(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport([]analysis.Finding{finding}, g, nil, nil)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing node error")
 	}
@@ -533,7 +1009,7 @@ func TestProjectFindingRejectsMissingEdge(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport([]analysis.Finding{finding}, g, nil, nil)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing edge error")
 	}
@@ -643,7 +1119,7 @@ func TestWriteScanResultRejectsLateInconsistencyWithoutPartialOutput(t *testing.
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, ".", scanFormatHuman, false, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, ".", scanFormatHuman, false, "", &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -666,7 +1142,7 @@ func TestWriteScanResultMissingNodeReturnsTwoWithEmptyStdout(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{finding}, g, ".", scanFormatHuman, false, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{finding}, g, ".", scanFormatHuman, false, "", &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -710,7 +1186,7 @@ func runCommandInDir(t *testing.T, dir string, args ...string) (string, string, 
 
 func writeScanResultForTest(findings []analysis.Finding, g *graph.Graph, format scanFormat) (string, string, int) {
 	var stdout, stderr bytes.Buffer
-	code := writeScanResult(findings, g, ".", format, false, &stdout, &stderr)
+	code := writeScanResult(findings, g, ".", format, false, "", &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
 
@@ -761,8 +1237,9 @@ func projectionFixtureWithValidFinding(t *testing.T) projectionFixture {
 }
 
 type cliJSONReport struct {
-	Findings     []cliJSONFinding `json:"findings"`
-	FindingCount int              `json:"finding_count"`
+	Findings     []cliJSONFinding      `json:"findings"`
+	FindingCount int                   `json:"finding_count"`
+	PatchOutputs *[]cliJSONPatchOutput `json:"patch_outputs,omitempty"`
 }
 
 type cliJSONFinding struct {
@@ -835,6 +1312,13 @@ type cliJSONPatchPreview struct {
 	File         string `json:"file,omitempty"`
 	Diff         string `json:"diff,omitempty"`
 	Reason       string `json:"reason,omitempty"`
+}
+
+type cliJSONPatchOutput struct {
+	Source string `json:"source"`
+	Output string `json:"output,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
 }
 
 func assertValidJSONReport(t *testing.T, output string) cliJSONReport {
@@ -981,6 +1465,13 @@ subjects:
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(files[name]), 0o600); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
+	}
+}
+
+func renameFixtureFile(t *testing.T, dir, oldName, newName string) {
+	t.Helper()
+	if err := os.Rename(filepath.Join(dir, oldName), filepath.Join(dir, newName)); err != nil {
+		t.Fatalf("rename fixture file: %v", err)
 	}
 }
 
