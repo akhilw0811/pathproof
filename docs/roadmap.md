@@ -4,7 +4,8 @@
 
 - Tested Go CLI bootstrap.
 - Deterministic `pathproof version` command.
-- Local Makefile checks and GitHub Actions CI.
+- Local Makefile checks and GitHub Actions CI that builds, tests, generates a
+  demo `pathproof.sarif`, and uploads it as a workflow artifact.
 - In-memory graph with deterministic IDs and evidence-backed nodes and edges.
 - Local Kubernetes YAML parsing for Services, Deployments,
   `networking.k8s.io/v1` Ingresses, ServiceAccounts, core `v1` Secret
@@ -52,7 +53,8 @@
 - Remediation verification.
 - In-place patch application, live validation, force/clobber behavior, Git
   commits, and pull request creation.
-- GitHub code scanning upload or other SARIF upload integrations.
+- GitHub code scanning upload, automatic PR comments, enforced policy gates, or
+  other SARIF upload integrations.
 - Patch previews for RBAC rule edits, wildcard resources or verbs,
   multi-resource rule splitting, API-group splitting, ClusterRoleBinding scope
   changes, `resourceNames`, Secret-bearing source files, and broader patch

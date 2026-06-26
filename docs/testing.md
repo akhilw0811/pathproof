@@ -18,6 +18,15 @@ scan exit code `0`, a vulnerable scan exit code `1`, and an invalid scan exit
 code `2`. Exit code `1` is expected success-with-findings behavior, so the
 shell test captures and checks it explicitly.
 
+GitHub Actions runs the repository check suite, builds `./bin/pathproof`, and
+generates `pathproof.sarif` from the intentionally vulnerable public demo
+fixture. The workflow captures the demo scan exit code and accepts only `1`,
+because findings are expected for that fixture. Exit code `0` would mean the
+demo no longer reports the expected `PP-K8S-001` finding, and exit code `2` or
+any other code is treated as a scan failure. The workflow verifies that the
+SARIF file exists, is non-empty, contains SARIF version `2.1.0`, and contains
+`PP-K8S-001`, then uploads it as a workflow artifact.
+
 Scan command tests cover argument validation, deterministic controlled flag
 errors, accepted `--format json` and `--format=json` syntax, accepted
 `--format sarif` and `--format=sarif` syntax, accepted `--preview-patches`
