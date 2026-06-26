@@ -29,6 +29,7 @@ Implemented Kubernetes support is intentionally small:
 - Analyze the in-memory graph for `PP-K8S-001`, which reports when a public
   Kubernetes endpoint routes to a workload, that workload runs as a
   ServiceAccount, and that ServiceAccount can read a parsed Secret.
+- Run the local scan pipeline from the CLI for Kubernetes YAML directories.
 
 `PP-K8S-001` findings use fixed rule-based `High` severity. Finding IDs are
 deterministic hashes of the rule ID, ordered node IDs, and ordered edge IDs.
@@ -39,13 +40,32 @@ analysis layer preserves graph evidence and does not redact arbitrary content.
 
 ```sh
 go run ./cmd/pathproof version
+go run ./cmd/pathproof scan ./cmd/pathproof/testdata/scan-safe
+go run ./cmd/pathproof scan --format json ./cmd/pathproof/testdata/scan-vulnerable
+go run ./cmd/pathproof scan --format=json ./cmd/pathproof/testdata/scan-vulnerable
 ```
 
-Expected output:
+`pathproof scan` currently supports only local directories containing
+Kubernetes YAML manifests. Human-readable output is the default. JSON output
+uses a stable top-level shape:
 
-```text
-pathproof dev
+```json
+{
+  "findings": [],
+  "finding_count": 0
+}
 ```
+
+Each JSON finding contains the finding ID, rule ID, title, severity, summary,
+ordered `path`, ordered `evidence`, and source references. Each path entry
+contains node `id`, `kind`, and `name`. Each evidence entry contains `edge_id`,
+`kind`, `source`, and `detail`.
+
+Scan exit codes are stable:
+
+- `0`: scan succeeded and found zero findings.
+- `1`: scan succeeded and found one or more findings.
+- `2`: usage, parsing, routing, output, or internal scan error.
 
 ## Development
 
@@ -62,7 +82,6 @@ The built binary is written to `bin/pathproof`.
 - GitHub Actions parsing
 - SBOM parsing
 - Kubernetes Secret values, live-cluster verification, or remediation
-- CLI integration for attack-path analysis
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
   ClusterRoles, and live authorization evaluation
 - AI agents

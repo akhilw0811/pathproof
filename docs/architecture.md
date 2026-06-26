@@ -1,7 +1,18 @@
 # Architecture
 
 PathProof is a small Go CLI with early in-memory graph domain logic. The
-current executable lives at `cmd/pathproof` and supports `pathproof version`.
+current executable lives at `cmd/pathproof` and supports `pathproof version`
+and local Kubernetes YAML directory scans with:
+
+- `pathproof scan <directory>`
+- `pathproof scan --format json <directory>`
+- `pathproof scan --format=json <directory>`
+
+The scan command is intentionally only an orchestration layer. It validates the
+local directory input, parses Kubernetes manifests, constructs the in-memory
+graph, runs deterministic analysis, projects findings into a private CLI report
+shape, and writes either human-readable output or JSON. It does not persist the
+graph or expose graph internals beyond the ordered finding path and evidence.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -42,7 +53,11 @@ metadata show that a supported rule can read a parsed Secret. It does not claim
 that a workload actually issued a Secret read request.
 
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
-graph storage, routing construction, and analysis are separate packages.
+graph storage, routing construction, analysis, and CLI presentation remain
+separate. The CLI report projection is private to `cmd/pathproof`; it resolves
+analysis finding node IDs back to graph node ID/kind/name values and preserves
+finding edge evidence as edge ID/kind/source/detail values. If a finding cannot
+be projected against the graph, the scan is treated as an internal scan error.
 
 Implemented graph analysis lives under `internal/analysis`. It is read-only:
 it consumes the in-memory graph and emits structured findings without changing
@@ -58,7 +73,6 @@ ML-ranked or score-based.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
-redaction. No analysis CLI integration, live Kubernetes authorization
-evaluation, verification, remediation, persistence, AI, dashboard, plugin
-system, external service integration, or live Kubernetes cluster integration is
-implemented.
+redaction. No live Kubernetes authorization evaluation, verification,
+remediation, persistence, AI, dashboard, plugin system, external service
+integration, or live Kubernetes cluster integration is implemented.

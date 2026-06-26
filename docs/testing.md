@@ -12,8 +12,21 @@ make check
 make build
 ```
 
-The bootstrap CLI is tested through `cmd/pathproof` unit tests and a minimal
-integration check that runs `go run ./cmd/pathproof version`.
+The CLI is tested through `cmd/pathproof` unit tests and an integration check
+that builds a temporary binary. Integration coverage asserts `version`, a safe
+scan exit code `0`, a vulnerable scan exit code `1`, and an invalid scan exit
+code `2`. Exit code `1` is expected success-with-findings behavior, so the
+shell test captures and checks it explicitly.
+
+Scan command tests cover argument validation, deterministic controlled flag
+errors, accepted `--format json` and `--format=json` syntax, missing and
+non-directory path errors, human output, JSON output, exactly one trailing
+newline, stderr-only errors, output write failures, deterministic repeated
+output, deterministic input file ordering, and Secret-value absence from stdout
+and stderr. CLI projection tests verify that finding path entries preserve node
+ID/kind/name, evidence entries preserve edge ID/kind/source/detail, and
+inconsistent finding-to-graph projection is treated as an internal scan error
+without partial stdout.
 
 Kubernetes parser tests cover supported manifest parsing, defaulting,
 multi-document source tracking, deterministic ordering, malformed YAML errors,
