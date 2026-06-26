@@ -19,6 +19,7 @@ const (
 	safeFixture       = "testdata/scan-safe"
 	vulnerableFixture = "testdata/scan-vulnerable"
 	invalidFixture    = "testdata/scan-invalid"
+	publicDemoFixture = "../../examples/kubernetes/public-secret-path"
 )
 
 func TestRunVersion(t *testing.T) {
@@ -176,6 +177,82 @@ func TestRunScanVulnerableFixtureReturnsOneAndHumanFinding(t *testing.T) {
 		t.Fatalf("default human output contains patch preview: %s", stdout)
 	}
 	assertExactlyOneTrailingNewline(t, stdout)
+}
+
+func TestRunScanPublicDemoFixtureEndToEnd(t *testing.T) {
+	demoDir, err := filepath.Abs(publicDemoFixture)
+	if err != nil {
+		t.Fatalf("resolve public demo fixture: %v", err)
+	}
+
+	stdout, stderr, code := runCommand("scan", demoDir)
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 1\n")
+	assertContains(t, stdout, "Rule: PP-K8S-001\n")
+	assertContains(t, stdout, "PublicEndpoint kubernetes://prod/service/public-api")
+	assertContains(t, stdout, "Workload kubernetes://prod/deployment/api")
+	assertContains(t, stdout, "ServiceAccount kubernetes://prod/serviceaccount/api")
+	assertContains(t, stdout, "Secret kubernetes://prod/secret/database-password")
+	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
+
+	stdout, stderr, code = runCommand("scan", "--preview-patches", demoDir)
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Option 1: NarrowBindingSubject")
+	assertContains(t, stdout, "Patch Preview:")
+	assertContains(t, stdout, "Status: generated")
+	assertContains(t, stdout, "File: rbac.yaml")
+	assertContains(t, stdout, "--- rbac.yaml\n")
+	assertContains(t, stdout, "+++ rbac.yaml\n")
+	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
+
+	parent := t.TempDir()
+	stdout, stderr, code = runCommandInDir(t, parent, "scan", "--write-patches", "patched", demoDir)
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 1")
+	assertContains(t, stdout, "Source: rbac.yaml")
+	assertContains(t, stdout, "Output: patched/rbac.yaml")
+	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
+	if got := listDirNames(t, filepath.Join(parent, "patched")); !reflect.DeepEqual(got, []string{"rbac.yaml"}) {
+		t.Fatalf("patched output entries = %#v, want only rbac.yaml", got)
+	}
+	patched, err := os.ReadFile(filepath.Join(parent, "patched", "rbac.yaml"))
+	if err != nil {
+		t.Fatalf("read patched demo output: %v", err)
+	}
+	if strings.Contains(string(patched), "name: api\n  namespace: prod") {
+		t.Fatalf("patched output still contains removed ServiceAccount subject:\n%s", patched)
+	}
+	assertContains(t, string(patched), "name: worker")
+
+	stdout, stderr, code = runCommandInDir(t, parent, "scan", "--write-patches", "validated", "--validate-patches", demoDir)
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Validation:")
+	assertContains(t, stdout, ": remediated\n")
+	assertContains(t, stdout, "Summary: PP-K8S-001 no longer appears in patched output.")
+	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
+
+	stdout, stderr, code = runCommandInDir(t, parent, "scan", "--format=json", "--write-patches", "json-patched", "--validate-patches", demoDir)
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 {
+		t.Fatalf("demo JSON findings = %#v, count = %d; want one finding", report.Findings, report.FindingCount)
+	}
+	if report.Findings[0].RuleID != "PP-K8S-001" {
+		t.Fatalf("demo JSON rule_id = %q, want PP-K8S-001", report.Findings[0].RuleID)
+	}
+	if report.PatchOutputs == nil || len(*report.PatchOutputs) == 0 {
+		t.Fatalf("demo JSON patch_outputs = %#v, want generated output", report.PatchOutputs)
+	}
+	if len(report.Validation) != 1 || report.Validation[0].RuleID != "PP-K8S-001" || report.Validation[0].Status != "remediated" {
+		t.Fatalf("demo JSON validation = %#v, want one remediated PP-K8S-001 result", report.Validation)
+	}
+	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
 }
 
 func TestRunScanInvalidFixtureReturnsTwoAndWritesErrorToStderr(t *testing.T) {
@@ -1533,6 +1610,17 @@ func assertContains(t *testing.T, got, want string) {
 	t.Helper()
 	if !strings.Contains(got, want) {
 		t.Fatalf("output = %q, want substring %q", got, want)
+	}
+}
+
+func assertDoesNotContainSecretPayloadFields(t *testing.T, outputs ...string) {
+	t.Helper()
+	for _, output := range outputs {
+		for _, forbidden := range []string{"data:", "stringData:"} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("output contains Secret payload field %q: %s", forbidden, output)
+			}
+		}
 	}
 }
 

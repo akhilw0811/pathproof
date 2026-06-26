@@ -28,6 +28,12 @@ verify that finding path entries preserve node ID/kind/name, evidence entries
 preserve edge ID/kind/source/detail, and inconsistent finding-to-graph
 projection is treated as an internal scan error without partial stdout.
 
+The public demo fixture under `examples/kubernetes/public-secret-path` is
+covered by a CLI smoke test. It asserts the documented loop: vulnerable scan
+exit code `1`, `PP-K8S-001` output, generated `NarrowBindingSubject` preview,
+patched-copy output, validation status `remediated`, structured JSON
+validation, and absence of Secret payload fields in output.
+
 Kubernetes parser tests cover supported manifest parsing, defaulting,
 multi-document source tracking, deterministic ordering, malformed YAML errors,
 and `rbac.authorization.k8s.io/v1` RBAC parsing for Roles, ClusterRoles,
