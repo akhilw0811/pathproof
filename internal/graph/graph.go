@@ -18,6 +18,9 @@ const (
 	Role           NodeKind = "Role"
 	Permission     NodeKind = "Permission"
 	Secret         NodeKind = "Secret"
+	Workflow       NodeKind = "Workflow"
+	WorkflowJob    NodeKind = "WorkflowJob"
+	GitHubAction   NodeKind = "GitHubAction"
 )
 
 type NodeID string
@@ -31,6 +34,8 @@ const (
 	BoundTo          EdgeKind = "BoundTo"
 	GrantsPermission EdgeKind = "GrantsPermission"
 	CanRead          EdgeKind = "CanRead"
+	DefinesJob       EdgeKind = "DefinesJob"
+	UsesAction       EdgeKind = "UsesAction"
 )
 
 var (
@@ -53,6 +58,21 @@ type SourceEvidence struct {
 
 type EdgeMetadata struct {
 	KubernetesCanReadAuthorizations []KubernetesCanReadAuthorization `json:"kubernetes_can_read_authorizations,omitempty"`
+	GitHubActionUse                 *GitHubActionUse                 `json:"github_action_use,omitempty"`
+}
+
+type GitHubActionUse struct {
+	WorkflowSourceReference string `json:"workflow_source_reference"`
+	WorkflowFile            string `json:"workflow_file"`
+	WorkflowName            string `json:"workflow_name,omitempty"`
+	JobID                   string `json:"job_id"`
+	StepIndex               int    `json:"step_index"`
+	StepName                string `json:"step_name,omitempty"`
+	Uses                    string `json:"uses"`
+	Owner                   string `json:"owner,omitempty"`
+	Repo                    string `json:"repo,omitempty"`
+	Path                    string `json:"path,omitempty"`
+	Ref                     string `json:"ref,omitempty"`
 }
 
 type KubernetesCanReadAuthorization struct {
@@ -303,6 +323,10 @@ func cloneEdge(edge Edge) Edge {
 	}
 	metadata := *edge.Metadata
 	metadata.KubernetesCanReadAuthorizations = cloneKubernetesCanReadAuthorizations(metadata.KubernetesCanReadAuthorizations)
+	if metadata.GitHubActionUse != nil {
+		actionUse := *metadata.GitHubActionUse
+		metadata.GitHubActionUse = &actionUse
+	}
 	edge.Metadata = &metadata
 	return edge
 }

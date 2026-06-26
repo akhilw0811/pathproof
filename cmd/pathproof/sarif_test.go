@@ -111,10 +111,10 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	}
 	run := report.Runs[0]
 	assertString(t, "driver name", run.Tool.Driver.Name, "PathProof")
-	if len(run.Tool.Driver.Rules) != 1 {
-		t.Fatalf("rules len = %d, want 1", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 2 {
+		t.Fatalf("rules len = %d, want 2", len(run.Tool.Driver.Rules))
 	}
-	rule := run.Tool.Driver.Rules[0]
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-K8S-001")
 	assertString(t, "rule id", rule.ID, "PP-K8S-001")
 	assertString(t, "rule name", rule.Name, "Public workload can read Kubernetes Secret")
 	assertString(t, "rule short description", rule.ShortDescription.Text, "Public workload can read Kubernetes Secret")
@@ -158,6 +158,69 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	}
 	assertExactlyOneTrailingNewline(t, stdout)
 	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsSARIFOutputShapeAndFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "build workflow.yml", `name: Build
+env:
+  TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - name: Publish
+        uses: owner/repo/path@v1.2.3
+        with:
+          token: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	run := report.Runs[0]
+	if len(run.Tool.Driver.Rules) != 2 {
+		t.Fatalf("rules len = %d, want 2", len(run.Tool.Driver.Rules))
+	}
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-001")
+	assertString(t, "rule id", rule.ID, "PP-GHA-001")
+	assertString(t, "rule name", rule.Name, "GitHub Actions workflow uses an action that is not pinned to a full commit SHA")
+	assertContains(t, rule.FullDescription.Text, "uses:")
+	assertContains(t, rule.FullDescription.Text, "40-character commit SHA")
+	assertString(t, "rule default level", rule.DefaultConfiguration.Level, "warning")
+	if strings.Contains(rule.Name+rule.ShortDescription.Text+rule.FullDescription.Text+rule.Help.Text, legacyGitHubActionsRuleWording()) {
+		t.Fatalf("SARIF rule uses old inaccurate wording: %#v", rule)
+	}
+	if len(run.Results) != 1 {
+		t.Fatalf("results len = %d, want 1: %#v", len(run.Results), run.Results)
+	}
+	result := run.Results[0]
+	assertString(t, "ruleId", result.RuleID, "PP-GHA-001")
+	assertString(t, "level", result.Level, "warning")
+	assertContains(t, result.Message.Text, "Workflow githubactions://.github/workflows/build workflow.yml")
+	assertContains(t, result.Message.Text, "GitHubAction githubactions://.github/workflows/build workflow.yml/job/test/step/1/action/owner/repo/path@v1.2.3")
+	if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+		t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+	}
+	assertString(t, "severity", result.Properties.Severity, "Medium")
+	if len(result.Properties.NodeIDs) != 3 || len(result.Properties.EdgeIDs) != 2 {
+		t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want 3/2", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+	}
+	gotURIs := locationURIs(result.Locations)
+	wantURIs := []string{".github/workflows/build%20workflow.yml#document=1"}
+	if !reflectDeepEqualStrings(gotURIs, wantURIs) {
+		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
+	}
+	wantDisplay := []string{".github/workflows/build workflow.yml#document=1"}
+	if !reflectDeepEqualStrings(result.Properties.SourceReferences, wantDisplay) {
+		t.Fatalf("SARIF source references = %#v, want %#v", result.Properties.SourceReferences, wantDisplay)
+	}
+	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) {
+		t.Fatalf("SARIF output contains old inaccurate wording: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
 }
 
 func TestRunScanSARIFRealLocationsAndReferences(t *testing.T) {
@@ -436,6 +499,17 @@ func assertValidSARIFReport(t *testing.T, output string) cliSARIFLog {
 		t.Fatalf("SARIF version = %q, want 2.1.0", report.Version)
 	}
 	return report
+}
+
+func mustSARIFRule(t *testing.T, rules []cliSARIFRule, id string) cliSARIFRule {
+	t.Helper()
+	for _, rule := range rules {
+		if rule.ID == id {
+			return rule
+		}
+	}
+	t.Fatalf("SARIF rule %q not found in %#v", id, rules)
+	return cliSARIFRule{}
 }
 
 func locationURIs(locations []cliSARIFLocation) []string {

@@ -20,9 +20,18 @@
 - Kubernetes Secret graph construction for parsed Secret metadata and static
   RBAC-derived ServiceAccount `CanRead` edges. Secret values are never
   ingested.
+- Local GitHub Actions workflow parsing under `.github/workflows` for
+  workflow name, job IDs, step indexes, optional step names, and static
+  `uses:` values. Workflow env values, with values, secrets, token values, run
+  scripts, and raw workflow documents are not retained.
+- Minimal GitHub Actions workflow/job/action-use graph construction with
+  `Workflow`, `WorkflowJob`, `GitHubAction`, `DefinesJob`, and `UsesAction`.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
+- Read-only deterministic GitHub Actions analysis for `PP-GHA-001`: workflow
+  action references not pinned to exactly 40 hexadecimal commit characters,
+  with fixed rule-based `Medium` severity and deterministic finding IDs.
 - Read-only deterministic remediation planning for `PP-K8S-001`, using typed
   structured `CanRead` authorization metadata. Implemented advisory actions are
   `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
@@ -40,16 +49,24 @@
   Validation builds a temporary complete patched manifest set from the input
   directory plus generated patch files, rescans it locally, and reports
   remediated, failed, or skipped results for supported `PP-K8S-001` findings.
-- Local Kubernetes YAML scan CLI for `pathproof scan <directory>` with
-  human-readable finding, remediation, and optional patch preview output, JSON
-  output, SARIF 2.1.0 finding output, and stable exit codes.
-- Local findings-only SARIF export for `PP-K8S-001`. SARIF artifact locations
-  use safe relative URIs when clean structured source references are available.
+- Local Kubernetes YAML and GitHub Actions workflow scan CLI for
+  `pathproof scan <directory>` with human-readable finding, supported
+  Kubernetes remediation and optional patch preview output, JSON output, SARIF
+  2.1.0 finding output, and stable exit codes.
+- Local findings-only SARIF export for `PP-K8S-001` and `PP-GHA-001`. SARIF
+  artifact locations use safe relative URIs when clean structured source
+  references are available.
 
 ## Later
 
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
+- Full CI/CD attack-path modeling.
+- GitHub Actions workflow permissions analysis.
+- GitHub Actions OIDC trust analysis.
+- Reusable workflow resolution.
+- Action source inspection.
+- Automatic GitHub Actions action pinning patches.
 - Remediation verification.
 - In-place patch application, live validation, force/clobber behavior, Git
   commits, and pull request creation.
