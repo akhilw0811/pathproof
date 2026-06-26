@@ -111,8 +111,8 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	}
 	run := report.Runs[0]
 	assertString(t, "driver name", run.Tool.Driver.Name, "PathProof")
-	if len(run.Tool.Driver.Rules) != 4 {
-		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 5 {
+		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-K8S-001")
 	assertString(t, "rule id", rule.ID, "PP-K8S-001")
@@ -181,8 +181,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 4 {
-		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 5 {
+		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-001")
 	assertString(t, "rule id", rule.ID, "PP-GHA-001")
@@ -246,8 +246,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 4 {
-		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 5 {
+		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-002")
 	assertString(t, "rule id", rule.ID, "PP-GHA-002")
@@ -305,8 +305,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 4 {
-		t.Fatalf("rules len = %d, want 4", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 5 {
+		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-003")
 	assertString(t, "rule id", rule.ID, "PP-GHA-003")
@@ -343,6 +343,68 @@ jobs:
 		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
 	}
 	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanCrossDomainSARIFOutputShapeAndFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "cross domain.yml", `name: Cross domain
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCRole("deploy", "repo:owner/repo:pull_request"))
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	run := report.Runs[0]
+	if len(run.Tool.Driver.Rules) != 5 {
+		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
+	}
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-XDOMAIN-001")
+	assertString(t, "rule id", rule.ID, "PP-XDOMAIN-001")
+	assertString(t, "rule name", rule.Name, "Risky GitHub Actions workflow can assume AWS IAM role")
+	assertContains(t, rule.FullDescription.Text, "cross-domain path")
+	assertString(t, "rule default level", rule.DefaultConfiguration.Level, "error")
+	assertContains(t, rule.Help.Text, "does not execute workflows")
+
+	var result cliSARIFResult
+	for _, candidate := range run.Results {
+		if candidate.RuleID == "PP-XDOMAIN-001" {
+			result = candidate
+			break
+		}
+	}
+	if result.RuleID == "" {
+		t.Fatalf("PP-XDOMAIN-001 SARIF result not found: %#v", run.Results)
+	}
+	assertString(t, "level", result.Level, "error")
+	assertContains(t, result.Message.Text, "workflow-level OIDC token capability")
+	assertContains(t, result.Message.Text, "AWS IAM role")
+	if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+		t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+	}
+	assertString(t, "severity", result.Properties.Severity, "High")
+	if len(result.Properties.NodeIDs) != 3 || len(result.Properties.EdgeIDs) != 2 {
+		t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want workflow cross-domain path", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+	}
+	gotURIs := locationURIs(result.Locations)
+	wantURIs := []string{".github/workflows/cross%20domain.yml#document=1"}
+	if !reflectDeepEqualStrings(gotURIs, wantURIs) {
+		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
+	}
+	for _, forbidden := range []string{"FAKE_CLI_XDOMAIN_GHA_ENV_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN_GHA_RUN_SECRET_DO_NOT_RETAIN", "assume_role_policy", "Principal", "Condition", "arn:aws:iam"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
 }
 
 func TestRunScanSARIFRealLocationsAndReferences(t *testing.T) {

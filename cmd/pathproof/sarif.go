@@ -107,6 +107,7 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 							sarifGitHubActionsUnpinnedActionRule(),
 							sarifGitHubActionsUnsafePullRequestTargetCheckoutRule(),
 							sarifGitHubActionsDangerousPermissionsRule(),
+							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule(),
 						},
 					},
 				},
@@ -172,6 +173,20 @@ func sarifGitHubActionsDangerousPermissionsRule() sarifRule {
 	}
 }
 
+func sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule() sarifRule {
+	const title = "Risky GitHub Actions workflow can assume AWS IAM role"
+	return sarifRule{
+		ID:               string(analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects a deterministic local cross-domain path where a risky GitHub Actions workflow or job has OIDC capability that can assume a statically modeled AWS IAM role trust."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "error",
+		},
+		Help: sarifMessage{Text: "Review the risky pull_request_target workflow condition and the AWS IAM role trust. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, or provide remediation for this rule."},
+	}
+}
+
 func newSARIFResult(root string, finding scanFinding) sarifResult {
 	sourceReferences := sarifSourceReferences(root, finding)
 	locations := make([]sarifLocation, 0, len(sourceReferences))
@@ -204,7 +219,7 @@ func newSARIFResult(root string, finding scanFinding) sarifResult {
 }
 
 func sarifFindingMessage(finding scanFinding) string {
-	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions) && finding.Summary != "" {
+	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole) && finding.Summary != "" {
 		return finding.Summary
 	}
 	parts := make([]string, 0, len(finding.Path))

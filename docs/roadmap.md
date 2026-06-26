@@ -44,11 +44,11 @@
   metadata and ignores variables, locals, modules, data sources, `jsonencode`,
   function calls, interpolation, dynamic blocks, nonliteral policies, and
   `aws_iam_policy_document`.
-- Graph-only AWS IAM OIDC trust modeling with `AWSIAMRole` nodes and optional
+- AWS IAM OIDC trust modeling with `AWSIAMRole` nodes and optional
   `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edges when
   `pathproof scan --repo OWNER/REPO` supplies repository identity and a static
-  GitHub Actions subject candidate matches the trust policy. This does not
-  create a finding by itself.
+  GitHub Actions subject candidate matches the trust policy. This trust edge
+  does not create a finding by itself.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
@@ -64,6 +64,11 @@
   workflow-level or job-level token permissions, with fixed rule-based `High`
   severity and deterministic finding IDs. Exact GitHub permission
   inheritance/override modeling is not implemented.
+- Read-only deterministic cross-domain analysis for `PP-XDOMAIN-001`: risky
+  GitHub Actions workflow or job OIDC capability can assume a locally modeled
+  AWS IAM role through a statically parsed OIDC trust. This first slice uses
+  only existing graph edges and structured PP-GHA-002/PP-GHA-003 risk metadata,
+  calls no cloud APIs, performs no IAM simulation, and has no remediation.
 - Read-only deterministic remediation planning for `PP-K8S-001`, using typed
   structured `CanRead` authorization metadata. Implemented advisory actions are
   `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
@@ -84,11 +89,11 @@
 - Local Kubernetes YAML, GitHub Actions workflow, and narrow Terraform scan CLI for
   `pathproof scan <directory>` with human-readable finding, supported
   Kubernetes remediation and optional patch preview output, optional
-  `--repo OWNER/REPO` graph-only OIDC trust matching, JSON output, SARIF 2.1.0
-  finding output, and stable exit codes.
+  `--repo OWNER/REPO` OIDC trust matching, JSON output, SARIF 2.1.0 finding
+  output, and stable exit codes.
 - Local findings-only SARIF export for `PP-K8S-001`, `PP-GHA-001`, and
-  `PP-GHA-002`, and `PP-GHA-003`. SARIF artifact locations use safe relative
-  URIs when clean structured source references are available.
+  `PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`. SARIF artifact locations
+  use safe relative URIs when clean structured source references are available.
 
 ## Later
 
@@ -100,7 +105,8 @@
   interpolation, `jsonencode`, and `aws_iam_policy_document`.
 - Cloud provider API validation for OIDC providers, accounts, ARNs, and roles.
 - IAM simulation or broad IAM condition evaluation.
-- GitHub Actions OIDC trust findings.
+- Additional GitHub Actions OIDC trust findings beyond the first
+  PP-XDOMAIN-001 slice.
 - Broader cloud trust-policy ingestion for GitHub Actions OIDC.
 - Reusable workflow resolution.
 - CI/CD-to-cloud path analysis.

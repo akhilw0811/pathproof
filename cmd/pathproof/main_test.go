@@ -175,6 +175,159 @@ jobs:
 	}
 }
 
+func TestRunScanCrossDomainWorkflowLevelOIDCAndRiskEmitsFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `name: Cross domain
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  audit:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCRole("deploy", "repo:owner/repo:pull_request"))
+
+	stdout, stderr, code := runCommand("scan", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-XDOMAIN-001\n")
+	assertContains(t, stdout, "Title: Risky GitHub Actions workflow can assume AWS IAM role\n")
+	assertContains(t, stdout, "Severity: High\n")
+	assertContains(t, stdout, "workflow-level OIDC token capability")
+	assertContains(t, stdout, "OIDCTokenCapability githubactions://.github/workflows/unsafe.yml/oidc-token/workflow")
+	assertContains(t, stdout, "AWSIAMRole aws://terraform/aws_iam_role/infra/iam.tf/deploy")
+	assertContains(t, stdout, "permissions: write-all")
+	assertContains(t, stdout, "infra/iam.tf#resource=aws_iam_role.deploy")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-XDOMAIN-001 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	assertDoesNotContainCrossDomainSecretValues(t, stdout, stderr)
+	if strings.Contains(stdout, dir) || strings.Contains(stderr, dir) {
+		t.Fatalf("output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+}
+
+func TestRunScanCrossDomainJSONRiskSignalAndRepoMatching(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `on: pull_request_target
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_CLI_XDOMAIN_GHA_WITH_SECRET_DO_NOT_RETAIN
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCRole("deploy", "repo:owner/repo:pull_request"))
+
+	stdout, stderr, code := runCommand("scan", "--format=json", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	var crossDomain []cliJSONFinding
+	for _, finding := range report.Findings {
+		if finding.RuleID == "PP-XDOMAIN-001" {
+			crossDomain = append(crossDomain, finding)
+			if finding.RiskSignal == nil {
+				t.Fatalf("risk_signal = nil for PP-XDOMAIN-001: %#v", finding)
+			}
+			if finding.Remediation != nil {
+				t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+			}
+		} else if finding.RiskSignal != nil {
+			t.Fatalf("%s JSON finding has risk_signal: %#v", finding.RuleID, finding)
+		}
+	}
+	if len(crossDomain) != 2 {
+		t.Fatalf("PP-XDOMAIN-001 count = %d, want PP-GHA-002 and PP-GHA-003 risk findings: %#v", len(crossDomain), report.Findings)
+	}
+	seenRisk := map[string]bool{}
+	for _, finding := range crossDomain {
+		seenRisk[finding.RiskSignal.RuleID] = true
+		if len(finding.Path) != 3 || len(finding.Evidence) != 2 {
+			t.Fatalf("path/evidence lengths = %d/%d, want workflow-level cross-domain path", len(finding.Path), len(finding.Evidence))
+		}
+		if finding.RiskSignal.RuleID == "PP-GHA-002" {
+			if finding.RiskSignal.JobID != "deploy" || finding.RiskSignal.StepIndex == nil || len(finding.RiskSignal.Selectors) != 1 {
+				t.Fatalf("PP-GHA-002 risk_signal = %#v", finding.RiskSignal)
+			}
+		}
+		if strings.Contains(finding.SourceReferences[0], dir) {
+			t.Fatalf("source reference contains temp dir: %#v", finding.SourceReferences)
+		}
+	}
+	if !seenRisk["PP-GHA-002"] || !seenRisk["PP-GHA-003"] {
+		t.Fatalf("risk signals = %#v, want PP-GHA-002 and PP-GHA-003", seenRisk)
+	}
+	assertDoesNotContainCrossDomainSecretValues(t, stdout, stderr)
+	for _, forbidden := range []string{"${{", "assume_role_policy", "Principal", "Condition", "arn:aws:iam"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+
+	noRepoStdout, noRepoStderr, noRepoCode := runCommand("scan", "--format=json", dir)
+	assertCode(t, noRepoCode, 1)
+	assertString(t, "no repo stderr", noRepoStderr, "")
+	assertNoRuleInJSONReport(t, noRepoStdout, "PP-XDOMAIN-001")
+
+	nonmatchingStdout, nonmatchingStderr, nonmatchingCode := runCommand("scan", "--format=json", "--repo", "other/repo", dir)
+	assertCode(t, nonmatchingCode, 1)
+	assertString(t, "nonmatching stderr", nonmatchingStderr, "")
+	assertNoRuleInJSONReport(t, nonmatchingStdout, "PP-XDOMAIN-001")
+}
+
+func TestRunScanCrossDomainSafeOIDCTrustAloneExitsZero(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on: pull_request
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - run: echo deploy
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCRole("deploy", "repo:owner/repo:pull_request"))
+
+	stdout, stderr, code := runCommand("scan", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Finding count: 0\nNo findings.\n")
+}
+
+func TestRunScanCrossDomainPatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("mkdir scan root: %v", err)
+	}
+	writeGitHubActionsWorkflowForTest(t, root, "unsafe.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCRole("deploy", "repo:owner/repo:pull_request"))
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--repo", "owner/repo", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-XDOMAIN-001\n")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 0")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-XDOMAIN-001 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestScanDirectoryWithRepoCreatesTerraformCanAssumeRoleGraphEdge(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on:
@@ -2424,7 +2577,25 @@ type cliJSONFinding struct {
 	Path             []cliJSONPathNode   `json:"path"`
 	Evidence         []cliJSONEvidence   `json:"evidence"`
 	SourceReferences []string            `json:"source_references"`
+	RiskSignal       *cliJSONRiskSignal  `json:"risk_signal,omitempty"`
 	Remediation      *cliJSONRemediation `json:"remediation,omitempty"`
+}
+
+type cliJSONRiskSignal struct {
+	RuleID          string                `json:"rule_id"`
+	SourceReference string                `json:"source_reference"`
+	WorkflowFile    string                `json:"workflow_file"`
+	JobID           string                `json:"job_id,omitempty"`
+	StepIndex       *int                  `json:"step_index,omitempty"`
+	Selectors       []cliJSONRiskSelector `json:"selectors,omitempty"`
+	Permission      string                `json:"permission,omitempty"`
+	Access          string                `json:"access,omitempty"`
+	Summary         string                `json:"summary"`
+}
+
+type cliJSONRiskSelector struct {
+	Field             string `json:"field"`
+	MatchedExpression string `json:"matched_expression"`
 }
 
 type cliJSONPathNode struct {
@@ -2999,6 +3170,32 @@ func assertDoesNotContainGitHubActionsSecretValues(t *testing.T, outputs ...stri
 			if strings.Contains(output, forbidden) {
 				t.Fatalf("output contains GitHub Actions secret-like value %q: %s", forbidden, output)
 			}
+		}
+	}
+}
+
+func assertDoesNotContainCrossDomainSecretValues(t *testing.T, outputs ...string) {
+	t.Helper()
+	for _, output := range outputs {
+		for _, forbidden := range []string{
+			"FAKE_CLI_XDOMAIN_GHA_ENV_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN_GHA_WITH_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN_GHA_RUN_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN_TF_SECRET_DO_NOT_RETAIN",
+		} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("output contains cross-domain secret-like value %q: %s", forbidden, output)
+			}
+		}
+	}
+}
+
+func assertNoRuleInJSONReport(t *testing.T, output, ruleID string) {
+	t.Helper()
+	report := assertValidJSONReport(t, output)
+	for _, finding := range report.Findings {
+		if finding.RuleID == ruleID {
+			t.Fatalf("JSON report contains %s: %#v", ruleID, report.Findings)
 		}
 	}
 }

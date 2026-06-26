@@ -194,9 +194,29 @@ The analyzer does not emit a finding for `CanRequestOIDCToken` alone because
 `id-token: write` is not necessarily vulnerable without additional unsafe
 trigger context or cloud trust-policy evidence. Existing `PP-GHA-003` behavior
 continues to report `id-token: write` under `pull_request_target`.
-`CanAssumeRole` is also graph-only. The analyzer does not emit a finding for
-a matched AWS IAM role trust relationship by itself because OIDC trust is not
-automatically a vulnerability.
+`CanAssumeRole` is also not a finding by itself because OIDC trust is not
+automatically a vulnerability. `PP-XDOMAIN-001` is emitted only when an
+explicitly modeled workflow-level or job-level OIDC capability reaches a
+matched AWS IAM role trust and the same workflow/job has a structured
+GitHub Actions risk signal from `PP-GHA-002` or `PP-GHA-003`. The supported
+cross-domain paths are:
+
+`Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole`
+
+and:
+
+`Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole`
+
+Workflow-level dangerous permission risk pairs only with workflow-level OIDC.
+Job-level dangerous permission risk pairs only with same-job OIDC. Unsafe
+checkout risk is a job/step risk and pairs with same-job OIDC when modeled; it
+also pairs with explicit workflow-level OIDC when that workflow-level
+capability is modeled. PathProof does not infer exact GitHub permission
+inheritance or override behavior. Because the current risk signals are
+`pull_request_target` risks, the matched role-assumption edge must use the
+`repo:OWNER/REPO:pull_request` subject candidate; branch-only, environment-only,
+or other subject matches on the same OIDC capability do not produce this
+finding.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
@@ -208,9 +228,9 @@ read-only: it consumes the graph and analysis findings, validates supported
 authorization metadata, and emits complete advisory options. It does not parse
 human-readable evidence prose and does not modify source manifests. The
 implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
-`NarrowBindingSubject`. `PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003` receive
-no remediation plan, patch preview, patch output, or validation result in this
-slice.
+`NarrowBindingSubject`. `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, and
+`PP-XDOMAIN-001` receive no remediation plan, patch preview, patch output, or
+validation result in this slice.
 
 Optional patch preview generation lives under `internal/patchpreview`. It is
 also read-only: it consumes the scan root and remediation plans, resolves
@@ -248,8 +268,8 @@ output directory, and never prints temporary paths or manifest contents.
 
 SARIF output is a findings-only CLI projection. `pathproof scan --format sarif`
 emits SARIF 2.1.0 with one PathProof tool driver, deterministic rule entries
-for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003`, and one result
-per finding.
+for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, and
+`PP-XDOMAIN-001`, and one result per finding.
 SARIF stdout
 omits patch previews, patch output
 summaries, validation results, unified diffs, patched file contents, temporary
@@ -264,8 +284,9 @@ because parser source tracking is currently file/document scoped.
 No live Kubernetes authorization evaluation, GitHub API integration, workflow
 execution, expression evaluation, reusable workflow resolution, action source
 inspection, exact GitHub workflow permission inheritance/override modeling,
-full CI/CD attack-path modeling, cloud provider integration, Terraform
-execution, broad HCL parsing, module or variable evaluation, IAM simulation,
-cross-domain findings, live validation, in-place patch application,
+full CI/CD attack-path modeling beyond the first GitHub Actions OIDC to AWS IAM
+role trust finding, cloud provider integration, Terraform execution, broad HCL
+parsing, module or variable evaluation, IAM simulation, live validation,
+in-place patch application,
 persistence, AI, dashboard, plugin system, external service integration, pull
 request creation, or live Kubernetes cluster integration is implemented.

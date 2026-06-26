@@ -54,17 +54,28 @@ entries preserve edge ID/kind/source/detail, one-node workflow-level findings
 project safely, malformed one-node findings are rejected, generic multi-node
 path edge continuity is enforced, and inconsistent finding-to-graph projection
 is treated as an internal scan error without partial stdout.
+Cross-domain CLI coverage asserts that `PP-XDOMAIN-001` appears only when a
+modeled risky GitHub Actions workflow/job OIDC path reaches a matching AWS IAM
+role trust with `--repo OWNER/REPO`, that missing or nonmatching `--repo`
+omits the cross-domain finding, that safe OIDC trust alone exits `0`, that
+human and JSON output include sanitized workflow/job, OIDC capability, AWS role,
+and risk-signal data, and that patch/write/validation flags do not attach
+remediation, patch previews, or validation results to `PP-XDOMAIN-001`.
 
 SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
 PathProof driver run, deterministic rule entries for `PP-K8S-001`,
-`PP-GHA-001`, `PP-GHA-002`, and `PP-GHA-003`, one result for vulnerable
-fixtures, zero results for safe fixtures, deterministic rule/result fields,
+`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`, one result for
+vulnerable fixtures, zero results for safe fixtures, deterministic rule/result fields,
 byte-identical repeated scans, and unchanged exit codes. GitHub Actions SARIF
 coverage asserts `PP-GHA-001` severity maps to `warning`, `PP-GHA-002` and
 `PP-GHA-003` severities map to `error`, workflow artifact URIs are relative
 and URI-safe, line numbers are not guessed, rule text avoids the old inaccurate
 scope wording, sanitized selector and permission evidence is present, and
-secret-like workflow values are absent.
+secret-like workflow values are absent. Cross-domain SARIF coverage asserts
+`PP-XDOMAIN-001` rule metadata, `error` level, finding-summary messages,
+workflow source as the primary URI-safe location, stable
+`pathproofFindingId` fingerprints, and absence of raw Terraform trust policy
+content and secret-like values.
 Source-location
 tests cover URI-encoded relative artifact URIs for paths with spaces,
 display-safe relative `properties.source_references`, omission of malformed
@@ -197,6 +208,17 @@ when identity inputs change, sanitized summaries/evidence for
 `permissions: write-all`, secret exclusion, and PP-GHA-002 and PP-GHA-003
 firing on the same workflow. Analysis coverage also asserts that a push
 workflow with graph-only OIDC token capability does not create a finding.
+Cross-domain analysis tests cover workflow-level OIDC plus workflow-level risk,
+job-level OIDC plus job-level risk, explicit workflow-level and job-level OIDC
+paths to the same AWS role both emitting when both are modeled, exact duplicate
+identity deduplication, PP-GHA-001 alone not triggering, safe OIDC trust alone
+not triggering, risk without `CanAssumeRole` not triggering, unsafe checkout
+risk pairing with same-job and explicit workflow-level OIDC, stable and
+sensitive finding IDs, repeated-analysis determinism, strict path evidence, and
+sanitized optional `risk_signal` data that is omitted from existing rule JSON.
+Regression coverage asserts that a `pull_request_target` risk does not produce
+`PP-XDOMAIN-001` when the only role trust match is for a different OIDC subject,
+such as a push branch ref.
 
 Remediation tests cover the read-only `internal/remediation.Build` API for
 `PP-K8S-001`. Coverage asserts complete advisory options for

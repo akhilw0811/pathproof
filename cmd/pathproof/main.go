@@ -408,8 +408,26 @@ type scanFinding struct {
 	Path             []scanPathNode     `json:"path"`
 	Evidence         []scanEvidence     `json:"evidence"`
 	SourceReferences []string           `json:"source_references"`
+	RiskSignal       *scanRiskSignal    `json:"risk_signal,omitempty"`
 	Remediation      *scanRemediation   `json:"remediation,omitempty"`
 	SARIFSources     []string           `json:"-"`
+}
+
+type scanRiskSignal struct {
+	RuleID          analysis.RuleID             `json:"rule_id"`
+	SourceReference string                      `json:"source_reference"`
+	WorkflowFile    string                      `json:"workflow_file"`
+	JobID           string                      `json:"job_id,omitempty"`
+	StepIndex       *int                        `json:"step_index,omitempty"`
+	Selectors       []scanGitHubActionsSelector `json:"selectors,omitempty"`
+	Permission      string                      `json:"permission,omitempty"`
+	Access          string                      `json:"access,omitempty"`
+	Summary         string                      `json:"summary"`
+}
+
+type scanGitHubActionsSelector struct {
+	Field             string `json:"field"`
+	MatchedExpression string `json:"matched_expression"`
 }
 
 type scanPathNode struct {
@@ -572,6 +590,7 @@ func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scan
 		sourceReferences = append(sourceReferences, normalizeDisplaySourceReferences(root, source))
 	}
 	sarifSources := structuredFindingSourceReferences(finding, g)
+	riskSignal := projectRiskSignal(root, finding.RiskSignal)
 
 	return scanFinding{
 		ID:               finding.ID,
@@ -582,8 +601,41 @@ func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scan
 		Path:             path,
 		Evidence:         evidence,
 		SourceReferences: sourceReferences,
+		RiskSignal:       riskSignal,
 		SARIFSources:     sarifSources,
 	}, nil
+}
+
+func projectRiskSignal(root string, risk *analysis.RiskSignal) *scanRiskSignal {
+	if risk == nil {
+		return nil
+	}
+	selectors := make([]scanGitHubActionsSelector, 0, len(risk.Selectors))
+	for _, selector := range risk.Selectors {
+		selectors = append(selectors, scanGitHubActionsSelector{
+			Field:             selector.Field,
+			MatchedExpression: selector.MatchedExpression,
+		})
+	}
+	return &scanRiskSignal{
+		RuleID:          risk.RuleID,
+		SourceReference: normalizeDisplaySourceReferences(root, risk.SourceReference),
+		WorkflowFile:    risk.WorkflowFile,
+		JobID:           risk.JobID,
+		StepIndex:       cloneIntPointer(risk.StepIndex),
+		Selectors:       selectors,
+		Permission:      risk.Permission,
+		Access:          risk.Access,
+		Summary:         risk.Summary,
+	}
+}
+
+func cloneIntPointer(value *int) *int {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func structuredFindingSourceReferences(finding analysis.Finding, g *graph.Graph) []string {
@@ -683,8 +735,11 @@ func projectRemediation(root string, plan remediation.Plan, previews []patchprev
 }
 
 func normalizeDisplaySourceReferences(root, value string) string {
-	if root == "" || value == "" || !strings.Contains(value, "#document=") {
+	if root == "" || value == "" || (!strings.Contains(value, "#document=") && !strings.Contains(value, "#resource=")) {
 		return value
+	}
+	if normalized := normalizeDisplaySourceReference(root, value); normalized != value {
+		return normalized
 	}
 	var out strings.Builder
 	offset := 0
@@ -751,28 +806,42 @@ func isPotentialSourceReferenceStart(b byte) bool {
 
 func normalizeDisplaySourceReference(root, value string) string {
 	index := strings.LastIndex(value, "#document=")
+	marker := "#document="
+	if index < 0 {
+		index = strings.LastIndex(value, "#resource=")
+		marker = "#resource="
+	}
 	if index < 0 {
 		return value
 	}
 	filename := value[:index]
-	documentValue := value[index+len("#document="):]
-	if filename == "" || documentValue == "" || strings.Contains(documentValue, "#") {
+	referenceValue := value[index+len(marker):]
+	if filename == "" || referenceValue == "" || strings.Contains(referenceValue, "#") {
 		return value
 	}
-	for _, r := range documentValue {
-		if r < '0' || r > '9' {
+	switch marker {
+	case "#document=":
+		for _, r := range referenceValue {
+			if r < '0' || r > '9' {
+				return value
+			}
+		}
+		documentIndex, err := strconv.Atoi(referenceValue)
+		if err != nil || documentIndex <= 0 {
 			return value
 		}
-	}
-	documentIndex, err := strconv.Atoi(documentValue)
-	if err != nil || documentIndex <= 0 {
-		return value
+	case "#resource=":
+		for _, r := range referenceValue {
+			if r <= 0x20 || r == 0x7f || r == '/' || r == '\\' {
+				return value
+			}
+		}
 	}
 	rel, ok := displayRelativeSourcePath(root, filename)
 	if !ok {
 		return value
 	}
-	return rel + "#document=" + documentValue
+	return rel + marker + referenceValue
 }
 
 func displayRelativeSourcePath(root, filename string) (string, bool) {
