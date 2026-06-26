@@ -198,17 +198,21 @@ type observedRole struct {
 }
 
 type resolvedBinding struct {
-	subject     parserkubernetes.Subject
-	role        graph.Node
-	roleKind    string
-	roleSource  *parserkubernetes.Source
-	rules       []parserkubernetes.PolicyRule
-	binding     parserkubernetes.Source
-	bindingKind string
-	bindingName string
-	scopeKind   string
-	scopeName   string
-	unresolved  bool
+	subject                             parserkubernetes.Subject
+	supportedServiceAccountSubjectCount int
+	role                                graph.Node
+	roleKind                            string
+	roleNamespace                       string
+	roleName                            string
+	roleSource                          *parserkubernetes.Source
+	rules                               []parserkubernetes.PolicyRule
+	binding                             parserkubernetes.Source
+	bindingKind                         string
+	bindingNamespace                    string
+	bindingName                         string
+	scopeKind                           string
+	scopeName                           string
+	unresolved                          bool
 }
 
 type observedSecret struct {
@@ -425,17 +429,21 @@ func resolveSupportedBindings(roleBindings []parserkubernetes.RoleBinding, clust
 
 		for _, subject := range subjects {
 			resolved = append(resolved, resolvedBinding{
-				subject:     subject,
-				role:        roleNode,
-				roleKind:    roleKind,
-				roleSource:  roleSource,
-				rules:       rules,
-				binding:     binding.Source,
-				bindingKind: "RoleBinding",
-				bindingName: binding.Name,
-				scopeKind:   "namespace",
-				scopeName:   binding.Namespace,
-				unresolved:  unresolved,
+				subject:                             subject,
+				supportedServiceAccountSubjectCount: len(subjects),
+				role:                                roleNode,
+				roleKind:                            roleKind,
+				roleNamespace:                       roleNamespaceForRoleBinding(binding.Namespace, binding.RoleRef.Kind),
+				roleName:                            binding.RoleRef.Name,
+				roleSource:                          roleSource,
+				rules:                               rules,
+				binding:                             binding.Source,
+				bindingKind:                         "RoleBinding",
+				bindingNamespace:                    binding.Namespace,
+				bindingName:                         binding.Name,
+				scopeKind:                           "namespace",
+				scopeName:                           binding.Namespace,
+				unresolved:                          unresolved,
 			})
 		}
 	}
@@ -468,16 +476,18 @@ func resolveSupportedBindings(roleBindings []parserkubernetes.RoleBinding, clust
 
 		for _, subject := range subjects {
 			resolved = append(resolved, resolvedBinding{
-				subject:     subject,
-				role:        roleNode,
-				roleKind:    roleKind,
-				roleSource:  roleSource,
-				rules:       rules,
-				binding:     binding.Source,
-				bindingKind: "ClusterRoleBinding",
-				bindingName: binding.Name,
-				scopeKind:   "cluster",
-				unresolved:  unresolved,
+				subject:                             subject,
+				supportedServiceAccountSubjectCount: len(subjects),
+				role:                                roleNode,
+				roleKind:                            roleKind,
+				roleName:                            binding.RoleRef.Name,
+				roleSource:                          roleSource,
+				rules:                               rules,
+				binding:                             binding.Source,
+				bindingKind:                         "ClusterRoleBinding",
+				bindingName:                         binding.Name,
+				scopeKind:                           "cluster",
+				unresolved:                          unresolved,
 			})
 		}
 	}
@@ -486,6 +496,13 @@ func resolveSupportedBindings(roleBindings []parserkubernetes.RoleBinding, clust
 		return resolvedBindingLess(resolved[i], resolved[j])
 	})
 	return resolved
+}
+
+func roleNamespaceForRoleBinding(bindingNamespace, roleRefKind string) string {
+	if roleRefKind == "Role" {
+		return bindingNamespace
+	}
+	return ""
 }
 
 func explicitServiceAccountSubjects(subjects []parserkubernetes.Subject) []parserkubernetes.Subject {
@@ -638,6 +655,7 @@ func addDesiredSecretsAndReads(desired *desiredGraph, bindings []resolvedBinding
 	}
 
 	canReadEvidenceRecords := make(map[boundToKey]map[string]struct{})
+	canReadAuthorizations := make(map[boundToKey]map[string]graph.KubernetesCanReadAuthorization)
 	for _, binding := range bindings {
 		if binding.unresolved || binding.roleSource == nil {
 			continue
@@ -663,8 +681,17 @@ func addDesiredSecretsAndReads(desired *desiredGraph, bindings []resolvedBinding
 				if canReadEvidenceRecords[key] == nil {
 					canReadEvidenceRecords[key] = make(map[string]struct{})
 				}
+				if canReadAuthorizations[key] == nil {
+					canReadAuthorizations[key] = make(map[string]graph.KubernetesCanReadAuthorization)
+				}
 				for _, verb := range matchedVerbs {
 					canReadEvidenceRecords[key][canReadEvidenceRecord(binding, permissionHash, string(permissionJSON), verb, secret)] = struct{}{}
+					authorization := canReadAuthorization(binding, rule, permissionHash, verb, secret)
+					identity, err := canReadAuthorizationIdentity(authorization)
+					if err != nil {
+						return fmt.Errorf("canonicalize secret read authorization for %s %s: %w", binding.roleKind, binding.role.Name, err)
+					}
+					canReadAuthorizations[key][identity] = authorization
 				}
 			}
 		}
@@ -686,7 +713,18 @@ func addDesiredSecretsAndReads(desired *desiredGraph, bindings []resolvedBinding
 			records = append(records, record)
 		}
 		sort.Strings(records)
-		desired.addEdge(graph.NewEdge(graph.CanRead, key.from, key.to, aggregatedCanReadEvidence(records)))
+		authorizations := make([]graph.KubernetesCanReadAuthorization, 0, len(canReadAuthorizations[key]))
+		for _, authorization := range canReadAuthorizations[key] {
+			authorizations = append(authorizations, authorization)
+		}
+		sort.Slice(authorizations, func(i, j int) bool {
+			left, _ := canReadAuthorizationIdentity(authorizations[i])
+			right, _ := canReadAuthorizationIdentity(authorizations[j])
+			return left < right
+		})
+		edge := graph.NewEdge(graph.CanRead, key.from, key.to, aggregatedCanReadEvidence(records))
+		edge.Metadata = &graph.EdgeMetadata{KubernetesCanReadAuthorizations: authorizations}
+		desired.addEdge(edge)
 	}
 	return nil
 }
@@ -792,6 +830,43 @@ func canReadEvidenceRecord(binding resolvedBinding, permissionHash, permissionJS
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "; ")
+}
+
+func canReadAuthorization(binding resolvedBinding, rule parserkubernetes.PolicyRule, permissionHash, matchedVerb string, secret observedSecret) graph.KubernetesCanReadAuthorization {
+	return graph.KubernetesCanReadAuthorization{
+		BindingKind:                         binding.bindingKind,
+		BindingNamespace:                    binding.bindingNamespace,
+		BindingName:                         binding.bindingName,
+		BindingSourceReference:              sourceRef(binding.binding),
+		BindingSupportedServiceAccountCount: binding.supportedServiceAccountSubjectCount,
+		ServiceAccountNamespace:             binding.subject.Namespace,
+		ServiceAccountName:                  binding.subject.Name,
+		RoleKind:                            binding.roleKind,
+		RoleNamespace:                       binding.roleNamespace,
+		RoleName:                            binding.roleName,
+		RoleSourceReference:                 sourceRef(*binding.roleSource),
+		PermissionSHA256:                    permissionHash,
+		Permission: graph.KubernetesPermission{
+			APIGroups:     canonicalStrings(rule.APIGroups),
+			Resources:     canonicalStrings(rule.Resources),
+			ResourceNames: canonicalStrings(rule.ResourceNames),
+			Verbs:         canonicalStrings(rule.Verbs),
+		},
+		MatchedVerb:            matchedVerb,
+		ScopeKind:              binding.scopeKind,
+		ScopeName:              binding.scopeName,
+		SecretNamespace:        secret.secret.Namespace,
+		SecretName:             secret.secret.Name,
+		SecretSourceReferences: append([]string(nil), secret.sourceRefs...),
+	}
+}
+
+func canReadAuthorizationIdentity(authorization graph.KubernetesCanReadAuthorization) (string, error) {
+	data, err := json.Marshal(authorization)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func aggregatedCanReadEvidence(records []string) graph.SourceEvidence {

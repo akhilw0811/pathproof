@@ -86,6 +86,49 @@ evidence records. Each record identifies the binding, role, canonical
 permission hash and JSON, matched verb, effective scope, and all observed
 source records for the Secret.
 
+`CanRead` edges also include optional typed metadata:
+
+```json
+{
+  "metadata": {
+    "kubernetes_can_read_authorizations": [
+      {
+        "binding_kind": "RoleBinding",
+        "binding_namespace": "prod",
+        "binding_name": "read-secrets",
+        "binding_source_reference": "resources.yaml#document=6",
+        "binding_supported_service_account_count": 1,
+        "service_account_namespace": "prod",
+        "service_account_name": "api",
+        "role_kind": "Role",
+        "role_namespace": "prod",
+        "role_name": "secret-reader",
+        "role_source_reference": "resources.yaml#document=5",
+        "permission_sha256": "...",
+        "permission": {
+          "apiGroups": [""],
+          "resources": ["secrets"],
+          "resourceNames": null,
+          "verbs": ["get"]
+        },
+        "matched_verb": "get",
+        "scope_kind": "namespace",
+        "scope_name": "prod",
+        "secret_namespace": "prod",
+        "secret_name": "database-password",
+        "secret_source_references": ["resources.yaml#document=4"]
+      }
+    ]
+  }
+}
+```
+
+This metadata is the remediation planner's input. The planner does not parse
+the aggregated evidence prose. Metadata contains only deterministic identities,
+source references, canonical permission fields, and matched authorization
+facts. It never includes Secret values, raw manifests, YAML snippets, or
+arbitrary metadata maps.
+
 PathProof's static Secret read model is:
 
 - `get` or `*` with empty `resourceNames` matches every parsed Secret in the
@@ -152,6 +195,76 @@ Each CLI JSON finding includes the finding `id`, `rule_id`, `title`,
 `name`. Each evidence entry contains `edge_id`, `kind`, `source`, and `detail`.
 Path and evidence order match the deterministic analysis chain order.
 
+When a complete remediation plan exists, the CLI finding also includes:
+
+```json
+{
+  "remediation": {
+    "id": "plan:...",
+    "finding_id": "finding:...",
+    "rule_id": "PP-K8S-001",
+    "summary": "...",
+    "options": [
+      {
+        "priority": 2,
+        "action": "RemoveSecretsResource",
+        "summary": "...",
+        "rationale": "...",
+        "requires_all_changes": false,
+        "changes": [
+          {
+            "action": "RemoveSecretsResource",
+            "target": {
+              "kind": "Role",
+              "namespace": "prod",
+              "name": "secret-reader"
+            },
+            "summary": "...",
+            "source_reference": "resources.yaml#document=5",
+            "permission_sha256": "..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Implemented remediation actions are:
+
+- `RemoveSecretsResource`
+- `RemoveSecretReadVerb`
+- `NarrowBindingSubject`
+
+`RemoveSecretsResource` is emitted only for core-only `apiGroups: [""]`
+permissions where removing or splitting the non-wildcard `secrets` resource
+entry can remove all modeled Secret-resource access for the contributing
+chain. A rule that still contains `resources: ["*"]`, `apiGroups: ["*"]`, or a
+mixed/non-core API group is not treated as remediated by removing only a
+literal `secrets` entry. `RemoveSecretReadVerb` is emitted only for core-only
+`apiGroups: [""]`, Secret-only resource rules. For multi-resource,
+wildcard-resource, wildcard API-group, or mixed API-group rules, PathProof
+prefers `RemoveSecretsResource` split/remove guidance when that guidance is
+complete, otherwise it omits the unsafe option. Future patch planning may add
+explicit API-group split/narrow guidance.
+
+Plans are advisory and read-only. They do not edit YAML, generate patches,
+apply changes, rescan files, or create pull requests. The planner returns only
+complete options: applying all changes in one option would break the modeled
+`CanRead` edge for that finding. If multiple independent authorization chains
+contribute to one `CanRead` edge, a complete option contains one required
+change per chain and marks that all listed changes must be applied together.
+If no complete option can be generated from structured metadata, no plan is
+reported for that finding.
+
+Plan IDs are stable SHA-256 hashes over canonical JSON containing the finding
+ID and ordered canonical option identities. Option identities contain priority,
+action, and ordered canonical change identities. Change identities contain the
+action, target kind/namespace/name, permission SHA-256 when applicable,
+binding or role source reference, matched verb or subject when applicable, and
+other canonical action parameters. Summary, rationale, constraints prose, and
+evidence string ordering are excluded from identity.
+
 Observed Roles or ClusterRoles with empty `rules` can still appear as reachable
 Role nodes and have `BoundTo` edges, but they create no Permission nodes and no
 `GrantsPermission` edges. Missing role references create unresolved Role nodes
@@ -167,5 +280,6 @@ resource rules in the same Role or ClusterRole are still modeled.
 
 The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
-remediation, or attack-path rules beyond `PP-K8S-001`. The scan CLI currently
-supports local Kubernetes YAML directories only.
+YAML editing, patch generation, remediation application, validation rescans,
+or attack-path rules beyond `PP-K8S-001`. The scan CLI currently supports
+local Kubernetes YAML directories only.

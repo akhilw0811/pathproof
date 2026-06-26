@@ -167,6 +167,10 @@ func TestRunScanVulnerableFixtureReturnsOneAndHumanFinding(t *testing.T) {
 	assertContains(t, stdout, "Evidence:\n  - RoutesTo edge:")
 	assertContains(t, stdout, "  - CanRead edge:")
 	assertContains(t, stdout, "Sources:")
+	assertContains(t, stdout, "Remediation:")
+	assertContains(t, stdout, "Option 1: RemoveSecretsResource")
+	assertContains(t, stdout, "Option 2: RemoveSecretReadVerb")
+	assertContains(t, stdout, "Changes:")
 	assertExactlyOneTrailingNewline(t, stdout)
 }
 
@@ -218,9 +222,45 @@ func TestRunScanJSONOutputIsStructured(t *testing.T) {
 			t.Fatalf("evidence[%d] missing fields: %#v", i, evidence)
 		}
 	}
+	if finding.Remediation == nil {
+		t.Fatal("remediation = nil, want structured remediation plan")
+	}
+	if finding.Remediation.ID == "" || finding.Remediation.FindingID != finding.ID || finding.Remediation.RuleID != finding.RuleID {
+		t.Fatalf("remediation identity = %#v, finding = %#v", finding.Remediation, finding)
+	}
+	if len(finding.Remediation.Options) == 0 {
+		t.Fatalf("remediation options empty: %#v", finding.Remediation)
+	}
+	for _, option := range finding.Remediation.Options {
+		if option.Action == "" || option.Priority == 0 || option.Summary == "" || option.Rationale == "" {
+			t.Fatalf("remediation option missing fields: %#v", option)
+		}
+		if len(option.Changes) == 0 {
+			t.Fatalf("remediation option has no changes: %#v", option)
+		}
+		for _, change := range option.Changes {
+			if change.Action == "" || change.Target.Kind == "" || change.Target.Name == "" || change.Summary == "" || change.SourceReference == "" {
+				t.Fatalf("remediation change missing fields: %#v", change)
+			}
+		}
+	}
 	assertExactlyOneTrailingNewline(t, stdout)
 	if strings.Contains(stdout, "Finding count:") || strings.Contains(stdout, "Rule:") {
 		t.Fatalf("json stdout contains human text: %q", stdout)
+	}
+}
+
+func TestRunScanSafeFixtureJSONContainsNoRemediationPlans(t *testing.T) {
+	stdout, stderr, code := runCommand("scan", "--format=json", safeFixture)
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("safe report = %#v, want no findings", report)
+	}
+	if strings.Contains(stdout, "remediation") {
+		t.Fatalf("safe stdout contains remediation: %s", stdout)
 	}
 }
 
@@ -301,6 +341,14 @@ func TestRunScanMultipleFindingsFollowAnalysisOrder(t *testing.T) {
 			t.Fatalf("findings are not in deterministic analysis order: %#v", report.Findings)
 		}
 	}
+	for _, finding := range report.Findings {
+		if finding.Remediation == nil {
+			t.Fatalf("finding %s remediation = nil, want matching plan", finding.ID)
+		}
+		if finding.Remediation.FindingID != finding.ID {
+			t.Fatalf("remediation finding_id = %q, want %q", finding.Remediation.FindingID, finding.ID)
+		}
+	}
 }
 
 func TestProjectFindingRejectsMissingNode(t *testing.T) {
@@ -318,7 +366,7 @@ func TestProjectFindingRejectsMissingNode(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport([]analysis.Finding{finding}, g)
+	_, err := newScanReport([]analysis.Finding{finding}, g, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing node error")
 	}
@@ -343,7 +391,7 @@ func TestProjectFindingRejectsMissingEdge(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport([]analysis.Finding{finding}, g)
+	_, err := newScanReport([]analysis.Finding{finding}, g, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing edge error")
 	}
@@ -365,7 +413,8 @@ func TestWriteScanResultRejectsUnrelatedFirstEdgeWithEmptyStdout(t *testing.T) {
 	assertString(t, "stdout", stdout, "")
 	assertOneLineStderr(t, stderr)
 	assertContains(t, stderr, "internal scan error")
-	assertContains(t, stderr, "inconsistent finding projection")
+	assertContains(t, stderr, "build remediation plans")
+	assertContains(t, stderr, "connects")
 }
 
 func TestWriteScanResultRejectsReversedEdgeWithEmptyStdout(t *testing.T) {
@@ -416,7 +465,7 @@ func TestWriteScanResultRejectsEdgeCountMismatchWithEmptyStdout(t *testing.T) {
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout, "")
 	assertOneLineStderr(t, stderr)
-	assertContains(t, stderr, "edge count")
+	assertContains(t, stderr, "path edges")
 }
 
 func TestWriteScanResultValidFindingProjectsInHumanAndJSON(t *testing.T) {
@@ -558,14 +607,15 @@ type cliJSONReport struct {
 }
 
 type cliJSONFinding struct {
-	ID               string            `json:"id"`
-	RuleID           string            `json:"rule_id"`
-	Title            string            `json:"title"`
-	Severity         string            `json:"severity"`
-	Summary          string            `json:"summary"`
-	Path             []cliJSONPathNode `json:"path"`
-	Evidence         []cliJSONEvidence `json:"evidence"`
-	SourceReferences []string          `json:"source_references"`
+	ID               string              `json:"id"`
+	RuleID           string              `json:"rule_id"`
+	Title            string              `json:"title"`
+	Severity         string              `json:"severity"`
+	Summary          string              `json:"summary"`
+	Path             []cliJSONPathNode   `json:"path"`
+	Evidence         []cliJSONEvidence   `json:"evidence"`
+	SourceReferences []string            `json:"source_references"`
+	Remediation      *cliJSONRemediation `json:"remediation,omitempty"`
 }
 
 type cliJSONPathNode struct {
@@ -579,6 +629,40 @@ type cliJSONEvidence struct {
 	Kind   string `json:"kind"`
 	Source string `json:"source"`
 	Detail string `json:"detail"`
+}
+
+type cliJSONRemediation struct {
+	ID        string                     `json:"id"`
+	FindingID string                     `json:"finding_id"`
+	RuleID    string                     `json:"rule_id"`
+	Summary   string                     `json:"summary"`
+	Options   []cliJSONRemediationOption `json:"options"`
+}
+
+type cliJSONRemediationOption struct {
+	Priority           int                        `json:"priority"`
+	Action             string                     `json:"action"`
+	Summary            string                     `json:"summary"`
+	Rationale          string                     `json:"rationale"`
+	RequiresAllChanges bool                       `json:"requires_all_changes"`
+	Changes            []cliJSONRemediationChange `json:"changes"`
+	Constraints        []string                   `json:"constraints,omitempty"`
+}
+
+type cliJSONRemediationChange struct {
+	Action           string                   `json:"action"`
+	Target           cliJSONRemediationTarget `json:"target"`
+	Summary          string                   `json:"summary"`
+	SourceReference  string                   `json:"source_reference"`
+	PermissionSHA256 string                   `json:"permission_sha256,omitempty"`
+	MatchedVerb      string                   `json:"matched_verb,omitempty"`
+	Subject          string                   `json:"subject,omitempty"`
+}
+
+type cliJSONRemediationTarget struct {
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
 }
 
 func assertValidJSONReport(t *testing.T, output string) cliJSONReport {

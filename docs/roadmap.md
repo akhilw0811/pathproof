@@ -22,14 +22,22 @@
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
+- Read-only deterministic remediation planning for `PP-K8S-001`, using typed
+  structured `CanRead` authorization metadata. Implemented advisory actions are
+  `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
+  Plans contain only complete options; multi-chain Secret read access requires
+  coordinated changes in one option.
 - Local Kubernetes YAML scan CLI for `pathproof scan <directory>` with
-  human-readable output, JSON output, and stable exit codes.
+  human-readable finding and remediation output, JSON output, and stable exit
+  codes.
 
 ## Later
 
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Remediation verification.
+- YAML editing, patch generation, remediation application, validation rescans,
+  and pull request creation.
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
   ClusterRoles, Secret values, broader Secret attack-path coverage,
   live-cluster authorization verification, and remediation when a concrete task
