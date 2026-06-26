@@ -23,6 +23,7 @@ const (
 	GitHubAction        NodeKind = "GitHubAction"
 	OIDCTokenCapability NodeKind = "OIDCTokenCapability"
 	AWSIAMRole          NodeKind = "AWSIAMRole"
+	AWSPermission       NodeKind = "AWSPermission"
 )
 
 type NodeID string
@@ -65,6 +66,7 @@ type NodeMetadata struct {
 	GitHubActionsWorkflow            *GitHubActionsWorkflow            `json:"github_actions_workflow,omitempty"`
 	GitHubActionsOIDCTokenCapability *GitHubActionsOIDCTokenCapability `json:"github_actions_oidc_token_capability,omitempty"`
 	AWSIAMRole                       *AWSIAMRoleMetadata               `json:"aws_iam_role,omitempty"`
+	AWSPermission                    *AWSPermissionMetadata            `json:"aws_permission,omitempty"`
 }
 
 type EdgeMetadata struct {
@@ -108,6 +110,20 @@ type AWSCanAssumeRoleMetadata struct {
 	WorkflowFile                  string `json:"workflow_file"`
 	Scope                         string `json:"scope"`
 	JobID                         string `json:"job_id,omitempty"`
+}
+
+type AWSPermissionMetadata struct {
+	Provider                 string   `json:"provider"`
+	SourceReference          string   `json:"source_reference"`
+	PolicyResourceName       string   `json:"policy_resource_name,omitempty"`
+	AttachmentResourceName   string   `json:"attachment_resource_name,omitempty"`
+	AttachedRoleResourceName string   `json:"attached_role_resource_name"`
+	StatementIndex           int      `json:"statement_index,omitempty"`
+	Actions                  []string `json:"actions,omitempty"`
+	Resources                []string `json:"resources,omitempty"`
+	ManagedPolicyARN         string   `json:"managed_policy_arn,omitempty"`
+	Administrative           bool     `json:"administrative"`
+	AdminReason              string   `json:"admin_reason,omitempty"`
 }
 
 type GitHubActionsWorkflow struct {
@@ -422,6 +438,12 @@ func cloneNode(node Node) Node {
 			role := *metadata.AWSIAMRole
 			role.TrustStatements = cloneAWSOIDCTrustStatements(role.TrustStatements)
 			metadata.AWSIAMRole = &role
+		}
+		if metadata.AWSPermission != nil {
+			permission := *metadata.AWSPermission
+			permission.Actions = cloneStrings(permission.Actions)
+			permission.Resources = cloneStrings(permission.Resources)
+			metadata.AWSPermission = &permission
 		}
 		node.Metadata = &metadata
 	}

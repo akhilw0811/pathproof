@@ -384,6 +384,237 @@ permissions:
 	}
 }
 
+func TestRunScanAWSIAMRoleAdminPolicyHumanOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeTerraformForTest(t, dir, "infra/iam.tf", `variable "token" {
+  default = "FAKE_CLI_AWS_TF_VARIABLE_SECRET_DO_NOT_RETAIN"
+}
+
+resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "admin" {
+  role = aws_iam_role.deploy.id
+  policy = <<EOF
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Action": "*",
+    "Resource": "*"
+  }
+}
+EOF
+}
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 1\n")
+	assertContains(t, stdout, "Rule: PP-AWS-001\n")
+	assertContains(t, stdout, "Title: AWS IAM role grants administrative permissions\n")
+	assertContains(t, stdout, "Severity: High\n")
+	assertContains(t, stdout, "AWSIAMRole aws://terraform/aws_iam_role/infra/iam.tf/deploy")
+	assertContains(t, stdout, "AWSPermission aws://terraform/aws_permission/")
+	assertContains(t, stdout, "action_star_resource_star")
+	assertContains(t, stdout, "infra/iam.tf#resource=aws_iam_role_policy.admin")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-AWS-001 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	assertDoesNotContainTerraformAWSSecretValues(t, stdout, stderr)
+	for _, forbidden := range []string{"Statement", "assume_role_policy", "policy ="} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanAWSIAMRoleAdministratorAccessJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeTerraformForTest(t, dir, "iam.tf", `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy_attachment" "admin" {
+  role       = aws_iam_role.deploy.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "readonly" {
+  role       = aws_iam_role.deploy.name
+  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=json", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 {
+		t.Fatalf("report = %#v, want one finding", report)
+	}
+	finding := report.Findings[0]
+	if finding.RuleID != "PP-AWS-001" || finding.Severity != "High" {
+		t.Fatalf("finding = %#v, want PP-AWS-001 High", finding)
+	}
+	if finding.Remediation != nil {
+		t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+	}
+	if len(finding.Path) != 2 || len(finding.Evidence) != 1 {
+		t.Fatalf("path/evidence lengths = %d/%d, want 2/1", len(finding.Path), len(finding.Evidence))
+	}
+	assertContains(t, stdout, "administrator_access_managed_policy")
+	assertContains(t, stdout, "arn:aws:iam::aws:policy/AdministratorAccess")
+	for _, forbidden := range []string{"ReadOnlyAccess", "Statement", "policy ="} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanAWSIAMRoleNonAdminPolicyExitsZero(t *testing.T) {
+	dir := t.TempDir()
+	writeTerraformForTest(t, dir, "iam.tf", `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}}"
+}
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Finding count: 0\nNo findings.\n")
+}
+
+func TestRunScanAWSIAMRoleDynamicRoleExpressionIsIgnoredAndSanitized(t *testing.T) {
+	dir := t.TempDir()
+	writeTerraformForTest(t, dir, "iam.tf", `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "admin" {
+  role = aws_iam_role.deploy.id[count.index]
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}"
+}
+`)
+
+	findings, g, err := scanDirectory(dir)
+	if err != nil {
+		t.Fatalf("scan directory: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+	if countGraphNodes(g, graph.AWSPermission) != 0 || countGraphEdges(g, graph.GrantsPermission) != 0 {
+		t.Fatalf("graph modeled dynamic role permission: nodes=%#v edges=%#v", g.Nodes(), g.Edges())
+	}
+
+	humanStdout, humanStderr, humanCode := runCommand("scan", dir)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", dir)
+	sarifStdout, sarifStderr, sarifCode := runCommand("scan", "--format=sarif", dir)
+
+	assertCode(t, humanCode, 0)
+	assertCode(t, jsonCode, 0)
+	assertCode(t, sarifCode, 0)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "json stderr", jsonStderr, "")
+	assertString(t, "sarif stderr", sarifStderr, "")
+	assertString(t, "human stdout", humanStdout, "Finding count: 0\nNo findings.\n")
+	assertString(t, "json stdout", jsonStdout, "{\"findings\":[],\"finding_count\":0}\n")
+	sarif := assertValidSARIFReport(t, sarifStdout)
+	if len(sarif.Runs[0].Results) != 0 {
+		t.Fatalf("SARIF results = %#v, want none", sarif.Runs[0].Results)
+	}
+	for _, output := range []string{humanStdout, humanStderr, jsonStdout, jsonStderr, sarifStdout, sarifStderr} {
+		for _, forbidden := range []string{"AWSPermission", "count.index", "aws_iam_role.deploy.id[count.index]"} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("output contains dynamic role expression text %q: %s", forbidden, output)
+			}
+		}
+	}
+	for _, output := range []string{humanStdout, humanStderr, jsonStdout, jsonStderr} {
+		if strings.Contains(output, "PP-AWS-001") {
+			t.Fatalf("non-SARIF output contains PP-AWS-001 for ignored dynamic role expression: %s", output)
+		}
+	}
+}
+
+func TestScanAWSIAMRolePermissionIDsStableAcrossDifferentRoots(t *testing.T) {
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	terraform := `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "admin" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}"
+}
+`
+	writeTerraformForTest(t, firstRoot, "infra/iam.tf", terraform)
+	writeTerraformForTest(t, secondRoot, "infra/iam.tf", terraform)
+
+	firstFindings, firstGraph, err := scanDirectory(firstRoot)
+	if err != nil {
+		t.Fatalf("scan first directory: %v", err)
+	}
+	secondFindings, secondGraph, err := scanDirectory(secondRoot)
+	if err != nil {
+		t.Fatalf("scan second directory: %v", err)
+	}
+	firstPermissionID := onlyGraphNodeIDOfKind(t, firstGraph, graph.AWSPermission)
+	secondPermissionID := onlyGraphNodeIDOfKind(t, secondGraph, graph.AWSPermission)
+	if firstPermissionID != secondPermissionID {
+		t.Fatalf("AWSPermission IDs differ across roots:\nfirst: %s\nsecond:%s", firstPermissionID, secondPermissionID)
+	}
+	firstAWS := onlyCLIFindingByRule(t, firstFindings, analysis.RuleAWSIAMRoleAdministrativePermissions)
+	secondAWS := onlyCLIFindingByRule(t, secondFindings, analysis.RuleAWSIAMRoleAdministrativePermissions)
+	if firstAWS.ID != secondAWS.ID {
+		t.Fatalf("PP-AWS-001 finding IDs differ across roots:\nfirst: %s\nsecond:%s", firstAWS.ID, secondAWS.ID)
+	}
+
+	stdout, stderr, code := runCommand("scan", firstRoot)
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	if strings.Contains(stdout, firstRoot) || strings.Contains(stderr, firstRoot) {
+		t.Fatalf("CLI output leaked scan root\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+}
+
+func TestRunScanAWSIAMRoleMalformedPolicyJSONErrorIsSanitized(t *testing.T) {
+	dir := t.TempDir()
+	writeTerraformForTest(t, dir, "iam.tf", `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "admin" {
+  role = aws_iam_role.deploy.id
+  policy = <<EOF
+{"Statement": []} FAKE_CLI_AWS_TF_TRAILING_SECRET_DO_NOT_RETAIN
+EOF
+}
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "aws_iam_role_policy.admin")
+	assertContains(t, stderr, "iam.tf#resource=aws_iam_role_policy.admin")
+	assertContains(t, stderr, "invalid policy JSON")
+	if strings.Contains(stderr, dir) {
+		t.Fatalf("stderr leaked absolute scan root %q: %s", dir, stderr)
+	}
+	for _, forbidden := range []string{"FAKE_CLI_AWS_TF_TRAILING_SECRET_DO_NOT_RETAIN", "Statement", "policy ="} {
+		if strings.Contains(stderr, forbidden) {
+			t.Fatalf("stderr contains %q: %s", forbidden, stderr)
+		}
+	}
+}
+
 func TestRunScanRejectsUnknownFlagsWithControlledError(t *testing.T) {
 	stdout, stderr, code := runCommand("scan", "--bogus", safeFixture)
 
@@ -3158,6 +3389,44 @@ func countGraphEdges(g *graph.Graph, kind graph.EdgeKind) int {
 	return count
 }
 
+func countGraphNodes(g *graph.Graph, kind graph.NodeKind) int {
+	count := 0
+	for _, node := range g.Nodes() {
+		if node.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
+func onlyGraphNodeIDOfKind(t *testing.T, g *graph.Graph, kind graph.NodeKind) graph.NodeID {
+	t.Helper()
+	var ids []graph.NodeID
+	for _, node := range g.Nodes() {
+		if node.Kind == kind {
+			ids = append(ids, node.ID)
+		}
+	}
+	if len(ids) != 1 {
+		t.Fatalf("%s node count = %d, want 1: %#v", kind, len(ids), g.Nodes())
+	}
+	return ids[0]
+}
+
+func onlyCLIFindingByRule(t *testing.T, findings []analysis.Finding, ruleID analysis.RuleID) analysis.Finding {
+	t.Helper()
+	var matches []analysis.Finding
+	for _, finding := range findings {
+		if finding.RuleID == ruleID {
+			matches = append(matches, finding)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("%s finding count = %d, want 1: %#v", ruleID, len(matches), findings)
+	}
+	return matches[0]
+}
+
 func assertDoesNotContainGitHubActionsSecretValues(t *testing.T, outputs ...string) {
 	t.Helper()
 	for _, output := range outputs {
@@ -3169,6 +3438,22 @@ func assertDoesNotContainGitHubActionsSecretValues(t *testing.T, outputs ...stri
 		} {
 			if strings.Contains(output, forbidden) {
 				t.Fatalf("output contains GitHub Actions secret-like value %q: %s", forbidden, output)
+			}
+		}
+	}
+}
+
+func assertDoesNotContainTerraformAWSSecretValues(t *testing.T, outputs ...string) {
+	t.Helper()
+	for _, output := range outputs {
+		for _, forbidden := range []string{
+			"FAKE_CLI_AWS_TF_VARIABLE_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_AWS_TF_TRAILING_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_AWS_TF_ACCESS_KEY_DO_NOT_RETAIN",
+			"FAKE_CLI_AWS_TF_CONDITION_SECRET_DO_NOT_RETAIN",
+		} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("Terraform AWS output contains secret-like value %q: %s", forbidden, output)
 			}
 		}
 	}

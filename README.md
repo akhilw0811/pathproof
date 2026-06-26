@@ -13,7 +13,10 @@ checks out untrusted pull request head code with `actions/checkout`, and
 `PP-GHA-003` when a `pull_request_target` workflow explicitly grants dangerous
 workflow-level or job-level token permissions, and detects `PP-XDOMAIN-001`
 when one of those risky GitHub Actions conditions has a modeled OIDC path to a
-locally parsed AWS IAM role trust.
+locally parsed AWS IAM role trust. It also models a narrow local Terraform
+slice for static AWS IAM role permissions and reports `PP-AWS-001` when an
+`aws_iam_role` has an inline wildcard admin policy or a literal
+AdministratorAccess attachment.
 
 PathProof is currently a defensive Go CLI focused on two small, tested local
 slices. It scans local YAML manifests and workflows, builds an in-memory graph,
@@ -29,6 +32,9 @@ statically parsed AWS IAM role trust policy when `--repo OWNER/REPO` is
 supplied. A matched AWS role trust edge does not produce a finding by itself;
 `PP-XDOMAIN-001` requires the GitHub Actions workflow or job to also have a
 modeled `PP-GHA-002` or `PP-GHA-003` risk signal.
+Static Terraform AWS IAM role permissions are modeled only for supported local
+`aws_iam_role_policy` and AdministratorAccess `aws_iam_role_policy_attachment`
+forms; this is not IAM simulation.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
@@ -245,6 +251,24 @@ locals, functions, `jsonencode`, interpolations, or
 `aws_iam_policy_document`, call AWS or GitHub APIs, verify ARNs or accounts,
 simulate IAM permissions, inspect role policies, or provide remediation.
 
+## Terraform AWS IAM Permissions
+
+PathProof also scans local `.tf` files for a narrow static AWS IAM role
+permission slice. It recognizes inline `aws_iam_role_policy` JSON attached to
+a parsed role by `aws_iam_role.<name>.id`, `aws_iam_role.<name>.name`, or a
+literal role name only when exactly one parsed role has an explicit static
+`name` matching that literal. It recognizes
+`aws_iam_role_policy_attachment` only for the literal AWS managed policy ARN
+`arn:aws:iam::aws:policy/AdministratorAccess`.
+
+`PP-AWS-001` is emitted only for obviously administrative permissions:
+`Allow` with `Action "*" Resource "*"`, `Allow` with
+`Action "*:*" Resource "*"`, or the literal AdministratorAccess attachment.
+PathProof does not evaluate conditions, `NotAction`, variables, modules,
+locals, `jsonencode`, customer-managed policies, unknown managed policies,
+permission boundaries, SCPs, or resource-level IAM semantics, and it provides
+no AWS remediation or patching in this slice.
+
 ## CI / SARIF
 
 The GitHub Actions workflow builds and tests PathProof, then runs the built CLI
@@ -280,8 +304,8 @@ only publishes the SARIF file as an artifact.
 - Safe read-only patch previews.
 - Patched-copy output to a separate directory, never in-place edits.
 - Validation by rescanning a complete temporary patched manifest set.
-- SARIF 2.1.0 finding export for implemented Kubernetes and GitHub Actions
-  rules.
+- SARIF 2.1.0 finding export for implemented Kubernetes, GitHub Actions, AWS,
+  and cross-domain rules.
 - Local GitHub Actions workflow parsing under `.github/workflows`.
 - `PP-GHA-001` detection for GitHub Actions `uses:` references that are not
   pinned to a full 40-character commit SHA.
@@ -291,6 +315,8 @@ only publishes the SARIF file as an artifact.
   grant dangerous workflow-level or job-level token permissions.
 - Internal graph-only modeling for GitHub Actions OIDC token request
   capability from explicit `id-token: write` or `permissions: write-all`.
+- `PP-AWS-001` detection for static local Terraform AWS IAM role permissions
+  that are obviously administrative.
 - `PP-XDOMAIN-001` detection for the first local cross-domain GitHub Actions
   OIDC to AWS IAM role trust path, gated by modeled PP-GHA-002 or PP-GHA-003
   risk signals.
@@ -306,21 +332,21 @@ The scan loop is:
 1. Parse local Kubernetes YAML manifests.
 2. Parse local GitHub Actions workflow YAML files under `.github/workflows`.
 3. Parse local Terraform `.tf` files for static AWS IAM role OIDC trust
-   metadata.
+   metadata and narrow static AWS IAM role permission facts.
 4. Build an in-memory evidence graph.
 5. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
 6. Add deterministic GitHub Actions workflow/job/action-use edges and
    graph-only OIDC token capability edges.
-7. Add deterministic AWS IAM role trust nodes and optional `CanAssumeRole`
-   edges when `--repo OWNER/REPO` supplies repository identity for static
-   subject matching.
-8. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
-   `PP-GHA-003`, and `PP-XDOMAIN-001`.
+7. Add deterministic AWS IAM role trust nodes, AWS permission nodes, permission
+   edges, and optional `CanAssumeRole` edges when `--repo OWNER/REPO` supplies
+   repository identity for static subject matching.
+8. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`,
+   `PP-GHA-003`, `PP-AWS-001`, and `PP-XDOMAIN-001`.
 9. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
-8. Optionally generate read-only `NarrowBindingSubject` patch previews.
-9. Optionally write patched copies to a separate output directory.
-10. Optionally validate by rescanning a complete temporary overlay that replaces
+10. Optionally generate read-only `NarrowBindingSubject` patch previews.
+11. Optionally write patched copies to a separate output directory.
+12. Optionally validate by rescanning a complete temporary overlay that replaces
    original files with generated patched copies.
 
 PathProof does not contact a live cluster, run `kubectl`, apply patches in

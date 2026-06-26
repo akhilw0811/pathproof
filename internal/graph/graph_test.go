@@ -803,6 +803,45 @@ func TestGraphAWSIAMRoleNodeMetadataIsCloned(t *testing.T) {
 	}
 }
 
+func TestGraphAWSPermissionNodeMetadataIsCloned(t *testing.T) {
+	g := New()
+	permission := NewNode(AWSPermission, "aws://terraform/aws_permission/admin")
+	permission.Metadata = &NodeMetadata{AWSPermission: &AWSPermissionMetadata{
+		Provider:                 "aws",
+		SourceReference:          "main.tf#resource=aws_iam_role_policy.admin",
+		PolicyResourceName:       "admin",
+		AttachedRoleResourceName: "deploy",
+		Actions:                  []string{"*"},
+		Resources:                []string{"*"},
+		Administrative:           true,
+		AdminReason:              "action_star_resource_star",
+	}}
+
+	added := mustAddNode(t, g, permission)
+	permission.Metadata.AWSPermission.Actions[0] = "s3:GetObject"
+	added.Metadata.AWSPermission.Resources[0] = "changed"
+
+	got, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found", added.ID)
+	}
+	if got.Metadata == nil || got.Metadata.AWSPermission == nil {
+		t.Fatalf("metadata = %#v, want aws permission metadata", got.Metadata)
+	}
+	if got.Metadata.AWSPermission.Actions[0] != "*" || got.Metadata.AWSPermission.Resources[0] != "*" {
+		t.Fatalf("stored metadata changed: %#v", got.Metadata.AWSPermission)
+	}
+
+	got.Metadata.AWSPermission.Actions[0] = "changed"
+	again, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after mutation", added.ID)
+	}
+	if again.Metadata.AWSPermission.Actions[0] != "*" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.AWSPermission)
+	}
+}
+
 func TestGraphAWSCanAssumeRoleEdgeMetadataIsCloned(t *testing.T) {
 	g := New()
 	capability := mustAddNode(t, g, NewNode(OIDCTokenCapability, "githubactions://.github/workflows/deploy.yml/oidc-token/workflow"))
