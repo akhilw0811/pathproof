@@ -1,0 +1,54 @@
+name: PathProof
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check
+        run: make check
+
+      - name: Build PathProof
+        run: go build -o ./bin/pathproof ./cmd/pathproof
+
+      - name: Generate demo SARIF
+        run: |
+          set -euo pipefail
+
+          set +e
+          ./bin/pathproof scan --format sarif ./examples/kubernetes/public-secret-path > pathproof.sarif
+          scan_status=$?
+          set -e
+
+          if [ "$scan_status" -ne 1 ]; then
+            echo "expected demo scan to exit 1 because findings are present; got $scan_status"
+            exit 1
+          fi
+
+          test -s pathproof.sarif
+          grep -q '"version":"2.1.0"' pathproof.sarif
+          grep -q 'PP-K8S-001' pathproof.sarif
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pathproof-sarif
+          path: pathproof.sarif
+          if-no-files-found: error

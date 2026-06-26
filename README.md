@@ -137,8 +137,34 @@ Get SARIF output for code-scanning-style integrations:
 ./bin/pathproof scan --format sarif ./examples/kubernetes/public-secret-path
 ```
 
-SARIF export is local stdout only. PathProof does not upload SARIF to GitHub or
-any other service.
+SARIF export from the CLI is local stdout only. The GitHub Actions workflow
+generates a SARIF file from the public demo fixture and uploads it as a
+workflow artifact.
+
+## CI / SARIF
+
+The GitHub Actions workflow builds and tests PathProof, then runs the built CLI
+against the intentionally vulnerable demo fixture:
+
+```sh
+./bin/pathproof scan --format sarif ./examples/kubernetes/public-secret-path > pathproof.sarif
+```
+
+The demo fixture is expected to produce `PP-K8S-001`, so CI handles exit code
+`1` explicitly instead of hiding failures with `|| true`. Scan exit codes are:
+
+- `0`: scan succeeded and found zero findings.
+- `1`: scan succeeded and found one or more findings.
+- `2`: usage, parsing, routing, patch output, validation, or internal scan
+  error.
+
+CI verifies that `pathproof.sarif` exists, is non-empty, contains SARIF version
+`2.1.0`, and contains `PP-K8S-001`, then uploads it with
+`actions/upload-artifact`.
+
+GitHub code scanning upload is not enabled by default. Repositories that want
+code scanning can add GitHub's `upload-sarif` action later, but this workflow
+only publishes the SARIF file as an artifact.
 
 ## What this proves
 
