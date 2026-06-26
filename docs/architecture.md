@@ -7,14 +7,16 @@ and local Kubernetes YAML directory scans with:
 - `pathproof scan <directory>`
 - `pathproof scan --format json <directory>`
 - `pathproof scan --format=json <directory>`
+- `pathproof scan --preview-patches <directory>`
 
 The scan command is intentionally only an orchestration layer. It validates the
 local directory input, parses Kubernetes manifests, constructs the in-memory
 graph, runs deterministic analysis, builds advisory remediation plans for
-supported findings, projects findings and plans into a private CLI report
-shape, and writes either human-readable output or JSON. It does not persist the
-graph or expose graph internals beyond the ordered finding path, evidence, and
-remediation plan fields.
+supported findings, optionally builds read-only patch previews for supported
+remediation changes, projects findings, plans, and previews into a private CLI
+report shape, and writes either human-readable output or JSON. It does not
+persist the graph or expose graph internals beyond the ordered finding path,
+evidence, remediation plan fields, and optional preview fields.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -92,7 +94,17 @@ human-readable evidence prose and does not modify source manifests. The
 implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
 `NarrowBindingSubject`.
 
-No live Kubernetes authorization evaluation, verification rescans, YAML
-editing, patch generation, remediation application, persistence, AI, dashboard,
-plugin system, external service integration, pull request creation, or live
-Kubernetes cluster integration is implemented.
+Optional patch preview generation lives under `internal/patchpreview`. It is
+also read-only: it consumes the scan root and remediation plans, resolves
+existing `filename#document=N` source references, reads source YAML, and emits
+deterministic unified diffs only for `NarrowBindingSubject` changes that remove
+one exact ServiceAccount subject from a multi-subject `RoleBinding` or
+`ClusterRoleBinding`. It edits only the referenced YAML document in memory and
+never writes source files. Unsupported actions, mismatched source references,
+namespace-less subjects, single-subject bindings, and source files containing
+core `v1` Secret payload fields produce `unsupported` preview entries.
+
+No live Kubernetes authorization evaluation, verification rescans, patch
+application, persistence, AI, dashboard, plugin system, external service
+integration, pull request creation, or live Kubernetes cluster integration is
+implemented.

@@ -30,8 +30,11 @@ Implemented Kubernetes support is intentionally small:
   Kubernetes endpoint routes to a workload, that workload runs as a
   ServiceAccount, and that ServiceAccount can read a parsed Secret.
 - Build deterministic, evidence-backed remediation plans for `PP-K8S-001`
-  findings. Plans are advisory and read-only. They do not edit YAML, generate
+  findings. Plans are advisory and read-only. They do not edit YAML, apply
   patches, open pull requests, or rescan modified files.
+- Optionally generate read-only unified diff previews for the
+  `NarrowBindingSubject` remediation action. Patch previews are not applied,
+  and source files are never modified.
 - Run the local scan pipeline from the CLI for Kubernetes YAML directories.
 
 `PP-K8S-001` findings use fixed rule-based `High` severity. Finding IDs are
@@ -46,6 +49,7 @@ go run ./cmd/pathproof version
 go run ./cmd/pathproof scan ./cmd/pathproof/testdata/scan-safe
 go run ./cmd/pathproof scan --format json ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --format=json ./cmd/pathproof/testdata/scan-vulnerable
+go run ./cmd/pathproof scan --preview-patches ./cmd/pathproof/testdata/scan-vulnerable
 ```
 
 `pathproof scan` currently supports only local directories containing
@@ -84,6 +88,16 @@ Every listed option is complete for the modeled finding. When multiple
 independent RBAC chains grant the same Secret read edge, one option includes
 all required changes and states that they must be applied together.
 
+Patch previews are opt-in with `--preview-patches`. The initial preview slice
+supports only `NarrowBindingSubject` changes for
+`rbac.authorization.k8s.io/v1` `RoleBinding` and `ClusterRoleBinding`
+manifests. Each preview removes one exact ServiceAccount subject from one
+referenced source document in memory, emits a deterministic unified diff, and
+does not write the file. Unsupported actions and unsafe cases are reported as
+`unsupported` previews instead of being applied. Source files containing a core
+`v1` Secret with payload fields are intentionally unsupported for previews so
+diff context cannot expose Secret values.
+
 Scan exit codes are stable:
 
 - `0`: scan succeeded and found zero findings.
@@ -104,9 +118,11 @@ The built binary is written to `bin/pathproof`.
 - Terraform parsing
 - GitHub Actions parsing
 - SBOM parsing
-- Kubernetes Secret values, live-cluster verification, YAML editing, patch
-  generation, remediation application, validation rescans, or pull request
-  creation
+- Kubernetes Secret values, live-cluster verification, patch application,
+  validation rescans, or pull request creation
+- Patch previews for RBAC rule edits, Secret-bearing source files, wildcard
+  resources or verbs, API-group splitting, ClusterRoleBinding scope changes,
+  `resourceNames`, or namespace-less binding subjects
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
   ClusterRoles, and live authorization evaluation
 - AI agents

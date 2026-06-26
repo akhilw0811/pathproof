@@ -171,6 +171,9 @@ func TestRunScanVulnerableFixtureReturnsOneAndHumanFinding(t *testing.T) {
 	assertContains(t, stdout, "Option 1: RemoveSecretsResource")
 	assertContains(t, stdout, "Option 2: RemoveSecretReadVerb")
 	assertContains(t, stdout, "Changes:")
+	if strings.Contains(stdout, "Patch Preview:") {
+		t.Fatalf("default human output contains patch preview: %s", stdout)
+	}
 	assertExactlyOneTrailingNewline(t, stdout)
 }
 
@@ -248,6 +251,9 @@ func TestRunScanJSONOutputIsStructured(t *testing.T) {
 	if strings.Contains(stdout, "Finding count:") || strings.Contains(stdout, "Rule:") {
 		t.Fatalf("json stdout contains human text: %q", stdout)
 	}
+	if strings.Contains(stdout, "patch_previews") {
+		t.Fatalf("default JSON output contains patch previews: %s", stdout)
+	}
 }
 
 func TestRunScanSafeFixtureJSONContainsNoRemediationPlans(t *testing.T) {
@@ -281,6 +287,142 @@ func TestRunScanOutputIsDeterministic(t *testing.T) {
 	assertString(t, "first json stderr", firstJSONErr, "")
 	assertString(t, "second json stderr", secondJSONErr, "")
 	assertString(t, "json stdout", secondJSON, firstJSON)
+}
+
+func TestRunScanPreviewPatchesHumanOutputIncludesGeneratedPreview(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--preview-patches", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Preview:")
+	assertContains(t, stdout, "Status: generated")
+	assertContains(t, stdout, "File: resources.yaml")
+	assertContains(t, stdout, "Diff:")
+	assertContains(t, stdout, "--- resources.yaml\n")
+	assertContains(t, stdout, "+++ resources.yaml\n")
+	assertContains(t, stdout, "@@")
+	assertContains(t, stdout, "-  name: api\n")
+	assertContains(t, stdout, "   name: worker\n")
+	assertExactlyOneTrailingNewline(t, stdout)
+}
+
+func TestRunScanPreviewPatchesJSONOutputIncludesStructuredPreview(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--preview-patches", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.Findings[0].Remediation == nil {
+		t.Fatal("remediation = nil, want remediation with patch previews")
+	}
+	previewCount := 0
+	for _, option := range report.Findings[0].Remediation.Options {
+		for _, preview := range option.PatchPreviews {
+			previewCount++
+			if preview.Status == "generated" {
+				if preview.File != "resources.yaml" || preview.Diff == "" || preview.OptionAction != "NarrowBindingSubject" {
+					t.Fatalf("generated preview = %#v", preview)
+				}
+			}
+		}
+	}
+	if previewCount == 0 {
+		t.Fatalf("no patch previews in JSON remediation: %#v", report.Findings[0].Remediation)
+	}
+	assertContains(t, stdout, `"patch_previews"`)
+	assertExactlyOneTrailingNewline(t, stdout)
+}
+
+func TestRunScanPreviewPatchesShowsUnsupportedPreview(t *testing.T) {
+	stdout, stderr, code := runCommand("scan", "--preview-patches", vulnerableFixture)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Preview:")
+	assertContains(t, stdout, "Status: unsupported")
+	assertContains(t, stdout, "NarrowBindingSubject")
+}
+
+func TestRunScanPreviewPatchesJSONFlagForms(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", false)
+
+	for _, args := range [][]string{
+		{"scan", "--format", "json", "--preview-patches", "scan-preview"},
+		{"scan", "--format=json", "--preview-patches", "scan-preview"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			stdout, stderr, code := runCommandInDir(t, parent, args...)
+
+			assertCode(t, code, 1)
+			assertString(t, "stderr", stderr, "")
+			report := assertValidJSONReport(t, stdout)
+			if report.Findings[0].Remediation == nil {
+				t.Fatal("remediation = nil")
+			}
+			assertContains(t, stdout, `"patch_previews"`)
+		})
+	}
+}
+
+func TestRunScanPreviewPatchesSafeScanHasNoPreviews(t *testing.T) {
+	stdout, stderr, code := runCommand("scan", "--preview-patches", safeFixture)
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Finding count: 0\nNo findings.\n")
+}
+
+func TestWriteScanResultPreviewBuilderDoesNotRunWithoutFlag(t *testing.T) {
+	fixture := projectionFixtureWithValidFinding(t)
+	var stdout, stderr bytes.Buffer
+
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, false, &stdout, &stderr)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr.String(), "")
+	assertContains(t, stdout.String(), "Finding count: 1\n")
+	if strings.Contains(stdout.String(), "Patch Preview:") {
+		t.Fatalf("output contains patch preview without flag: %s", stdout.String())
+	}
+}
+
+func TestWriteScanResultPreviewInternalErrorLeavesStdoutEmpty(t *testing.T) {
+	fixture := projectionFixtureWithValidFinding(t)
+	var stdout, stderr bytes.Buffer
+
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, true, &stdout, &stderr)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout.String(), "")
+	assertOneLineStderr(t, stderr.String())
+	assertContains(t, stderr.String(), "build patch previews")
+}
+
+func TestRunScanPreviewPatchesOutputIsDeterministicAndExcludesSecretValues(t *testing.T) {
+	parent := t.TempDir()
+	writePreviewFixture(t, parent, "scan-preview", true)
+	firstOut, firstErr, firstCode := runCommandInDir(t, parent, "scan", "--preview-patches", "scan-preview")
+	secondOut, secondErr, secondCode := runCommandInDir(t, parent, "scan", "--preview-patches", "scan-preview")
+
+	assertCode(t, firstCode, 1)
+	assertCode(t, secondCode, 1)
+	assertString(t, "first stderr", firstErr, "")
+	assertString(t, "second stderr", secondErr, "")
+	assertString(t, "stdout", secondOut, firstOut)
+	for _, value := range []string{
+		"FAKE_PREVIEW_CLI_SECRET_DATA_VALUE_DO_NOT_RETAIN",
+		"FAKE_PREVIEW_CLI_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN",
+	} {
+		if strings.Contains(firstOut, value) || strings.Contains(firstErr, value) {
+			t.Fatalf("preview output contains secret value %q\nstdout:%s\nstderr:%s", value, firstOut, firstErr)
+		}
+	}
+	assertContains(t, firstOut, "Status: unsupported")
 }
 
 func TestRunScanReversedInputFileCreationOrderIsDeterministic(t *testing.T) {
@@ -366,7 +508,7 @@ func TestProjectFindingRejectsMissingNode(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport([]analysis.Finding{finding}, g, nil)
+	_, err := newScanReport([]analysis.Finding{finding}, g, nil, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing node error")
 	}
@@ -391,7 +533,7 @@ func TestProjectFindingRejectsMissingEdge(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport([]analysis.Finding{finding}, g, nil)
+	_, err := newScanReport([]analysis.Finding{finding}, g, nil, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing edge error")
 	}
@@ -501,7 +643,7 @@ func TestWriteScanResultRejectsLateInconsistencyWithoutPartialOutput(t *testing.
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, scanFormatHuman, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, ".", scanFormatHuman, false, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -524,7 +666,7 @@ func TestWriteScanResultMissingNodeReturnsTwoWithEmptyStdout(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{finding}, g, scanFormatHuman, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{finding}, g, ".", scanFormatHuman, false, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -549,9 +691,26 @@ func runCommand(args ...string) (string, string, int) {
 	return stdout.String(), stderr.String(), code
 }
 
+func runCommandInDir(t *testing.T, dir string, args ...string) (string, string, int) {
+	t.Helper()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir %s: %v", dir, err)
+	}
+	defer func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	}()
+	return runCommand(args...)
+}
+
 func writeScanResultForTest(findings []analysis.Finding, g *graph.Graph, format scanFormat) (string, string, int) {
 	var stdout, stderr bytes.Buffer
-	code := writeScanResult(findings, g, format, &stdout, &stderr)
+	code := writeScanResult(findings, g, ".", format, false, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
 
@@ -647,6 +806,7 @@ type cliJSONRemediationOption struct {
 	RequiresAllChanges bool                       `json:"requires_all_changes"`
 	Changes            []cliJSONRemediationChange `json:"changes"`
 	Constraints        []string                   `json:"constraints,omitempty"`
+	PatchPreviews      []cliJSONPatchPreview      `json:"patch_previews,omitempty"`
 }
 
 type cliJSONRemediationChange struct {
@@ -663,6 +823,18 @@ type cliJSONRemediationTarget struct {
 	Kind      string `json:"kind"`
 	Namespace string `json:"namespace,omitempty"`
 	Name      string `json:"name"`
+}
+
+type cliJSONPatchPreview struct {
+	PlanID       string `json:"plan_id"`
+	OptionIndex  int    `json:"option_index"`
+	OptionAction string `json:"option_action"`
+	ChangeIndex  int    `json:"change_index"`
+	Status       string `json:"status"`
+	Summary      string `json:"summary"`
+	File         string `json:"file,omitempty"`
+	Diff         string `json:"diff,omitempty"`
+	Reason       string `json:"reason,omitempty"`
 }
 
 func assertValidJSONReport(t *testing.T, output string) cliJSONReport {
@@ -878,6 +1050,87 @@ subjects:
 		t.Fatalf("write multi finding fixture: %v", err)
 	}
 	return dir
+}
+
+func writePreviewFixture(t *testing.T, parent, name string, secretPayload bool) {
+	t.Helper()
+	dir := filepath.Join(parent, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("create preview fixture dir: %v", err)
+	}
+	secretExtra := ""
+	if secretPayload {
+		secretExtra = `data:
+  password: FAKE_PREVIEW_CLI_SECRET_DATA_VALUE_DO_NOT_RETAIN
+stringData:
+  token: FAKE_PREVIEW_CLI_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN
+`
+	}
+	content := `apiVersion: v1
+kind: Service
+metadata:
+  name: public-api
+  namespace: prod
+spec:
+  type: LoadBalancer
+  selector:
+    app: api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: api
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  namespace: prod
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+  namespace: prod
+` + secretExtra + `---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-reader
+  namespace: prod
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-secrets
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: secret-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: prod
+- kind: ServiceAccount
+  name: worker
+  namespace: prod
+`
+	if err := os.WriteFile(filepath.Join(dir, "resources.yaml"), []byte(content), 0o600); err != nil {
+		t.Fatalf("write preview fixture: %v", err)
+	}
 }
 
 var _ io.Writer = failingWriter{}

@@ -12,12 +12,13 @@ import (
 	"pathproof/internal/analysis"
 	"pathproof/internal/graph"
 	parserkubernetes "pathproof/internal/parser/kubernetes"
+	"pathproof/internal/patchpreview"
 	"pathproof/internal/remediation"
 	routingkubernetes "pathproof/internal/routing/kubernetes"
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json] [--preview-patches] <directory>"
 
 type scanFormat string
 
@@ -25,6 +26,12 @@ const (
 	scanFormatHuman scanFormat = "human"
 	scanFormatJSON  scanFormat = "json"
 )
+
+type scanOptions struct {
+	format         scanFormat
+	previewPatches bool
+	directory      string
+}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -53,28 +60,36 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runScan(args []string, stdout, stderr io.Writer) int {
-	format, dir, err := parseScanArgs(args)
+	options, err := parseScanArgs(args)
 	if err != nil {
 		printError(stderr, err.Error())
 		return 2
 	}
 
-	findings, g, err := scanDirectory(dir)
+	findings, g, err := scanDirectory(options.directory)
 	if err != nil {
 		printError(stderr, err.Error())
 		return 2
 	}
 
-	return writeScanResult(findings, g, format, stdout, stderr)
+	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, stdout, stderr)
 }
 
-func writeScanResult(findings []analysis.Finding, g *graph.Graph, format scanFormat, stdout, stderr io.Writer) int {
+func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, stdout, stderr io.Writer) int {
 	plans, err := remediation.Build(g, findings)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
 		return 2
 	}
-	report, err := newScanReport(findings, g, plans)
+	var previews []patchpreview.Preview
+	if previewPatches {
+		previews, err = patchpreview.Build(root, plans)
+		if err != nil {
+			printError(stderr, "internal scan error: build patch previews: "+err.Error())
+			return 2
+		}
+	}
+	report, err := newScanReport(findings, g, plans, previews)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -105,33 +120,34 @@ func writeScanResult(findings []analysis.Finding, g *graph.Graph, format scanFor
 	return 0
 }
 
-func parseScanArgs(args []string) (scanFormat, string, error) {
+func parseScanArgs(args []string) (scanOptions, error) {
 	flags := flag.NewFlagSet("scan", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	formatValue := flags.String("format", string(scanFormatHuman), "output format")
+	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
 	if err := flags.Parse(args); err != nil {
-		return "", "", fmt.Errorf("invalid scan arguments: %w; %s", err, usage)
+		return scanOptions{}, fmt.Errorf("invalid scan arguments: %w; %s", err, usage)
 	}
 	format := scanFormat(*formatValue)
 	switch format {
 	case scanFormatHuman, scanFormatJSON:
 	default:
-		return "", "", fmt.Errorf("unsupported scan format %q; supported formats are human and json", format)
+		return scanOptions{}, fmt.Errorf("unsupported scan format %q; supported formats are human and json", format)
 	}
 
 	remaining := flags.Args()
 	if len(remaining) != 1 {
-		return "", "", fmt.Errorf("scan requires exactly one directory argument, got %d; %s", len(remaining), usage)
+		return scanOptions{}, fmt.Errorf("scan requires exactly one directory argument, got %d; %s", len(remaining), usage)
 	}
 	dir := remaining[0]
 	info, err := os.Stat(dir)
 	if err != nil {
-		return "", "", fmt.Errorf("scan directory %q: %w", dir, err)
+		return scanOptions{}, fmt.Errorf("scan directory %q: %w", dir, err)
 	}
 	if !info.IsDir() {
-		return "", "", fmt.Errorf("scan path %q is not a directory", dir)
+		return scanOptions{}, fmt.Errorf("scan path %q is not a directory", dir)
 	}
-	return format, dir, nil
+	return scanOptions{format: format, previewPatches: *previewPatches, directory: dir}, nil
 }
 
 func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
@@ -192,6 +208,7 @@ type scanRemediationOption struct {
 	RequiresAllChanges bool                    `json:"requires_all_changes"`
 	Changes            []scanRemediationChange `json:"changes"`
 	Constraints        []string                `json:"constraints,omitempty"`
+	PatchPreviews      []scanPatchPreview      `json:"patch_previews,omitempty"`
 }
 
 type scanRemediationChange struct {
@@ -210,7 +227,19 @@ type scanRemediationTarget struct {
 	Name      string `json:"name"`
 }
 
-func newScanReport(findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan) (scanReport, error) {
+type scanPatchPreview struct {
+	PlanID       remediation.PlanID  `json:"plan_id"`
+	OptionIndex  int                 `json:"option_index"`
+	OptionAction remediation.Action  `json:"option_action"`
+	ChangeIndex  int                 `json:"change_index"`
+	Status       patchpreview.Status `json:"status"`
+	Summary      string              `json:"summary"`
+	File         string              `json:"file,omitempty"`
+	Diff         string              `json:"diff,omitempty"`
+	Reason       string              `json:"reason,omitempty"`
+}
+
+func newScanReport(findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview) (scanReport, error) {
 	planByFinding := make(map[analysis.FindingID]remediation.Plan, len(plans))
 	for _, plan := range plans {
 		planByFinding[plan.FindingID] = plan
@@ -225,7 +254,7 @@ func newScanReport(findings []analysis.Finding, g *graph.Graph, plans []remediat
 			return scanReport{}, err
 		}
 		if plan, ok := planByFinding[finding.ID]; ok {
-			item.Remediation = projectRemediation(plan)
+			item.Remediation = projectRemediation(plan, previews)
 		}
 		report.Findings = append(report.Findings, item)
 	}
@@ -297,7 +326,7 @@ func projectFinding(finding analysis.Finding, g *graph.Graph) (scanFinding, erro
 	}, nil
 }
 
-func projectRemediation(plan remediation.Plan) *scanRemediation {
+func projectRemediation(plan remediation.Plan, previews []patchpreview.Preview) *scanRemediation {
 	projected := scanRemediation{
 		ID:        plan.ID,
 		FindingID: plan.FindingID,
@@ -314,6 +343,22 @@ func projectRemediation(plan remediation.Plan) *scanRemediation {
 			RequiresAllChanges: option.RequiresAllChanges,
 			Constraints:        append([]string(nil), option.Constraints...),
 			Changes:            make([]scanRemediationChange, 0, len(option.Changes)),
+		}
+		for _, preview := range previews {
+			if preview.PlanID != plan.ID || preview.OptionIndex != len(projected.Options) {
+				continue
+			}
+			projectedOption.PatchPreviews = append(projectedOption.PatchPreviews, scanPatchPreview{
+				PlanID:       preview.PlanID,
+				OptionIndex:  preview.OptionIndex,
+				OptionAction: preview.OptionAction,
+				ChangeIndex:  preview.ChangeIndex,
+				Status:       preview.Status,
+				Summary:      preview.Summary,
+				File:         preview.File,
+				Diff:         preview.Diff,
+				Reason:       preview.Reason,
+			})
 		}
 		for _, change := range option.Changes {
 			projectedOption.Changes = append(projectedOption.Changes, scanRemediationChange{
@@ -402,7 +447,7 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 				if _, err := fmt.Fprintln(w, "    Changes:"); err != nil {
 					return err
 				}
-				for _, change := range option.Changes {
+				for changeIndex, change := range option.Changes {
 					if _, err := fmt.Fprintf(w, "      - %s %s: %s [%s]\n", change.Action, remediationTargetName(change.Target), change.Summary, change.SourceReference); err != nil {
 						return err
 					}
@@ -411,11 +456,56 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 							return err
 						}
 					}
+					for _, preview := range option.PatchPreviews {
+						if preview.ChangeIndex != changeIndex {
+							continue
+						}
+						if _, err := fmt.Fprintln(w, "        Patch Preview:"); err != nil {
+							return err
+						}
+						if _, err := fmt.Fprintf(w, "          Status: %s\n", preview.Status); err != nil {
+							return err
+						}
+						if preview.File != "" {
+							if _, err := fmt.Fprintf(w, "          File: %s\n", preview.File); err != nil {
+								return err
+							}
+						}
+						if preview.Reason != "" {
+							if _, err := fmt.Fprintf(w, "          Reason: %s\n", preview.Reason); err != nil {
+								return err
+							}
+						}
+						if preview.Diff != "" {
+							if _, err := fmt.Fprintln(w, "          Diff:"); err != nil {
+								return err
+							}
+							if _, err := fmt.Fprint(w, indentPreviewDiff(preview.Diff)); err != nil {
+								return err
+							}
+						}
+					}
 				}
 			}
 		}
 	}
 	return nil
+}
+
+func indentPreviewDiff(diff string) string {
+	if diff == "" {
+		return ""
+	}
+	lines := strings.SplitAfter(diff, "\n")
+	var out strings.Builder
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		out.WriteString("            ")
+		out.WriteString(line)
+	}
+	return out.String()
 }
 
 func remediationTargetName(target scanRemediationTarget) string {
