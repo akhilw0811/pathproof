@@ -13,9 +13,11 @@ import (
 
 	"pathproof/internal/analysis"
 	"pathproof/internal/graph"
+	parsergithubactions "pathproof/internal/parser/githubactions"
 	parserkubernetes "pathproof/internal/parser/kubernetes"
 	"pathproof/internal/patchpreview"
 	"pathproof/internal/remediation"
+	routinggithubactions "pathproof/internal/routing/githubactions"
 	routingkubernetes "pathproof/internal/routing/kubernetes"
 	"pathproof/internal/validation"
 )
@@ -205,8 +207,15 @@ func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
 	}
+	workflows, err := parsergithubactions.ParseDir(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
+	}
 	g := graph.New()
 	if err := routingkubernetes.AddRoutes(g, resources); err != nil {
+		return nil, nil, fmt.Errorf("build scan graph: %w", err)
+	}
+	if err := routinggithubactions.AddRoutes(g, workflows); err != nil {
 		return nil, nil, fmt.Errorf("build scan graph: %w", err)
 	}
 	return analysis.Analyze(g), g, nil
@@ -472,17 +481,14 @@ func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scan
 	if g == nil {
 		return scanFinding{}, fmt.Errorf("finding %q cannot be projected without a graph", finding.ID)
 	}
-	if len(finding.NodeIDs) != 4 {
-		return scanFinding{}, fmt.Errorf("finding %q has %d path nodes, want 4", finding.ID, len(finding.NodeIDs))
+	if len(finding.NodeIDs) == 0 {
+		return scanFinding{}, fmt.Errorf("finding %q has 0 path nodes, want at least 1", finding.ID)
 	}
 	if len(finding.EdgeIDs) != len(finding.NodeIDs)-1 {
 		return scanFinding{}, fmt.Errorf("finding %q has edge count %d, want %d for %d path nodes", finding.ID, len(finding.EdgeIDs), len(finding.NodeIDs)-1, len(finding.NodeIDs))
 	}
 	if len(finding.EdgeIDs) != len(finding.Evidence) {
 		return scanFinding{}, fmt.Errorf("finding %q has %d edge IDs but %d evidence entries", finding.ID, len(finding.EdgeIDs), len(finding.Evidence))
-	}
-	if len(finding.Evidence) != 3 {
-		return scanFinding{}, fmt.Errorf("finding %q has %d evidence entries, want 3", finding.ID, len(finding.Evidence))
 	}
 
 	path := make([]scanPathNode, 0, len(finding.NodeIDs))

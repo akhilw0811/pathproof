@@ -20,6 +20,7 @@ const (
 	vulnerableFixture = "testdata/scan-vulnerable"
 	invalidFixture    = "testdata/scan-invalid"
 	publicDemoFixture = "../../examples/kubernetes/public-secret-path"
+	ghaDemoFixture    = "../../examples/github-actions/unpinned-action"
 )
 
 func TestRunVersion(t *testing.T) {
@@ -179,6 +180,236 @@ func TestRunScanVulnerableFixtureReturnsOneAndHumanFinding(t *testing.T) {
 	assertExactlyOneTrailingNewline(t, stdout)
 }
 
+func TestRunScanSafeGitHubActionsWorkflowReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "safe.yml", `name: Safe
+jobs:
+  test:
+    steps:
+      - uses: owner/repo@0123456789abcdef0123456789ABCDEF01234567
+      - uses: ./local-action
+      - uses: docker://alpine:3.19
+      - uses: ${{ matrix.action }}
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Finding count: 0\nNo findings.\n")
+}
+
+func TestRunScanGitHubActionsUnpinnedWorkflowReturnsOneAndFindingOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unpinned.yml", `name: Unpinned
+env:
+  TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - name: Build
+        run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 1\n")
+	assertContains(t, stdout, "Rule: PP-GHA-001\n")
+	assertContains(t, stdout, "Title: GitHub Actions workflow uses an action that is not pinned to a full commit SHA\n")
+	assertContains(t, stdout, "Severity: Medium\n")
+	assertContains(t, stdout, "Workflow githubactions://.github/workflows/unpinned.yml")
+	assertContains(t, stdout, "WorkflowJob githubactions://.github/workflows/unpinned.yml/job/test")
+	assertContains(t, stdout, "GitHubAction githubactions://.github/workflows/unpinned.yml/job/test/step/1/action/actions/checkout@v4")
+	assertContains(t, stdout, "UsesAction")
+	assertContains(t, stdout, "actions/checkout@v4")
+	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) || strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("GitHub Actions finding output contains unsupported text: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsJSONOutputIncludesFindingWithoutRemediation(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unpinned.yml", `jobs:
+  release:
+    steps:
+      - uses: owner/repo/path@v1.2.3
+        env:
+          TOKEN: FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN
+        with:
+          password: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=json", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 {
+		t.Fatalf("finding count = %d len = %d, want 1", report.FindingCount, len(report.Findings))
+	}
+	finding := report.Findings[0]
+	if finding.RuleID != "PP-GHA-001" || finding.Severity != "Medium" {
+		t.Fatalf("finding = %#v, want PP-GHA-001 Medium", finding)
+	}
+	if finding.Remediation != nil {
+		t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+	}
+	if len(finding.Path) != 3 || len(finding.Evidence) != 2 {
+		t.Fatalf("path/evidence lengths = %d/%d, want 3/2", len(finding.Path), len(finding.Evidence))
+	}
+	assertContains(t, stdout, "owner/repo/path@v1.2.3")
+	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) {
+		t.Fatalf("JSON output contains old inaccurate rule wording: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanMixedKubernetesAndGitHubActionsFindingsAreDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	writeSplitVulnerableFixture(t, dir, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+	writeGitHubActionsWorkflowForTest(t, dir, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: docker/login-action@v3
+`)
+
+	firstOut, firstErr, firstCode := runCommand("scan", "--format=json", dir)
+	secondOut, secondErr, secondCode := runCommand("scan", "--format=json", dir)
+
+	assertCode(t, firstCode, 1)
+	assertCode(t, secondCode, 1)
+	assertString(t, "first stderr", firstErr, "")
+	assertString(t, "second stderr", secondErr, "")
+	assertString(t, "stdout", secondOut, firstOut)
+	report := assertValidJSONReport(t, firstOut)
+	if report.FindingCount != 2 || len(report.Findings) != 2 {
+		t.Fatalf("finding count = %d len = %d, want 2", report.FindingCount, len(report.Findings))
+	}
+	seen := map[string]bool{}
+	for i, finding := range report.Findings {
+		seen[finding.RuleID] = true
+		if i > 0 && report.Findings[i-1].ID > finding.ID {
+			t.Fatalf("findings are not sorted by deterministic ID: %#v", report.Findings)
+		}
+	}
+	if !seen["PP-K8S-001"] || !seen["PP-GHA-001"] {
+		t.Fatalf("rules seen = %#v, want both PP-K8S-001 and PP-GHA-001", seen)
+	}
+}
+
+func TestRunScanGitHubActionsPatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("mkdir scan root: %v", err)
+	}
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: owner/repo@main
+`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-GHA-001\n")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 0")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-GHA-001 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestRunScanGitHubActionsMalformedWorkflowErrorExcludesValues(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "bad.yml", `name: bad
+env:
+  TOKEN: FAKE_CLI_GHA_MALFORMED_SECRET_DO_NOT_RETAIN
+jobs: [
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, ".github")
+	assertContains(t, stderr, "document 1")
+	assertContains(t, stderr, "invalid YAML")
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsMalformedAliasErrorIsSanitized(t *testing.T) {
+	dir := t.TempDir()
+	const fakeAlias = "FAKE_CLI_GHA_ALIAS_TOKEN_DO_NOT_RETAIN"
+	writeGitHubActionsWorkflowForTest(t, dir, "bad-alias.yml", `name: bad alias
+jobs:
+  test:
+    steps:
+      - uses: owner/repo@main
+        with:
+          token: *FAKE_CLI_GHA_ALIAS_TOKEN_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, ".github/workflows/bad-alias.yml")
+	assertContains(t, stderr, "document 1")
+	assertContains(t, stderr, "invalid YAML")
+	for _, forbidden := range []string{fakeAlias, "unknown anchor", "token:", "with:", "owner/repo@main"} {
+		if strings.Contains(stderr, forbidden) {
+			t.Fatalf("stderr contains %q: %s", forbidden, stderr)
+		}
+	}
+}
+
+func TestRunScanGitHubActionsMalformedThirdDocumentErrorIsSanitized(t *testing.T) {
+	dir := t.TempDir()
+	const fakeAlias = "FAKE_CLI_GHA_THIRD_DOC_ALIAS_DO_NOT_RETAIN"
+	writeGitHubActionsWorkflowForTest(t, dir, "bad-third.yml", `name: valid
+jobs:
+  test:
+    steps:
+      - uses: owner/repo@0123456789abcdef0123456789abcdef01234567
+---
+name: ignored second document
+env:
+  TOKEN: FAKE_CLI_GHA_IGNORED_DOC_VALUE_DO_NOT_RETAIN
+---
+with:
+  token: *FAKE_CLI_GHA_THIRD_DOC_ALIAS_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", dir)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, ".github/workflows/bad-third.yml")
+	assertContains(t, stderr, "document 3")
+	assertContains(t, stderr, "invalid YAML")
+	for _, forbidden := range []string{fakeAlias, "FAKE_CLI_GHA_IGNORED_DOC_VALUE_DO_NOT_RETAIN", "unknown anchor", "token:", "with:", "env:"} {
+		if strings.Contains(stderr, forbidden) {
+			t.Fatalf("stderr contains %q: %s", forbidden, stderr)
+		}
+	}
+}
+
 func TestRunScanPublicDemoFixtureEndToEnd(t *testing.T) {
 	demoDir, err := filepath.Abs(publicDemoFixture)
 	if err != nil {
@@ -253,6 +484,24 @@ func TestRunScanPublicDemoFixtureEndToEnd(t *testing.T) {
 		t.Fatalf("demo JSON validation = %#v, want one remediated PP-K8S-001 result", report.Validation)
 	}
 	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsDemoFixture(t *testing.T) {
+	demoDir, err := filepath.Abs(ghaDemoFixture)
+	if err != nil {
+		t.Fatalf("resolve GitHub Actions demo fixture: %v", err)
+	}
+
+	stdout, stderr, code := runCommand("scan", demoDir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 1\n")
+	assertContains(t, stdout, "Rule: PP-GHA-001\n")
+	assertContains(t, stdout, "actions/checkout@v4")
+	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) || strings.Contains(stdout, "Remediation:") {
+		t.Fatalf("GitHub Actions demo output contains unsupported text: %s", stdout)
+	}
 }
 
 func TestRunScanInvalidFixtureReturnsTwoAndWritesErrorToStderr(t *testing.T) {
@@ -2012,6 +2261,35 @@ func writeFileForTest(t *testing.T, dir, name, content string) {
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 		t.Fatalf("write %s: %v", name, err)
 	}
+}
+
+func writeGitHubActionsWorkflowForTest(t *testing.T, root, name, content string) {
+	t.Helper()
+	dir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir workflows: %v", err)
+	}
+	writeFileForTest(t, dir, name, content)
+}
+
+func assertDoesNotContainGitHubActionsSecretValues(t *testing.T, outputs ...string) {
+	t.Helper()
+	for _, output := range outputs {
+		for _, forbidden := range []string{
+			"FAKE_CLI_GHA_ENV_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_GHA_MALFORMED_SECRET_DO_NOT_RETAIN",
+		} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("output contains GitHub Actions secret-like value %q: %s", forbidden, output)
+			}
+		}
+	}
+}
+
+func legacyGitHubActionsRuleWording() string {
+	return "third" + "-party"
 }
 
 func listDirNames(t *testing.T, dir string) []string {

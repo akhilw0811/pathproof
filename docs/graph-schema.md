@@ -19,6 +19,13 @@ stable deterministic hashes of typed identities.
 - `Secret`: a parsed Kubernetes core `v1` Secret metadata object. Secret node
   names use `kubernetes://<namespace>/secret/<name>`. Secret values are never
   ingested or represented in graph nodes.
+- `Workflow`: a local GitHub Actions workflow file under `.github/workflows`.
+  Workflow node names use `githubactions://<relative-workflow-path>`.
+- `WorkflowJob`: a GitHub Actions job in a parsed workflow. Job node names use
+  `githubactions://<relative-workflow-path>/job/<job_id>`.
+- `GitHubAction`: one parsed workflow step with a `uses:` value. Action node
+  names include the relative workflow path, job ID, step index, and raw
+  `uses:` value.
 
 ## Edge Kinds
 
@@ -30,6 +37,8 @@ stable deterministic hashes of typed identities.
   Permission.
 - `CanRead`: a ServiceAccount can read a parsed Secret under PathProof's static
   RBAC authorization model.
+- `DefinesJob`: a GitHub Actions workflow defines a job.
+- `UsesAction`: a GitHub Actions job step uses an action reference.
 
 ## Evidence
 
@@ -129,6 +138,36 @@ source references, canonical permission fields, and matched authorization
 facts. It never includes Secret values, raw manifests, YAML snippets, or
 arbitrary metadata maps.
 
+`UsesAction` edges include optional typed metadata:
+
+```json
+{
+  "metadata": {
+    "github_action_use": {
+      "workflow_source_reference": ".github/workflows/build.yml#document=1",
+      "workflow_file": ".github/workflows/build.yml",
+      "workflow_name": "Build",
+      "job_id": "test",
+      "step_index": 0,
+      "step_name": "Checkout",
+      "uses": "actions/checkout@v4",
+      "owner": "actions",
+      "repo": "checkout",
+      "path": "",
+      "ref": "v4"
+    }
+  }
+}
+```
+
+This metadata is the input for `PP-GHA-001`. It contains only deterministic
+workflow source identity and the static `uses:` value. GitHub Actions parsing
+does not retain or serialize `env` values, `with` values, `secrets`, token
+values, run scripts, or raw workflow documents. PathProof does not evaluate
+GitHub expressions. A `uses:` value that is entirely an expression is not
+modeled as a static action reference for this rule; a static `owner/repo` with
+an expression in the ref is modeled and treated as unpinned.
+
 PathProof's static Secret read model is:
 
 - `get` or `*` with empty `resourceNames` matches every parsed Secret in the
@@ -146,8 +185,8 @@ actually issued a Secret read request.
 
 ## Findings
 
-Findings are produced by read-only analysis over the in-memory graph. The first
-implemented rule is:
+Findings are produced by read-only analysis over the in-memory graph.
+Implemented rules are:
 
 - Rule ID: `PP-K8S-001`
 - Title: `Public workload can read Kubernetes Secret`
@@ -155,28 +194,49 @@ implemented rule is:
 - Required path:
   `PublicEndpoint --RoutesTo--> Workload --RunsAs--> ServiceAccount --CanRead--> Secret`
 
-A finding is emitted only when all four nodes exist with the expected kinds and
-all three directed edges exist with the expected kinds. The ordered finding
-chain stores the four node IDs followed by the three edge IDs in path order.
-Multiple public endpoints, workloads, or Secrets create distinct findings when
-they form distinct chains. Multiple independent RBAC authorization records on a
-single `CanRead` edge remain attached to the same finding through that edge's
-aggregated evidence.
+- Rule ID: `PP-GHA-001`
+- Title:
+  `GitHub Actions workflow uses an action that is not pinned to a full commit SHA`
+- Severity: fixed `Medium`
+- Required path:
+  `Workflow --DefinesJob--> WorkflowJob --UsesAction--> GitHubAction`
 
-Finding IDs are deterministic and stable. They are SHA-256 hashes of a
+`PP-K8S-001` is emitted only when all four Kubernetes nodes exist with the
+expected kinds and all three directed edges exist with the expected kinds. The
+ordered finding chain stores the four node IDs followed by the three edge IDs
+in path order. Multiple public endpoints, workloads, or Secrets create
+distinct findings when they form distinct chains. Multiple independent RBAC
+authorization records on a single `CanRead` edge remain attached to the same
+finding through that edge's aggregated evidence.
+
+`PP-GHA-001` is emitted only when the workflow, job, and action nodes exist
+with the expected kinds, the two directed edges exist with the expected kinds,
+and the `UsesAction` metadata describes a static remote GitHub action
+reference whose ref is missing or is not exactly 40 hexadecimal characters.
+Local actions beginning with `./`, Docker actions beginning with `docker://`,
+and `uses:` values that are entirely expressions do not create findings. Tags,
+branches, semver refs, and expression refs on an otherwise static
+`owner/repo` action are unpinned. PathProof does not verify whether a commit
+SHA exists.
+
+Finding IDs are deterministic and stable. `PP-K8S-001` IDs are SHA-256 hashes of a
 canonical JSON identity containing only fixed field names for `rule_id`,
 ordered `node_ids`, and ordered `edge_ids`. Evidence, source references,
 summary text, title, and severity are not part of finding identity.
+`PP-GHA-001` IDs are SHA-256 hashes of a canonical JSON identity containing
+`rule_id`, workflow file, job ID, step index, action owner, repo, path, and
+ref.
 
-Finding evidence preserves the complete ordered edge evidence for `RoutesTo`,
-`RunsAs`, and `CanRead`. `source_references` are derived from those edge
-evidence sources in chain order, omit empty strings, and deduplicate exact
-repeated references while preserving first appearance. They are not globally
-sorted.
+Finding evidence preserves the complete ordered edge evidence for the matched
+path. `source_references` are derived from those edge evidence sources in
+chain order, omit empty strings, and deduplicate exact repeated references
+while preserving first appearance. They are not globally sorted.
 
-Secret values are absent from findings because Secret values are never ingested
-into parser output or graph evidence. The analyzer does not redact arbitrary
-strings from graph evidence.
+Secret values are absent from findings because Secret values are never
+ingested into parser output or graph evidence. GitHub Actions env, with,
+secret, token, and run values are absent from findings because they are never
+retained by the workflow parser or graph builder. The analyzer does not redact
+arbitrary strings from graph evidence.
 
 The scan CLI uses a private presentation projection and does not change the
 internal graph or analysis schemas. JSON scan output has this stable top-level
@@ -191,9 +251,10 @@ shape:
 
 SARIF scan output is also a private CLI projection, not a graph schema. It is
 selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
-with one PathProof run, one deterministic `PP-K8S-001` rule entry, and one
-result per finding. Result properties include finding ID, severity, ordered
-node IDs, ordered edge IDs, and clean display source references when available.
+with one PathProof run, deterministic rule entries for `PP-K8S-001` and
+`PP-GHA-001`, and one result per finding. Result properties include finding
+ID, severity, ordered node IDs, ordered edge IDs, and clean display source
+references when available.
 
 SARIF locations are derived only from structured source-reference fields whose
 entire value is a clean `filename#document=N` reference. PathProof does not
@@ -382,8 +443,12 @@ resource rules in the same Role or ClusterRole are still modeled.
 
 The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
-in-place patch application, live validation, or attack-path rules beyond
-`PP-K8S-001`. The scan CLI currently supports local Kubernetes YAML
-directories only. Patch previews and patch output are limited to
-`NarrowBindingSubject` and do not cover RBAC rule edits, Secret-bearing source
-files, or broader YAML patch types.
+workflow execution, GitHub API state, expression evaluation, workflow
+permissions, OIDC trust, reusable workflow resolution, action source
+inspection, CI/CD-to-cloud attack paths, in-place patch application, live
+validation, or attack-path rules beyond `PP-K8S-001` and `PP-GHA-001`. The
+scan CLI currently supports local Kubernetes YAML directories and local
+GitHub Actions workflow files under `.github/workflows`. Patch previews and
+patch output are limited to Kubernetes `NarrowBindingSubject` and do not cover
+`PP-GHA-001`, RBAC rule edits, Secret-bearing source files, or broader YAML
+patch types.

@@ -101,8 +101,11 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 			{
 				Tool: sarifTool{
 					Driver: sarifDriver{
-						Name:  "PathProof",
-						Rules: []sarifRule{sarifPublicWorkloadCanReadSecretRule()},
+						Name: "PathProof",
+						Rules: []sarifRule{
+							sarifPublicWorkloadCanReadSecretRule(),
+							sarifGitHubActionsUnpinnedActionRule(),
+						},
 					},
 				},
 				Results: results,
@@ -122,6 +125,20 @@ func sarifPublicWorkloadCanReadSecretRule() sarifRule {
 			Level: "error",
 		},
 		Help: sarifMessage{Text: "PathProof provides deterministic remediation plans for verified paths. Where applicable, NarrowBindingSubject patch support can remove the implicated ServiceAccount subject from a RoleBinding or ClusterRoleBinding."},
+	}
+}
+
+func sarifGitHubActionsUnpinnedActionRule() sarifRule {
+	const title = "GitHub Actions workflow uses an action that is not pinned to a full commit SHA"
+	return sarifRule{
+		ID:               string(analysis.RuleGitHubActionsUnpinnedAction),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects GitHub Actions uses: references that are not pinned to a 40-character commit SHA."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "warning",
+		},
+		Help: sarifMessage{Text: "Pin GitHub Actions uses: references to a full 40-character commit SHA. Local actions and docker:// actions are outside this rule."},
 	}
 }
 

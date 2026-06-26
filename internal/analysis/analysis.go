@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strconv"
 
 	"pathproof/internal/graph"
 )
@@ -15,10 +16,13 @@ type Severity string
 
 const (
 	RulePublicWorkloadCanReadSecret RuleID   = "PP-K8S-001"
+	RuleGitHubActionsUnpinnedAction RuleID   = "PP-GHA-001"
 	SeverityHigh                    Severity = "High"
+	SeverityMedium                  Severity = "Medium"
 )
 
 const publicWorkloadCanReadSecretTitle = "Public workload can read Kubernetes Secret"
+const githubActionsUnpinnedActionTitle = "GitHub Actions workflow uses an action that is not pinned to a full commit SHA"
 
 type Finding struct {
 	ID               FindingID         `json:"id"`
@@ -44,6 +48,17 @@ type findingIdentity struct {
 	EdgeIDs []graph.EdgeID `json:"edge_ids"`
 }
 
+type githubActionsFindingIdentity struct {
+	RuleID       RuleID `json:"rule_id"`
+	WorkflowFile string `json:"workflow_file"`
+	JobID        string `json:"job_id"`
+	StepIndex    int    `json:"step_index"`
+	Owner        string `json:"owner"`
+	Repo         string `json:"repo"`
+	Path         string `json:"path,omitempty"`
+	Ref          string `json:"ref,omitempty"`
+}
+
 func Analyze(g *graph.Graph) []Finding {
 	findings := make([]Finding, 0)
 	if g == nil {
@@ -51,8 +66,10 @@ func Analyze(g *graph.Graph) []Finding {
 	}
 
 	var routesTo []graph.Edge
+	var definesJob []graph.Edge
 	runsAsByWorkload := make(map[graph.NodeID][]graph.Edge)
 	canReadByServiceAccount := make(map[graph.NodeID][]graph.Edge)
+	usesActionByJob := make(map[graph.NodeID][]graph.Edge)
 	for _, edge := range g.Edges() {
 		switch edge.Kind {
 		case graph.RoutesTo:
@@ -61,6 +78,10 @@ func Analyze(g *graph.Graph) []Finding {
 			runsAsByWorkload[edge.From] = append(runsAsByWorkload[edge.From], edge)
 		case graph.CanRead:
 			canReadByServiceAccount[edge.From] = append(canReadByServiceAccount[edge.From], edge)
+		case graph.DefinesJob:
+			definesJob = append(definesJob, edge)
+		case graph.UsesAction:
+			usesActionByJob[edge.From] = append(usesActionByJob[edge.From], edge)
 		}
 	}
 
@@ -95,10 +116,98 @@ func Analyze(g *graph.Graph) []Finding {
 		}
 	}
 
+	for _, defines := range definesJob {
+		workflow, ok := nodeOfKind(g, defines.From, graph.Workflow)
+		if !ok {
+			continue
+		}
+		job, ok := nodeOfKind(g, defines.To, graph.WorkflowJob)
+		if !ok {
+			continue
+		}
+		for _, uses := range usesActionByJob[job.ID] {
+			action, ok := nodeOfKind(g, uses.To, graph.GitHubAction)
+			if !ok {
+				continue
+			}
+			finding, ok := newGitHubActionsUnpinnedActionFinding(workflow, job, action, defines, uses)
+			if ok {
+				findings = append(findings, finding)
+			}
+		}
+	}
+
 	sort.Slice(findings, func(i, j int) bool {
 		return findings[i].ID < findings[j].ID
 	})
 	return findings
+}
+
+func newGitHubActionsUnpinnedActionFinding(workflow, job, action graph.Node, definesJob, usesAction graph.Edge) (Finding, bool) {
+	if usesAction.Metadata == nil || usesAction.Metadata.GitHubActionUse == nil {
+		return Finding{}, false
+	}
+	actionUse := *usesAction.Metadata.GitHubActionUse
+	if actionUse.Owner == "" || actionUse.Repo == "" || isFullCommitSHA(actionUse.Ref) {
+		return Finding{}, false
+	}
+
+	nodeIDs := []graph.NodeID{workflow.ID, job.ID, action.ID}
+	edgeIDs := []graph.EdgeID{definesJob.ID, usesAction.ID}
+	id, err := stableGitHubActionsFindingID(actionUse)
+	if err != nil {
+		return Finding{}, false
+	}
+	evidence := []FindingEvidence{
+		findingEvidence(definesJob),
+		findingEvidence(usesAction),
+	}
+	return Finding{
+		ID:               id,
+		RuleID:           RuleGitHubActionsUnpinnedAction,
+		Title:            githubActionsUnpinnedActionTitle,
+		Severity:         SeverityMedium,
+		NodeIDs:          append([]graph.NodeID(nil), nodeIDs...),
+		EdgeIDs:          append([]graph.EdgeID(nil), edgeIDs...),
+		Summary:          "GitHub Actions workflow " + actionUse.WorkflowFile + " job " + actionUse.JobID + " step " + stepIndexString(actionUse.StepIndex) + " uses " + actionUse.Uses + ", which is not pinned to a full commit SHA.",
+		Evidence:         cloneFindingEvidence(evidence),
+		SourceReferences: sourceReferences(evidence),
+	}, true
+}
+
+func stableGitHubActionsFindingID(actionUse graph.GitHubActionUse) (FindingID, error) {
+	data, err := json.Marshal(githubActionsFindingIdentity{
+		RuleID:       RuleGitHubActionsUnpinnedAction,
+		WorkflowFile: actionUse.WorkflowFile,
+		JobID:        actionUse.JobID,
+		StepIndex:    actionUse.StepIndex,
+		Owner:        actionUse.Owner,
+		Repo:         actionUse.Repo,
+		Path:         actionUse.Path,
+		Ref:          actionUse.Ref,
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return FindingID("finding:" + string(RuleGitHubActionsUnpinnedAction) + ":" + hex.EncodeToString(sum[:])), nil
+}
+
+func isFullCommitSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func stepIndexString(index int) string {
+	return strconv.Itoa(index)
 }
 
 func nodeOfKind(g *graph.Graph, id graph.NodeID, kind graph.NodeKind) (graph.Node, bool) {

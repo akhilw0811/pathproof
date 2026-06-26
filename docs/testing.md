@@ -33,23 +33,33 @@ errors, accepted `--format json` and `--format=json` syntax, accepted
 syntax, missing and non-directory path errors, human output, JSON output, SARIF
 output, exactly one trailing newline, stderr-only errors, output write failures,
 deterministic repeated output, deterministic input file ordering, and
-Secret-value absence from stdout and stderr. CLI projection tests verify that
-finding path entries preserve node ID/kind/name, evidence entries preserve edge
-ID/kind/source/detail, and inconsistent finding-to-graph projection is treated
-as an internal scan error without partial stdout.
+Secret-value absence from stdout and stderr. GitHub Actions CLI coverage
+asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
+mixed Kubernetes and GitHub Actions findings are deterministic, `PP-GHA-001`
+appears in human and JSON output without remediation, patch previews, patch
+outputs, or validation results, and secret-like workflow env, with, and run
+values are absent from stdout, stderr, JSON, SARIF, and errors. CLI projection
+tests verify that finding path entries preserve node ID/kind/name, evidence
+entries preserve edge ID/kind/source/detail, generic path edge continuity is
+enforced for all finding shapes, and inconsistent finding-to-graph projection
+is treated as an internal scan error without partial stdout.
 
 SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
-PathProof driver run, exactly one deterministic `PP-K8S-001` rule entry, one
-result for the vulnerable fixture, zero results for the safe fixture,
-deterministic rule/result fields, byte-identical repeated scans, and unchanged
-exit codes. Source-location tests cover URI-encoded relative artifact URIs for
-paths with spaces, display-safe relative `properties.source_references`,
-omission of malformed document suffixes, omission of outside-root references,
-and refusal to parse source references embedded in arbitrary prose. SARIF patch
-flag tests verify that write-patch and validation side effects still occur
-under the existing flag contract while SARIF stdout remains findings-only and
-omits patch previews, patch outputs, validation arrays, diffs, patched
-contents, temporary paths, raw manifests, and Secret values.
+PathProof driver run, deterministic rule entries for `PP-K8S-001` and
+`PP-GHA-001`, one result for vulnerable fixtures, zero results for safe
+fixtures, deterministic rule/result fields, byte-identical repeated scans, and
+unchanged exit codes. GitHub Actions SARIF coverage asserts `PP-GHA-001`
+severity maps to `warning`, workflow artifact URIs are relative and URI-safe,
+line numbers are not guessed, rule text avoids the old inaccurate scope
+wording, and secret-like workflow values are absent. Source-location
+tests cover URI-encoded relative artifact URIs for paths with spaces,
+display-safe relative `properties.source_references`, omission of malformed
+document suffixes, omission of outside-root references, and refusal to parse
+source references embedded in arbitrary prose. SARIF patch flag tests verify
+that write-patch and validation side effects still occur under the existing
+flag contract while SARIF stdout remains findings-only and omits patch
+previews, patch outputs, validation arrays, diffs, patched contents, temporary
+paths, raw manifests, and Secret values.
 
 The public demo fixture under `examples/kubernetes/public-secret-path` is
 covered by a CLI smoke test. It asserts the documented loop: vulnerable scan
@@ -69,6 +79,14 @@ decoding, deterministic ordering, duplicate source preservation, and regression
 checks that Secret `data`, `stringData`, and values are absent from serialized
 parser output and parse errors.
 
+GitHub Actions parser tests cover workflow file discovery under
+`.github/workflows`, `.yml` and `.yaml` filtering, one-job workflows, multiple
+jobs sorted by job ID, run-only step omission, deterministic file ordering,
+malformed workflow errors with filenames, paths with spaces, missing workflow
+directories, and regression checks that env values, with values, secret-like
+tokens, run scripts, and raw workflow documents are absent from serialized
+parser output and errors.
+
 Kubernetes routing tests cover deterministic graph construction, source
 evidence, duplicate conflict rejection before graph mutation, namespace-scoped
 matching, observed and inferred ServiceAccount provenance, and preservation of
@@ -87,6 +105,13 @@ evidence deduplication, conflict atomicity, typed structured `CanRead`
 authorization metadata, deterministic metadata ordering, and regression checks
 that Secret values are absent from graph JSON, metadata, and evidence.
 
+GitHub Actions routing tests cover deterministic `Workflow`, `WorkflowJob`,
+and `GitHubAction` node construction, `DefinesJob` and `UsesAction` edges,
+source evidence, repeated action uses remaining distinct by step index, static
+owner/repo/path/ref parsing, local and Docker action exclusion from static
+action metadata, expression handling, and regression checks that ignored
+workflow values are absent from graph JSON.
+
 Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
 edge semantics, exact required node and edge kind validation, unrelated graph
 noise, cycles, deterministic finding IDs and ordering, ordered node and edge
@@ -99,6 +124,16 @@ node and edge evidence preservation, nil and empty graph behavior, and fixed
 `High` severity. The Secret-value regression for analysis runs through the real
 Kubernetes parser and routing pipeline before marshalling findings; analysis
 preserves graph evidence and does not perform generic redaction.
+
+GitHub Actions analysis tests cover `PP-GHA-001` positives for action refs
+such as `actions/checkout@v4`, `docker/login-action@main`,
+`owner/repo/path@v1.2.3`, missing refs, and expression refs on static
+`owner/repo` actions. Negative tests cover local actions, Docker actions,
+entire expression `uses:` values, and refs pinned to exactly 40 hexadecimal
+characters including uppercase hex. Coverage also asserts fixed `Medium`
+severity, deterministic repeated analysis, stable finding IDs, finding ID
+changes when action refs change, absence of the old inaccurate scope wording, and
+secret-like workflow values absent from finding JSON.
 
 Remediation tests cover the read-only `internal/remediation.Build` API for
 `PP-K8S-001`. Coverage asserts complete advisory options for

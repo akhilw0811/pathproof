@@ -2,7 +2,7 @@
 
 PathProof is a small Go CLI with early in-memory graph domain logic. The
 current executable lives at `cmd/pathproof` and supports `pathproof version`
-and local Kubernetes YAML directory scans with:
+and local directory scans with:
 
 - `pathproof scan <directory>`
 - `pathproof scan --format json <directory>`
@@ -13,9 +13,10 @@ and local Kubernetes YAML directory scans with:
 - `pathproof scan --write-patches <output-directory> --validate-patches <directory>`
 
 The scan command is intentionally only an orchestration layer. It validates the
-local directory input, parses Kubernetes manifests, constructs the in-memory
-graph, runs deterministic analysis, builds advisory remediation plans for
-supported findings, optionally builds read-only patch previews for supported
+local directory input, parses Kubernetes manifests and local GitHub Actions
+workflows under `.github/workflows`, constructs the in-memory graph, runs
+deterministic analysis, builds advisory remediation plans for supported
+Kubernetes findings, optionally builds read-only patch previews for supported
 remediation changes, optionally writes patched copies for supported generated
 previews to a separate output directory, optionally validates written patches
 by rescanning a temporary complete patched manifest overlay, projects findings,
@@ -44,6 +45,19 @@ Secret parsing intentionally reads only namespace, name, and source location.
 Secret `data`, `stringData`, and Secret values are never ingested, stored,
 logged, serialized, or exposed by parser or graph output.
 
+Implemented GitHub Actions parsing lives under
+`internal/parser/githubactions`. It reads only `.github/workflows/*.yml` and
+`.github/workflows/*.yaml` under the scan root and emits explicit Go types for
+workflow name, workflow source, job IDs, step indexes, optional step names, and
+static `uses:` values. It does not require a Git repository, call GitHub APIs,
+execute workflows, evaluate expressions, resolve reusable workflows, inspect
+action source code, parse workflow permissions, expand matrices, or retain
+`env`, `with`, `secrets`, token values, run scripts, or raw workflow
+documents. A `uses:` value that is entirely an expression is ignored by the
+implemented rule because it is not a statically recognizable action reference.
+If a `uses:` value has a static `owner/repo` shape but an expression in the
+ref, it is treated as unpinned because the ref is not a full commit SHA.
+
 Implemented Kubernetes routing lives under `internal/routing/kubernetes`.
 It builds deterministic graph relationships for:
 
@@ -71,6 +85,16 @@ canonical permission, matched verb, effective scope, and parsed Secret identity
 and source references. It does not include Secret values, raw manifests, YAML
 snippets, or arbitrary metadata maps.
 
+Implemented GitHub Actions routing lives under
+`internal/routing/githubactions`. It builds only the graph needed for the
+current rule: `Workflow` nodes, `WorkflowJob` nodes, `GitHubAction` step-use
+nodes, `DefinesJob` edges, and `UsesAction` edges. `UsesAction` metadata
+stores the workflow source reference, relative workflow file, workflow name or
+file fallback, job ID, step index, optional step name, raw `uses:` value, and
+parsed owner, repo, path, and ref when the action reference is statically
+recognizable. It does not model CI/CD identities, workflow permissions, OIDC
+trust, reusable workflow calls, cloud trust, or runtime behavior.
+
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
 graph storage, routing construction, analysis, and CLI presentation remain
 separate. The CLI report projection is private to `cmd/pathproof`; it resolves
@@ -80,8 +104,8 @@ be projected against the graph, the scan is treated as an internal scan error.
 
 Implemented graph analysis lives under `internal/analysis`. It is read-only:
 it consumes the in-memory graph and emits structured findings without changing
-nodes, edges, parser output, or routing behavior. The only implemented rule is
-`PP-K8S-001`, which requires this exact directed chain:
+nodes, edges, parser output, or routing behavior. `PP-K8S-001` requires this
+exact directed chain:
 
 `PublicEndpoint --RoutesTo--> Workload --RunsAs--> ServiceAccount --CanRead--> Secret`
 
@@ -89,6 +113,16 @@ The rule does not infer missing relationships. Unresolved roles and unsupported
 authorization inputs create no findings unless routing already produced the
 required `CanRead` edge. Severity is fixed at `High` for this rule and is not
 ML-ranked or score-based.
+
+`PP-GHA-001` requires this exact directed chain:
+
+`Workflow --DefinesJob--> WorkflowJob --UsesAction--> GitHubAction`
+
+The `UsesAction` edge must have static GitHub action metadata with nonempty
+owner and repo fields, and the ref must be missing or not exactly 40
+hexadecimal characters. Local actions beginning with `./`, Docker actions
+beginning with `docker://`, and `uses:` values that are entirely expressions do
+not produce findings. Severity is fixed at `Medium`.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
@@ -100,7 +134,8 @@ read-only: it consumes the graph and analysis findings, validates supported
 authorization metadata, and emits complete advisory options. It does not parse
 human-readable evidence prose and does not modify source manifests. The
 implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
-`NarrowBindingSubject`.
+`NarrowBindingSubject`. `PP-GHA-001` receives no remediation plan, patch
+preview, patch output, or validation result in this slice.
 
 Optional patch preview generation lives under `internal/patchpreview`. It is
 also read-only: it consumes the scan root and remediation plans, resolves
@@ -137,8 +172,9 @@ patch output directory, never writes copied input files to the user-visible
 output directory, and never prints temporary paths or manifest contents.
 
 SARIF output is a findings-only CLI projection. `pathproof scan --format sarif`
-emits SARIF 2.1.0 with one PathProof tool driver, one `PP-K8S-001` rule entry,
-and one result per finding. SARIF stdout omits patch previews, patch output
+emits SARIF 2.1.0 with one PathProof tool driver, deterministic rule entries
+for `PP-K8S-001` and `PP-GHA-001`, and one result per finding. SARIF stdout
+omits patch previews, patch output
 summaries, validation results, unified diffs, patched file contents, temporary
 paths, and raw manifests even when patch flags are supplied. Patch
 write/validation side effects still follow the same scan flag contract. SARIF
@@ -148,7 +184,9 @@ to the scan root and URI-encoded, while display source references in result
 properties remain relative display strings. SARIF does not guess line numbers
 because parser source tracking is currently file/document scoped.
 
-No live Kubernetes authorization evaluation, live validation, in-place patch
+No live Kubernetes authorization evaluation, GitHub API integration, workflow
+execution, expression evaluation, reusable workflow resolution, action source
+inspection, full CI/CD attack-path modeling, live validation, in-place patch
 application, persistence, AI, dashboard, plugin system, external service
 integration, pull request creation, or live Kubernetes cluster integration is
 implemented.

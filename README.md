@@ -1,19 +1,24 @@
 # PathProof
 
-PathProof is a Go-based Kubernetes security graph engine that scans local
-Kubernetes manifests, models public exposure, workloads, ServiceAccounts, RBAC,
-and Secret metadata, detects the `PP-K8S-001` path from a public workload to a
+PathProof is a Go-based security graph engine that scans local Kubernetes
+manifests and local GitHub Actions workflows. It models the smallest current
+Kubernetes slice for public exposure, workloads, ServiceAccounts, RBAC, and
+Secret metadata, detects the `PP-K8S-001` path from a public workload to a
 readable Secret, proposes deterministic remediation, previews and writes
-patched copies, and validates the fix with a rescan.
+patched copies, and validates the fix with a rescan. It also detects
+`PP-GHA-001` when a GitHub Actions `uses:` reference is not pinned to a full
+40-character commit SHA.
 
-PathProof is currently a defensive Go CLI focused on one small, tested
-Kubernetes slice. It scans local YAML manifests, builds an in-memory graph, and
+PathProof is currently a defensive Go CLI focused on two small, tested local
+slices. It scans local YAML manifests and workflows, builds an in-memory graph,
 reports `PP-K8S-001` when an internet-facing workload runs as a ServiceAccount
-that can read a Kubernetes Secret.
+that can read a Kubernetes Secret, and reports `PP-GHA-001` for unpinned
+GitHub Actions action references.
 
-Cloud provider APIs, non-Kubernetes inputs, broader sensitive-resource types,
-live cluster scanning, pull request creation, AI/ML ranking, and dashboards are
-not implemented.
+Cloud provider APIs, full CI/CD attack-path modeling, workflow permissions
+analysis, OIDC trust analysis, reusable workflow resolution, action source
+inspection, broader sensitive-resource types, live cluster scanning, pull
+request creation, AI/ML ranking, and dashboards are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, and internal scan errors exit `2`.
@@ -141,6 +146,21 @@ SARIF export from the CLI is local stdout only. The GitHub Actions workflow
 generates a SARIF file from the public demo fixture and uploads it as a
 workflow artifact.
 
+Scan the GitHub Actions demo fixture:
+
+```sh
+./bin/pathproof scan ./examples/github-actions/unpinned-action
+```
+
+Expected shape:
+
+```text
+Finding count: 1
+Rule: PP-GHA-001
+Title: GitHub Actions workflow uses an action that is not pinned to a full commit SHA
+Severity: Medium
+```
+
 ## CI / SARIF
 
 The GitHub Actions workflow builds and tests PathProof, then runs the built CLI
@@ -177,6 +197,9 @@ only publishes the SARIF file as an artifact.
 - Patched-copy output to a separate directory, never in-place edits.
 - Validation by rescanning a complete temporary patched manifest set.
 - SARIF 2.1.0 finding export for the implemented `PP-K8S-001` rule.
+- Local GitHub Actions workflow parsing under `.github/workflows`.
+- `PP-GHA-001` detection for GitHub Actions `uses:` references that are not
+  pinned to a full 40-character commit SHA.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -187,27 +210,33 @@ generation, and CLI presentation separate.
 The scan loop is:
 
 1. Parse local Kubernetes YAML manifests.
-2. Build an in-memory evidence graph.
-3. Add deterministic routing and RBAC-derived Secret read edges.
-4. Analyze the graph for `PP-K8S-001`.
-5. Build advisory remediation plans from structured graph metadata.
-6. Optionally generate read-only `NarrowBindingSubject` patch previews.
-7. Optionally write patched copies to a separate output directory.
-8. Optionally validate by rescanning a complete temporary overlay that replaces
+2. Parse local GitHub Actions workflow YAML files under `.github/workflows`.
+3. Build an in-memory evidence graph.
+4. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
+5. Add deterministic GitHub Actions workflow/job/action-use edges.
+6. Analyze the graph for `PP-K8S-001` and `PP-GHA-001`.
+7. Build advisory remediation plans from structured graph metadata for
+   supported Kubernetes findings only.
+8. Optionally generate read-only `NarrowBindingSubject` patch previews.
+9. Optionally write patched copies to a separate output directory.
+10. Optionally validate by rescanning a complete temporary overlay that replaces
    original files with generated patched copies.
 
 PathProof does not contact a live cluster, run `kubectl`, apply patches in
-place, create pull requests, persist the graph, or use AI/ML ranking.
+place, execute GitHub Actions workflows, call GitHub APIs, create pull
+requests, persist the graph, or use AI/ML ranking.
 
 ## Current scope
 
 Implemented:
 
 - Local Kubernetes YAML scanning.
+- Local GitHub Actions workflow scanning under `.github/workflows`.
 - Public endpoint to workload routing.
 - ServiceAccount identity modeling.
 - RBAC Secret read analysis.
 - `PP-K8S-001` finding.
+- `PP-GHA-001` finding for action references not pinned to a full commit SHA.
 - SARIF 2.1.0 finding export.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
@@ -217,6 +246,12 @@ Not implemented:
 
 - Live cluster scanning.
 - Cloud provider APIs.
+- Full CI/CD attack-path modeling.
+- Workflow permissions analysis.
+- OIDC trust analysis.
+- Reusable workflow resolution.
+- Action source inspection.
+- Automatic action pinning patches.
 - PR creation.
 - In-place edits.
 - Broad RBAC patching.
@@ -252,6 +287,7 @@ go run ./cmd/pathproof scan ./cmd/pathproof/testdata/scan-safe
 go run ./cmd/pathproof scan --format json ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --format sarif ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --preview-patches ./examples/kubernetes/public-secret-path
+go run ./cmd/pathproof scan ./examples/github-actions/unpinned-action
 ```
 
 Scan exit codes are stable:
