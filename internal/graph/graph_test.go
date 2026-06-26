@@ -759,6 +759,93 @@ func TestGraphGitHubActionsOIDCTokenRequestEdgeMetadataIsCloned(t *testing.T) {
 	}
 }
 
+func TestGraphAWSIAMRoleNodeMetadataIsCloned(t *testing.T) {
+	g := New()
+	role := NewNode(AWSIAMRole, "aws://terraform/aws_iam_role/main.tf/deploy")
+	role.Metadata = &NodeMetadata{AWSIAMRole: &AWSIAMRoleMetadata{
+		Provider:        "aws",
+		ResourceName:    "deploy",
+		SourceReference: "main.tf#resource=aws_iam_role.deploy",
+		TrustedIssuer:   "token.actions.githubusercontent.com",
+		TrustStatements: []AWSOIDCTrustStatement{{
+			StatementIndex: 0,
+			SubjectPatterns: []AWSOIDCSubjectPattern{{
+				Operator: "StringEquals",
+				Pattern:  "repo:owner/repo:pull_request",
+			}},
+			Audiences: []string{"sts.amazonaws.com"},
+		}},
+	}}
+
+	added := mustAddNode(t, g, role)
+	role.Metadata.AWSIAMRole.TrustStatements[0].SubjectPatterns[0].Pattern = "changed"
+	added.Metadata.AWSIAMRole.TrustStatements[0].Audiences[0] = "changed"
+
+	got, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found", added.ID)
+	}
+	if got.Metadata == nil || got.Metadata.AWSIAMRole == nil {
+		t.Fatalf("metadata = %#v, want aws iam role metadata", got.Metadata)
+	}
+	statement := got.Metadata.AWSIAMRole.TrustStatements[0]
+	if statement.SubjectPatterns[0].Pattern != "repo:owner/repo:pull_request" || statement.Audiences[0] != "sts.amazonaws.com" {
+		t.Fatalf("stored metadata changed: %#v", got.Metadata.AWSIAMRole)
+	}
+
+	got.Metadata.AWSIAMRole.TrustStatements[0].SubjectPatterns[0].Operator = "changed"
+	again, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after mutation", added.ID)
+	}
+	if again.Metadata.AWSIAMRole.TrustStatements[0].SubjectPatterns[0].Operator != "StringEquals" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.AWSIAMRole)
+	}
+}
+
+func TestGraphAWSCanAssumeRoleEdgeMetadataIsCloned(t *testing.T) {
+	g := New()
+	capability := mustAddNode(t, g, NewNode(OIDCTokenCapability, "githubactions://.github/workflows/deploy.yml/oidc-token/workflow"))
+	role := mustAddNode(t, g, NewNode(AWSIAMRole, "aws://terraform/aws_iam_role/main.tf/deploy"))
+	edge := NewEdge(CanAssumeRole, capability.ID, role.ID, SourceEvidence{Source: "main.tf#resource=aws_iam_role.deploy", Detail: "assume role"})
+	edge.Metadata = &EdgeMetadata{AWSCanAssumeRole: &AWSCanAssumeRoleMetadata{
+		Provider:         "aws",
+		RoleResourceName: "deploy",
+		TrustedIssuer:    "token.actions.githubusercontent.com",
+		StatementIndex:   0,
+		Audience:         "sts.amazonaws.com",
+		SubjectCandidate: "repo:owner/repo:pull_request",
+		SubjectPattern:   "repo:owner/repo:pull_request",
+		SubjectOperator:  "StringEquals",
+		WorkflowFile:     ".github/workflows/deploy.yml",
+		Scope:            "workflow",
+	}}
+
+	added := mustAddEdge(t, g, edge)
+	edge.Metadata.AWSCanAssumeRole.SubjectCandidate = "changed"
+	added.Metadata.AWSCanAssumeRole.SubjectPattern = "changed"
+
+	got, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found", added.ID)
+	}
+	if got.Metadata == nil || got.Metadata.AWSCanAssumeRole == nil {
+		t.Fatalf("metadata = %#v, want aws assume-role metadata", got.Metadata)
+	}
+	if got.Metadata.AWSCanAssumeRole.SubjectCandidate != "repo:owner/repo:pull_request" || got.Metadata.AWSCanAssumeRole.SubjectPattern != "repo:owner/repo:pull_request" {
+		t.Fatalf("stored metadata changed: %#v", got.Metadata.AWSCanAssumeRole)
+	}
+
+	got.Metadata.AWSCanAssumeRole.SubjectOperator = "changed"
+	again, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found after mutation", added.ID)
+	}
+	if again.Metadata.AWSCanAssumeRole.SubjectOperator != "StringEquals" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.AWSCanAssumeRole)
+	}
+}
+
 func TestGraphAddEdgeRejectsMissingEndpoints(t *testing.T) {
 	g := New()
 	from := mustAddNode(t, g, NewNode(PublicEndpoint, "public-api"))

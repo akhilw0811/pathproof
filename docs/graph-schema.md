@@ -31,6 +31,9 @@ stable deterministic hashes of typed identities.
   `githubactions://<relative-workflow-path>/oidc-token/workflow`. Job-level
   node names use
   `githubactions://<relative-workflow-path>/job/<job_id>/oidc-token`.
+- `AWSIAMRole`: a local Terraform `aws_iam_role` resource with static
+  GitHub Actions OIDC trust metadata. Node names use
+  `aws://terraform/aws_iam_role/<relative-tf-path>/<resource_name>`.
 
 ## Edge Kinds
 
@@ -47,6 +50,9 @@ stable deterministic hashes of typed identities.
 - `CanRequestOIDCToken`: a GitHub Actions workflow or job can request an OIDC
   token because it explicitly grants `id-token: write` or
   `permissions: write-all`.
+- `CanAssumeRole`: a GitHub Actions `OIDCTokenCapability` has one static OIDC
+  subject candidate that matches a parsed AWS IAM role trust statement. This
+  edge is graph-only and exists only when `--repo OWNER/REPO` is supplied.
 
 ## Evidence
 
@@ -290,6 +296,80 @@ scope, job identity when applicable, provider, and modeled permission/access.
 It does not include secrets, environment values, arbitrary `with` values, run
 scripts, raw YAML, OIDC claims, JWTs, cloud trust policies, or unknown
 permission values.
+
+`AWSIAMRole` nodes include optional typed AWS IAM role metadata:
+
+```json
+{
+  "metadata": {
+    "aws_iam_role": {
+      "provider": "aws",
+      "resource_name": "deploy",
+      "source_reference": "main.tf#resource=aws_iam_role.deploy",
+      "trusted_issuer": "token.actions.githubusercontent.com",
+      "trust_statements": [
+        {
+          "statement_index": 0,
+          "subject_patterns": [
+            {
+              "operator": "StringEquals",
+              "pattern": "repo:owner/repo:ref:refs/heads/main"
+            }
+          ],
+          "audiences": ["sts.amazonaws.com"]
+        }
+      ]
+    }
+  }
+}
+```
+
+This metadata is produced only from local static Terraform `aws_iam_role`
+resources whose `assume_role_policy` is a literal heredoc JSON string or
+simple quoted JSON string. It stores only sanitized trust facts: provider,
+resource name, source reference, trusted issuer, supported subject patterns,
+audiences, and statement indexes. It does not include raw Terraform, raw trust
+policy JSON, provider credentials, variables, environment values, access keys,
+secret-like values, ARNs, or unsupported condition values.
+
+`CanAssumeRole` edges include optional typed match metadata:
+
+```json
+{
+  "metadata": {
+    "aws_can_assume_role": {
+      "provider": "aws",
+      "role_resource_name": "deploy",
+      "role_source_reference": "main.tf#resource=aws_iam_role.deploy",
+      "trusted_issuer": "token.actions.githubusercontent.com",
+      "statement_index": 0,
+      "audience": "sts.amazonaws.com",
+      "subject_candidate": "repo:owner/repo:ref:refs/heads/main",
+      "subject_pattern": "repo:owner/repo:ref:refs/heads/main",
+      "subject_operator": "StringEquals",
+      "oidc_capability_source_reference": ".github/workflows/deploy.yml#document=1",
+      "workflow_file": ".github/workflows/deploy.yml",
+      "scope": "job",
+      "job_id": "deploy"
+    }
+  }
+}
+```
+
+`CanAssumeRole` is added only when a GitHub Actions OIDC capability exists,
+`--repo OWNER/REPO` is supplied, the parsed trust statement uses issuer
+`token.actions.githubusercontent.com`, action
+`sts:AssumeRoleWithWebIdentity`, audience `sts.amazonaws.com`, and one
+supported `sub` condition matches a deterministic subject candidate.
+`StringEquals` requires an exact subject match. `StringLike` supports only
+simple `*` wildcard matching. PathProof does not implement a broad IAM
+condition evaluator.
+
+Subject candidates are generated only from parsed GitHub Actions data:
+literal `on.push.branches` values, `pull_request`, `pull_request_target`, and
+static job environment names. PathProof does not infer branch names, expand
+matrices, evaluate expressions, infer repository identity from Git remotes, or
+call GitHub.
 
 PathProof's static Secret read model is:
 
@@ -616,12 +696,17 @@ resource rules in the same Role or ClusterRole are still modeled.
 The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
 workflow execution, GitHub API state, expression evaluation, workflow
-permissions, OIDC trust, reusable workflow resolution, action source
-inspection, CI/CD-to-cloud attack paths, in-place patch application, live
-validation, or attack-path rules beyond `PP-K8S-001`, `PP-GHA-001`, and
-`PP-GHA-002`. The
+permissions, reusable workflow resolution, action source inspection,
+CI/CD-to-cloud findings, in-place patch application, live validation, or
+attack-path rules beyond `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
+`PP-GHA-003`. Terraform support is limited to graph-only static
+`aws_iam_role` GitHub Actions OIDC trust metadata and optional
+`CanAssumeRole` edges when `--repo OWNER/REPO` is supplied; PathProof does not
+execute Terraform, evaluate modules or variables, call AWS or GitHub, validate
+cloud state, or simulate IAM. The
 scan CLI currently supports local Kubernetes YAML directories and local
-GitHub Actions workflow files under `.github/workflows`. Patch previews and
-patch output are limited to Kubernetes `NarrowBindingSubject` and do not cover
-`PP-GHA-001`, `PP-GHA-002`, RBAC rule edits, Secret-bearing source files, or
-broader YAML patch types.
+GitHub Actions workflow files under `.github/workflows` plus local `.tf`
+files for that narrow Terraform slice. Patch previews and patch output are
+limited to Kubernetes `NarrowBindingSubject` and do not cover `PP-GHA-001`,
+`PP-GHA-002`, `PP-GHA-003`, Terraform, RBAC rule edits, Secret-bearing source
+files, or broader YAML patch types.

@@ -22,6 +22,7 @@ const (
 	WorkflowJob         NodeKind = "WorkflowJob"
 	GitHubAction        NodeKind = "GitHubAction"
 	OIDCTokenCapability NodeKind = "OIDCTokenCapability"
+	AWSIAMRole          NodeKind = "AWSIAMRole"
 )
 
 type NodeID string
@@ -38,6 +39,7 @@ const (
 	DefinesJob          EdgeKind = "DefinesJob"
 	UsesAction          EdgeKind = "UsesAction"
 	CanRequestOIDCToken EdgeKind = "CanRequestOIDCToken"
+	CanAssumeRole       EdgeKind = "CanAssumeRole"
 )
 
 var (
@@ -62,6 +64,7 @@ type SourceEvidence struct {
 type NodeMetadata struct {
 	GitHubActionsWorkflow            *GitHubActionsWorkflow            `json:"github_actions_workflow,omitempty"`
 	GitHubActionsOIDCTokenCapability *GitHubActionsOIDCTokenCapability `json:"github_actions_oidc_token_capability,omitempty"`
+	AWSIAMRole                       *AWSIAMRoleMetadata               `json:"aws_iam_role,omitempty"`
 }
 
 type EdgeMetadata struct {
@@ -69,6 +72,42 @@ type EdgeMetadata struct {
 	GitHubActionUse                 *GitHubActionUse                 `json:"github_action_use,omitempty"`
 	GitHubActionsWorkflowJob        *GitHubActionsWorkflowJob        `json:"github_actions_workflow_job,omitempty"`
 	GitHubActionsOIDCTokenRequest   *GitHubActionsOIDCTokenRequest   `json:"github_actions_oidc_token_request,omitempty"`
+	AWSCanAssumeRole                *AWSCanAssumeRoleMetadata        `json:"aws_can_assume_role,omitempty"`
+}
+
+type AWSIAMRoleMetadata struct {
+	Provider        string                  `json:"provider"`
+	ResourceName    string                  `json:"resource_name"`
+	SourceReference string                  `json:"source_reference"`
+	TrustedIssuer   string                  `json:"trusted_issuer,omitempty"`
+	TrustStatements []AWSOIDCTrustStatement `json:"trust_statements,omitempty"`
+}
+
+type AWSOIDCTrustStatement struct {
+	StatementIndex  int                     `json:"statement_index"`
+	SubjectPatterns []AWSOIDCSubjectPattern `json:"subject_patterns,omitempty"`
+	Audiences       []string                `json:"audiences,omitempty"`
+}
+
+type AWSOIDCSubjectPattern struct {
+	Operator string `json:"operator"`
+	Pattern  string `json:"pattern"`
+}
+
+type AWSCanAssumeRoleMetadata struct {
+	Provider                      string `json:"provider"`
+	RoleResourceName              string `json:"role_resource_name"`
+	RoleSourceReference           string `json:"role_source_reference"`
+	TrustedIssuer                 string `json:"trusted_issuer"`
+	StatementIndex                int    `json:"statement_index"`
+	Audience                      string `json:"audience"`
+	SubjectCandidate              string `json:"subject_candidate"`
+	SubjectPattern                string `json:"subject_pattern"`
+	SubjectOperator               string `json:"subject_operator"`
+	OIDCCapabilitySourceReference string `json:"oidc_capability_source_reference"`
+	WorkflowFile                  string `json:"workflow_file"`
+	Scope                         string `json:"scope"`
+	JobID                         string `json:"job_id,omitempty"`
 }
 
 type GitHubActionsWorkflow struct {
@@ -379,6 +418,11 @@ func cloneNode(node Node) Node {
 			capability := *metadata.GitHubActionsOIDCTokenCapability
 			metadata.GitHubActionsOIDCTokenCapability = &capability
 		}
+		if metadata.AWSIAMRole != nil {
+			role := *metadata.AWSIAMRole
+			role.TrustStatements = cloneAWSOIDCTrustStatements(role.TrustStatements)
+			metadata.AWSIAMRole = &role
+		}
 		node.Metadata = &metadata
 	}
 	return node
@@ -411,6 +455,10 @@ func cloneEdge(edge Edge) Edge {
 		request := *metadata.GitHubActionsOIDCTokenRequest
 		metadata.GitHubActionsOIDCTokenRequest = &request
 	}
+	if metadata.AWSCanAssumeRole != nil {
+		canAssume := *metadata.AWSCanAssumeRole
+		metadata.AWSCanAssumeRole = &canAssume
+	}
 	edge.Metadata = &metadata
 	return edge
 }
@@ -436,6 +484,26 @@ func cloneStrings(values []string) []string {
 		return nil
 	}
 	return append([]string(nil), values...)
+}
+
+func cloneAWSOIDCTrustStatements(statements []AWSOIDCTrustStatement) []AWSOIDCTrustStatement {
+	if statements == nil {
+		return nil
+	}
+	cloned := make([]AWSOIDCTrustStatement, len(statements))
+	for i, statement := range statements {
+		cloned[i] = statement
+		cloned[i].SubjectPatterns = cloneAWSOIDCSubjectPatterns(statement.SubjectPatterns)
+		cloned[i].Audiences = cloneStrings(statement.Audiences)
+	}
+	return cloned
+}
+
+func cloneAWSOIDCSubjectPatterns(patterns []AWSOIDCSubjectPattern) []AWSOIDCSubjectPattern {
+	if patterns == nil {
+		return nil
+	}
+	return append([]AWSOIDCSubjectPattern(nil), patterns...)
 }
 
 func cloneGitHubActionsCheckoutHeadSelectors(selectors []GitHubActionsCheckoutHeadSelector) []GitHubActionsCheckoutHeadSelector {

@@ -25,13 +25,16 @@ type Source struct {
 type Workflow struct {
 	Name                      string            `json:"name,omitempty"`
 	Source                    Source            `json:"source"`
+	TriggersPullRequest       bool              `json:"triggers_pull_request,omitempty"`
 	TriggersPullRequestTarget bool              `json:"triggers_pull_request_target,omitempty"`
+	PushBranches              []string          `json:"push_branches,omitempty"`
 	PermissionGrants          []PermissionGrant `json:"permission_grants,omitempty"`
 	Jobs                      []Job             `json:"jobs,omitempty"`
 }
 
 type Job struct {
 	ID               string            `json:"id"`
+	Environment      string            `json:"environment,omitempty"`
 	PermissionGrants []PermissionGrant `json:"permission_grants,omitempty"`
 	Steps            []Step            `json:"steps,omitempty"`
 }
@@ -144,7 +147,9 @@ func parseWorkflow(r io.Reader, root, filename string) (Workflow, error) {
 		workflow.Name = name.Value
 	}
 	if on := mappingValue(&document, "on"); on != nil {
+		workflow.TriggersPullRequest = hasTrigger(on, "pull_request")
 		workflow.TriggersPullRequestTarget = hasPullRequestTargetTrigger(on)
+		workflow.PushBranches = parsePushBranches(on)
 	}
 	if permissions := mappingValue(&document, "permissions"); permissions != nil {
 		workflow.PermissionGrants = parsePermissionGrants(permissions, "workflow", "")
@@ -177,6 +182,9 @@ func parseJobs(jobs *yaml.Node) []Job {
 			continue
 		}
 		job := Job{ID: key.Value}
+		if environment := mappingValue(value, "environment"); environment != nil {
+			job.Environment = parseJobEnvironment(environment)
+		}
 		if permissions := mappingValue(value, "permissions"); permissions != nil {
 			job.PermissionGrants = parsePermissionGrants(permissions, "job", job.ID)
 		}
@@ -296,19 +304,98 @@ func sanitizeMapPermissionAccess(value string) string {
 }
 
 func hasPullRequestTargetTrigger(on *yaml.Node) bool {
+	return hasTrigger(on, "pull_request_target")
+}
+
+func hasTrigger(on *yaml.Node, trigger string) bool {
 	switch on.Kind {
 	case yaml.ScalarNode:
-		return on.Value == "pull_request_target"
+		return on.Value == trigger
 	case yaml.SequenceNode:
 		for _, item := range on.Content {
-			if item.Kind == yaml.ScalarNode && item.Value == "pull_request_target" {
+			if item.Kind == yaml.ScalarNode && item.Value == trigger {
 				return true
 			}
 		}
 	case yaml.MappingNode:
-		return mappingValue(on, "pull_request_target") != nil
+		return mappingValue(on, trigger) != nil
 	}
 	return false
+}
+
+func parsePushBranches(on *yaml.Node) []string {
+	if on.Kind != yaml.MappingNode {
+		return nil
+	}
+	push := mappingValue(on, "push")
+	if push == nil || push.Kind != yaml.MappingNode {
+		return nil
+	}
+	branches := mappingValue(push, "branches")
+	if branches == nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]struct{})
+	add := func(value string) {
+		branch := sanitizeStaticGitHubValue(value)
+		if branch == "" || strings.ContainsAny(branch, "*?[]") {
+			return
+		}
+		if _, ok := seen[branch]; ok {
+			return
+		}
+		seen[branch] = struct{}{}
+		out = append(out, branch)
+	}
+	switch branches.Kind {
+	case yaml.ScalarNode:
+		add(branches.Value)
+	case yaml.SequenceNode:
+		for _, item := range branches.Content {
+			if item.Kind == yaml.ScalarNode {
+				add(item.Value)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func parseJobEnvironment(node *yaml.Node) string {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		return sanitizeStaticGitHubValue(node.Value)
+	case yaml.MappingNode:
+		name := scalarMappingValue(node, "name")
+		if name == nil {
+			return ""
+		}
+		return sanitizeStaticGitHubValue(name.Value)
+	default:
+		return ""
+	}
+}
+
+func sanitizeStaticGitHubValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.Contains(value, "${{") || strings.Contains(value, "}}") {
+		return ""
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case strings.ContainsRune("/._-", r):
+		default:
+			return ""
+		}
+	}
+	return value
 }
 
 func parseCheckoutHeadSelectors(stepNode *yaml.Node) []CheckoutHeadSelector {

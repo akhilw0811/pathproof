@@ -29,18 +29,24 @@ SARIF file exists, is non-empty, contains SARIF version `2.1.0`, and contains
 
 Scan command tests cover argument validation, deterministic controlled flag
 errors, accepted `--format json` and `--format=json` syntax, accepted
-`--format sarif` and `--format=sarif` syntax, accepted `--preview-patches`
-syntax, missing and non-directory path errors, human output, JSON output, SARIF
-output, exactly one trailing newline, stderr-only errors, output write failures,
-deterministic repeated output, deterministic input file ordering, and
-Secret-value absence from stdout and stderr. GitHub Actions CLI coverage
+`--format sarif` and `--format=sarif` syntax, accepted `--repo OWNER/REPO`
+syntax, invalid `--repo` errors with empty stdout, accepted
+`--preview-patches` syntax, missing and non-directory path errors, human
+output, JSON output, SARIF output, exactly one trailing newline, stderr-only
+errors, output write failures, deterministic repeated output, deterministic
+input file ordering, and Secret-value absence from stdout and stderr.
+GitHub Actions CLI coverage
 asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
 unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
 GitHub Actions findings are deterministic, `PP-GHA-001`, `PP-GHA-002`, and
 `PP-GHA-003` appear in human and JSON output without remediation, patch
 previews, patch outputs, or validation results, and a push workflow with only
 `id-token: write` exits `0` with no findings in human, JSON, and SARIF output.
-Graph-only OIDC capability text is not emitted in scan output. Secret-like
+Graph-only OIDC capability text is not emitted in scan output. Terraform AWS
+OIDC trust graph-only coverage asserts that a matching trust policy plus
+`--repo` can create a graph edge while human no-finding output remains
+unchanged, JSON findings remain empty, SARIF results remain empty, and no
+Terraform graph internals appear in CLI output. Secret-like
 workflow env, with, run, permission expressions, and expression-only `uses:`
 values are absent from stdout, stderr, JSON, SARIF, and errors. CLI projection
 tests verify that finding path entries preserve node ID/kind/name, evidence
@@ -90,15 +96,29 @@ parser output and parse errors.
 GitHub Actions parser tests cover workflow file discovery under
 `.github/workflows`, `.yml` and `.yaml` filtering, one-job workflows, multiple
 jobs sorted by job ID, run-only step omission, deterministic file ordering,
-`pull_request_target` trigger detection for unquoted and quoted `on`, scalar
-`on`, sequence `on`, and mapping `on` forms, checkout PR-head selector
-detection, minimal workflow-level and job-level `permissions` parsing,
+`pull_request` and `pull_request_target` trigger detection for unquoted and
+quoted `on`, scalar `on`, sequence `on`, and mapping `on` forms, static
+`on.push.branches` literals for OIDC subject matching, static job environment
+names for OIDC subject matching, checkout PR-head selector detection, minimal
+workflow-level and job-level `permissions` parsing,
 `permissions: write-all`, `permissions: read-all`, `permissions: {}`,
 deterministic permission grant ordering, malformed workflow errors with
 filenames, paths with spaces, missing workflow directories, and regression
 checks that env values, arbitrary with values, secret-like tokens, run scripts,
 unknown or expression-based permission values, expression-only `uses:` values,
 and raw workflow documents are absent from serialized parser output and errors.
+
+Terraform parser tests cover deterministic local `.tf` file walking, top-level
+`aws_iam_role` resource extraction, literal heredoc and quoted JSON
+`assume_role_policy` values, ignored dynamic and nonliteral policy values,
+ignored non-role resources, malformed supported Terraform syntax with
+sanitized filename errors, malformed extracted trust JSON with sanitized
+resource errors, trust detection for GitHub Actions OIDC federated principals,
+`sts:AssumeRoleWithWebIdentity`, `StringEquals` and `StringLike`
+`sub`/`aud` conditions, string and array condition values, missing
+issuer/action/sub/aud negatives, simple `*` wildcard pattern support, and
+regression checks that variables, provider credentials, raw trust JSON, and
+secret-like Terraform values are absent from parser output and errors.
 
 Kubernetes routing tests cover deterministic graph construction, source
 evidence, duplicate conflict rejection before graph mutation, namespace-scoped
@@ -130,6 +150,16 @@ distinct workflow and job OIDC capabilities, deterministic graph JSON across
 repeated and reversed workflow/job inputs, local and Docker action exclusion
 from static action metadata, expression handling, metadata cloning, and
 regression checks that ignored workflow values are absent from graph JSON.
+
+Terraform routing tests cover deterministic `AWSIAMRole` node construction,
+sanitized trust metadata, `CanAssumeRole` edge construction only when
+`--repo OWNER/REPO` supplies repository identity and a static subject candidate
+matches, no cross-domain edge without `--repo`, no edge without a static
+candidate, nonmatching repo/ref negatives, `StringEquals` exact matching,
+simple `StringLike` wildcard matching, metadata cloning, deterministic graph
+JSON, and regression checks that raw Terraform, raw trust policy JSON,
+provider credentials, ARNs, unsupported condition values, and secret-like
+values are absent from graph JSON.
 
 Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
 edge semantics, exact required node and edge kind validation, unrelated graph

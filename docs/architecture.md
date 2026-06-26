@@ -8,14 +8,16 @@ and local directory scans with:
 - `pathproof scan --format json <directory>`
 - `pathproof scan --format=json <directory>`
 - `pathproof scan --format sarif <directory>`
+- `pathproof scan --repo OWNER/REPO <directory>`
 - `pathproof scan --preview-patches <directory>`
 - `pathproof scan --write-patches <output-directory> <directory>`
 - `pathproof scan --write-patches <output-directory> --validate-patches <directory>`
 
 The scan command is intentionally only an orchestration layer. It validates the
 local directory input, parses Kubernetes manifests and local GitHub Actions
-workflows under `.github/workflows`, constructs the in-memory graph, runs
-deterministic analysis, builds advisory remediation plans for supported
+workflows under `.github/workflows`, parses local Terraform `.tf` files for a
+narrow static AWS IAM role OIDC trust-policy slice, constructs the in-memory
+graph, runs deterministic analysis, builds advisory remediation plans for supported
 Kubernetes findings, optionally builds read-only patch previews for supported
 remediation changes, optionally writes patched copies for supported generated
 previews to a separate output directory, optionally validates written patches
@@ -48,20 +50,36 @@ logged, serialized, or exposed by parser or graph output.
 Implemented GitHub Actions parsing lives under
 `internal/parser/githubactions`. It reads only `.github/workflows/*.yml` and
 `.github/workflows/*.yaml` under the scan root and emits explicit Go types for
-workflow name, workflow source, `pull_request_target` trigger presence,
-sanitized workflow-level and job-level permission grants, job IDs, step
-indexes, optional step names, and sanitized static action identity components.
+workflow name, workflow source, `pull_request` and `pull_request_target`
+trigger presence, static push branch literals for OIDC subject matching,
+sanitized workflow-level and job-level permission grants, job IDs, static job
+environment names for OIDC subject matching, step indexes, optional step
+names, and sanitized static action identity components.
 For `actions/checkout` steps only, it also records sanitized matches for the
 PR-head selector expressions used by `PP-GHA-002`. It does not require a Git
 repository, call GitHub APIs, execute workflows, evaluate expressions, resolve
 reusable workflows, inspect action source code, model exact workflow
-permission inheritance or overrides, expand matrices, or retain `env`,
-arbitrary `with` values, `secrets`, token values, run scripts,
+permission inheritance or overrides, infer branch names, expand matrices, or
+retain `env`, arbitrary `with` values, `secrets`, token values, run scripts,
 expression-only `uses:` values, unknown permission values, or raw workflow
 documents. A `uses:` value that is entirely an expression is ignored because it
 is not a statically recognizable action reference. If a `uses:` value has a
 static `owner/repo` shape but an expression in the ref, the ref is stored as a
 sanitized expression marker and treated as unpinned.
+
+Implemented Terraform parsing lives under `internal/parser/terraform`. It
+walks local `.tf` files under the scan root and recognizes only top-level
+`resource "aws_iam_role" "<name>" { ... }` blocks where
+`assume_role_policy` is a static literal heredoc JSON string or a simple
+quoted JSON string. It parses only the extracted trust-policy JSON using
+`encoding/json`. It ignores variables, locals, modules, data sources,
+`jsonencode`, function calls, interpolation, dynamic blocks, references to
+`aws_iam_policy_document`, and nonliteral trust policies. It does not execute
+Terraform, evaluate HCL, call AWS, call GitHub, parse remote state, or retain
+raw Terraform files, raw trust JSON, provider credentials, variable values, or
+unsupported condition values. Malformed supported Terraform syntax and
+malformed extracted trust JSON return deterministic sanitized errors with file
+or resource context and no raw policy content.
 
 Implemented Kubernetes routing lives under `internal/routing/kubernetes`.
 It builds deterministic graph relationships for:
@@ -110,6 +128,19 @@ whether the capability came from explicit `id-token: write` or from
 structure only and does not create a finding by itself. It does not model
 CI/CD identities, exact workflow permission inheritance or overrides, OIDC
 trust policies, reusable workflow calls, cloud trust, or runtime behavior.
+
+Implemented Terraform routing lives under `internal/routing/terraform`. It
+adds graph-only `AWSIAMRole` nodes for statically parsed local
+`aws_iam_role` resources and stores only sanitized trust metadata: provider,
+resource name, source reference, trusted issuer, supported subject patterns,
+audience values, and statement indexes. When the optional CLI flag
+`--repo OWNER/REPO` is supplied, routing generates a limited set of GitHub
+Actions OIDC subject candidates from parsed workflow data and adds
+`OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` only when a candidate
+matches a supported trust statement. Without `--repo`, role trust metadata is
+modeled but no cross-domain edge is created. The routing layer does not infer
+repository identity from Git remotes, call GitHub, call AWS, validate accounts
+or ARNs remotely, simulate IAM, or emit findings.
 
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
 graph storage, routing construction, analysis, and CLI presentation remain
@@ -163,6 +194,9 @@ The analyzer does not emit a finding for `CanRequestOIDCToken` alone because
 `id-token: write` is not necessarily vulnerable without additional unsafe
 trigger context or cloud trust-policy evidence. Existing `PP-GHA-003` behavior
 continues to report `id-token: write` under `pull_request_target`.
+`CanAssumeRole` is also graph-only. The analyzer does not emit a finding for
+a matched AWS IAM role trust relationship by itself because OIDC trust is not
+automatically a vulnerability.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
@@ -230,7 +264,8 @@ because parser source tracking is currently file/document scoped.
 No live Kubernetes authorization evaluation, GitHub API integration, workflow
 execution, expression evaluation, reusable workflow resolution, action source
 inspection, exact GitHub workflow permission inheritance/override modeling,
-OIDC trust-policy modeling, full CI/CD attack-path modeling, cloud provider
-integration, Terraform parsing, live validation, in-place patch application,
+full CI/CD attack-path modeling, cloud provider integration, Terraform
+execution, broad HCL parsing, module or variable evaluation, IAM simulation,
+cross-domain findings, live validation, in-place patch application,
 persistence, AI, dashboard, plugin system, external service integration, pull
 request creation, or live Kubernetes cluster integration is implemented.
