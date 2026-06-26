@@ -189,6 +189,27 @@ shape:
 }
 ```
 
+SARIF scan output is also a private CLI projection, not a graph schema. It is
+selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
+with one PathProof run, one deterministic `PP-K8S-001` rule entry, and one
+result per finding. Result properties include finding ID, severity, ordered
+node IDs, ordered edge IDs, and clean display source references when available.
+
+SARIF locations are derived only from structured source-reference fields whose
+entire value is a clean `filename#document=N` reference. PathProof does not
+parse arbitrary prose, evidence details, summaries, or remediation text to find
+embedded source references. Malformed references and references outside the
+scan root are omitted. SARIF artifact URIs are relative to the scan root and
+URI-encoded, while `properties.source_references` keeps display-safe relative
+strings such as `resources file.yaml#document=1`. Line numbers and regions are
+not emitted because the parser currently tracks file/document source location,
+not line ranges.
+
+SARIF remains findings-only even when patch flags are supplied. Patch previews,
+patch output summaries, validation results, unified diffs, patched file
+contents, temporary paths, raw manifests, and Secret values are not represented
+in SARIF.
+
 Each CLI JSON finding includes the finding `id`, `rule_id`, `title`,
 `severity`, `summary`, ordered `path`, ordered `evidence`, and
 `source_references`. Each path entry contains the graph node `id`, `kind`, and

@@ -21,13 +21,14 @@ import (
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
 const (
 	scanFormatHuman scanFormat = "human"
 	scanFormatJSON  scanFormat = "json"
+	scanFormatSARIF scanFormat = "sarif"
 )
 
 type scanOptions struct {
@@ -128,6 +129,8 @@ func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, f
 		err = writeHumanReport(&output, report)
 	case scanFormatJSON:
 		err = writeJSONReport(&output, report)
+	case scanFormatSARIF:
+		err = writeSARIFReport(&output, root, report)
 	default:
 		err = fmt.Errorf("unsupported format %q", format)
 	}
@@ -165,9 +168,9 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	})
 	format := scanFormat(*formatValue)
 	switch format {
-	case scanFormatHuman, scanFormatJSON:
+	case scanFormatHuman, scanFormatJSON, scanFormatSARIF:
 	default:
-		return scanOptions{}, fmt.Errorf("unsupported scan format %q; supported formats are human and json", format)
+		return scanOptions{}, fmt.Errorf("unsupported scan format %q; supported formats are human, json, and sarif", format)
 	}
 
 	remaining := flags.Args()
@@ -360,6 +363,7 @@ type scanFinding struct {
 	Evidence         []scanEvidence     `json:"evidence"`
 	SourceReferences []string           `json:"source_references"`
 	Remediation      *scanRemediation   `json:"remediation,omitempty"`
+	SARIFSources     []string           `json:"-"`
 }
 
 type scanPathNode struct {
@@ -521,6 +525,7 @@ func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scan
 	for _, source := range finding.SourceReferences {
 		sourceReferences = append(sourceReferences, normalizeDisplaySourceReferences(root, source))
 	}
+	sarifSources := structuredFindingSourceReferences(finding, g)
 
 	return scanFinding{
 		ID:               finding.ID,
@@ -531,7 +536,50 @@ func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scan
 		Path:             path,
 		Evidence:         evidence,
 		SourceReferences: sourceReferences,
+		SARIFSources:     sarifSources,
 	}, nil
+}
+
+func structuredFindingSourceReferences(finding analysis.Finding, g *graph.Graph) []string {
+	seen := make(map[string]struct{})
+	refs := make([]string, 0)
+	add := func(value string) {
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		refs = append(refs, value)
+	}
+	for _, nodeID := range finding.NodeIDs {
+		node, ok := g.Node(nodeID)
+		if !ok {
+			continue
+		}
+		for _, evidence := range node.Evidence {
+			add(evidence.Source)
+		}
+	}
+	for _, edgeID := range finding.EdgeIDs {
+		edge, ok := g.Edge(edgeID)
+		if !ok {
+			continue
+		}
+		add(edge.Evidence.Source)
+		if edge.Metadata == nil {
+			continue
+		}
+		for _, authorization := range edge.Metadata.KubernetesCanReadAuthorizations {
+			add(authorization.BindingSourceReference)
+			add(authorization.RoleSourceReference)
+			for _, source := range authorization.SecretSourceReferences {
+				add(source)
+			}
+		}
+	}
+	return refs
 }
 
 func projectRemediation(root string, plan remediation.Plan, previews []patchpreview.Preview) *scanRemediation {

@@ -131,6 +131,15 @@ Expected excerpt:
 }
 ```
 
+Get SARIF output for code-scanning-style integrations:
+
+```sh
+./bin/pathproof scan --format sarif ./examples/kubernetes/public-secret-path
+```
+
+SARIF export is local stdout only. PathProof does not upload SARIF to GitHub or
+any other service.
+
 ## What this proves
 
 - Deterministic graph modeling with stable IDs and ordered evidence.
@@ -141,6 +150,7 @@ Expected excerpt:
 - Safe read-only patch previews.
 - Patched-copy output to a separate directory, never in-place edits.
 - Validation by rescanning a complete temporary patched manifest set.
+- SARIF 2.1.0 finding export for the implemented `PP-K8S-001` rule.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -172,6 +182,7 @@ Implemented:
 - ServiceAccount identity modeling.
 - RBAC Secret read analysis.
 - `PP-K8S-001` finding.
+- SARIF 2.1.0 finding export.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
 - Validation rescan.
@@ -213,6 +224,7 @@ Useful local commands:
 go run ./cmd/pathproof version
 go run ./cmd/pathproof scan ./cmd/pathproof/testdata/scan-safe
 go run ./cmd/pathproof scan --format json ./cmd/pathproof/testdata/scan-vulnerable
+go run ./cmd/pathproof scan --format sarif ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --preview-patches ./examples/kubernetes/public-secret-path
 ```
 
