@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -381,7 +382,7 @@ func TestWriteScanResultPreviewBuilderDoesNotRunWithoutFlag(t *testing.T) {
 	fixture := projectionFixtureWithValidFinding(t)
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, false, "", &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, false, "", false, &stdout, &stderr)
 
 	assertCode(t, code, 1)
 	assertString(t, "stderr", stderr.String(), "")
@@ -395,7 +396,7 @@ func TestWriteScanResultPreviewInternalErrorLeavesStdoutEmpty(t *testing.T) {
 	fixture := projectionFixtureWithValidFinding(t)
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, true, "", &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, true, "", false, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -700,6 +701,182 @@ func TestRunScanWritePatchesJSONWithAbsoluteInputDirectoryUsesRelativeSources(t 
 	}
 }
 
+func TestRunScanValidatePatchesRequiresWritePatchesAndRejectsExtraArgs(t *testing.T) {
+	stdout, stderr, code := runCommand("scan", "--validate-patches", safeFixture)
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "--validate-patches requires --write-patches")
+
+	parent := t.TempDir()
+	writeSplitPreviewFixture(t, parent, "scan-preview")
+	stdout, stderr, code = runCommandInDir(t, parent, "scan", "--write-patches", "patched", "--validate-patches", "scan-preview", "extra")
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "scan requires exactly one directory argument")
+}
+
+func TestRunScanValidatePatchesUsesCompleteOverlayAndReportsRemediated(t *testing.T) {
+	parent := t.TempDir()
+	writeSplitPreviewFixture(t, parent, "scan-preview")
+	inputPath := filepath.Join(parent, "scan-preview", "rbac.yaml")
+	original, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatalf("read input: %v", err)
+	}
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", "patched", "--validate-patches", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 1")
+	assertContains(t, stdout, "Validation:")
+	assertContains(t, stdout, ": remediated\n")
+	assertContains(t, stdout, "Summary: PP-K8S-001 no longer appears in patched output.")
+	if strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("validation output contains temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	for _, value := range []string{
+		"FAKE_CLI_SECRET_DATA_VALUE_DO_NOT_RETAIN",
+		"FAKE_CLI_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN",
+	} {
+		if strings.Contains(stdout, value) || strings.Contains(stderr, value) {
+			t.Fatalf("validation output contains secret value %q\nstdout:%s\nstderr:%s", value, stdout, stderr)
+		}
+	}
+	after, err := os.ReadFile(inputPath)
+	if err != nil {
+		t.Fatalf("read input after scan: %v", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("input file changed:\nafter:\n%s\nbefore:\n%s", after, original)
+	}
+	if got := listDirNames(t, filepath.Join(parent, "patched")); !reflect.DeepEqual(got, []string{"rbac.yaml"}) {
+		t.Fatalf("patched output entries = %#v, want only rbac.yaml", got)
+	}
+}
+
+func TestRunScanValidatePatchesJSONOutputIsStructured(t *testing.T) {
+	parent := t.TempDir()
+	writeSplitPreviewFixture(t, parent, "scan-preview")
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--write-patches", "patched", "--validate-patches", "scan-preview")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if len(report.Validation) != 1 {
+		t.Fatalf("validation = %#v, want one result", report.Validation)
+	}
+	result := report.Validation[0]
+	if result.RuleID != "PP-K8S-001" || result.Status != "remediated" || result.Summary == "" {
+		t.Fatalf("validation result = %#v", result)
+	}
+	if strings.Contains(stdout, parent) || strings.Contains(stderr, parent) {
+		t.Fatalf("JSON validation output contains temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	for _, value := range []string{
+		"FAKE_CLI_SECRET_DATA_VALUE_DO_NOT_RETAIN",
+		"FAKE_CLI_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN",
+	} {
+		if strings.Contains(stdout, value) || strings.Contains(stderr, value) {
+			t.Fatalf("JSON validation output contains secret value %q\nstdout:%s\nstderr:%s", value, stdout, stderr)
+		}
+	}
+	assertExactlyOneTrailingNewline(t, stdout)
+}
+
+func TestRunScanValidatePatchesDoesNotAcceptPartialPatchOutputAsProof(t *testing.T) {
+	parent := t.TempDir()
+	writePartialValidationFixture(t, parent, "scan-partial")
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", "patched", "--validate-patches", "scan-partial")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Validation:")
+	assertContains(t, stdout, ": failed\n")
+	assertContains(t, stdout, "Summary: PP-K8S-001 still appears after rescanning patched output.")
+	if strings.Contains(stdout, "FAKE_VALIDATION_OVERLAY_SECRET_VALUE_DO_NOT_RETAIN") || strings.Contains(stderr, "FAKE_VALIDATION_OVERLAY_SECRET_VALUE_DO_NOT_RETAIN") {
+		t.Fatalf("validation output contains overlay Secret value\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+	partialFindings, _, err := scanDirectory(filepath.Join(parent, "patched"))
+	if err != nil {
+		t.Fatalf("scan partial output: %v", err)
+	}
+	if len(partialFindings) != 0 {
+		t.Fatalf("partial patch output findings = %#v, want none to prove partial scan would be misleading", partialFindings)
+	}
+	if got := listDirNames(t, filepath.Join(parent, "patched")); !reflect.DeepEqual(got, []string{"binding-a.yaml"}) {
+		t.Fatalf("patched output entries = %#v, want only generated patched copy", got)
+	}
+}
+
+func TestRunScanValidatePatchesSkippedWhenNoPatchesWritten(t *testing.T) {
+	parent := t.TempDir()
+	outputRoot := filepath.Join(parent, "patched")
+
+	stdout, stderr, code := runCommand("scan", "--write-patches", outputRoot, "--validate-patches", vulnerableFixture)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Validation:")
+	assertContains(t, stdout, ": skipped\n")
+	assertContains(t, stdout, "Summary: No written patch output was available to validate this finding.")
+	if _, err := os.Stat(outputRoot); !os.IsNotExist(err) {
+		t.Fatalf("outputRoot stat err = %v, want not exist", err)
+	}
+}
+
+func TestRunScanValidatePatchesScanErrorLeavesStdoutEmptyAndCleansOverlay(t *testing.T) {
+	parent := t.TempDir()
+	writeSplitPreviewFixture(t, parent, "scan-preview")
+	originalScanValidationDirectory := scanValidationDirectory
+	var overlay string
+	scanValidationDirectory = func(dir string) ([]analysis.Finding, *graph.Graph, error) {
+		overlay = dir
+		return nil, nil, errors.New("controlled validation scan failure")
+	}
+	defer func() {
+		scanValidationDirectory = originalScanValidationDirectory
+	}()
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-patches", "patched", "--validate-patches", "scan-preview")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "validate patch output")
+	assertContains(t, stderr, "controlled validation scan failure")
+	if overlay == "" {
+		t.Fatal("validation scan was not called")
+	}
+	if _, err := os.Stat(overlay); !os.IsNotExist(err) {
+		t.Fatalf("validation overlay stat err = %v, want cleaned up", err)
+	}
+	if strings.Contains(stderr, overlay) || strings.Contains(stderr, parent) {
+		t.Fatalf("stderr contains temp path: %q", stderr)
+	}
+}
+
+func TestRunScanValidatePatchesCombinedWithPreviewIsDeterministic(t *testing.T) {
+	parent := t.TempDir()
+	writeSplitPreviewFixture(t, parent, "scan-preview")
+	firstOut, firstErr, firstCode := runCommandInDir(t, parent, "scan", "--preview-patches", "--write-patches", "patched-a", "--validate-patches", "scan-preview")
+	secondOut, secondErr, secondCode := runCommandInDir(t, parent, "scan", "--preview-patches", "--write-patches", "patched-b", "--validate-patches", "scan-preview")
+
+	assertCode(t, firstCode, 1)
+	assertCode(t, secondCode, 1)
+	assertString(t, "first stderr", firstErr, "")
+	assertString(t, "second stderr", secondErr, "")
+	normalizedSecond := strings.ReplaceAll(secondOut, "patched-b/", "patched-a/")
+	assertString(t, "stdout", normalizedSecond, firstOut)
+	assertContains(t, firstOut, "Patch Preview:")
+	assertContains(t, firstOut, "Validation:")
+}
+
 func TestRunScanWritePatchesWithAbsoluteInputDirectoryAndSpacedFilenameUsesRelativeSources(t *testing.T) {
 	parent := t.TempDir()
 	writePreviewFixture(t, parent, "scan-preview", false)
@@ -984,7 +1161,7 @@ func TestProjectFindingRejectsMissingNode(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing node error")
 	}
@@ -1009,7 +1186,7 @@ func TestProjectFindingRejectsMissingEdge(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing edge error")
 	}
@@ -1119,7 +1296,7 @@ func TestWriteScanResultRejectsLateInconsistencyWithoutPartialOutput(t *testing.
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, ".", scanFormatHuman, false, "", &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, ".", scanFormatHuman, false, "", false, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -1142,7 +1319,7 @@ func TestWriteScanResultMissingNodeReturnsTwoWithEmptyStdout(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{finding}, g, ".", scanFormatHuman, false, "", &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{finding}, g, ".", scanFormatHuman, false, "", false, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -1186,7 +1363,7 @@ func runCommandInDir(t *testing.T, dir string, args ...string) (string, string, 
 
 func writeScanResultForTest(findings []analysis.Finding, g *graph.Graph, format scanFormat) (string, string, int) {
 	var stdout, stderr bytes.Buffer
-	code := writeScanResult(findings, g, ".", format, false, "", &stdout, &stderr)
+	code := writeScanResult(findings, g, ".", format, false, "", false, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
 
@@ -1240,6 +1417,7 @@ type cliJSONReport struct {
 	Findings     []cliJSONFinding      `json:"findings"`
 	FindingCount int                   `json:"finding_count"`
 	PatchOutputs *[]cliJSONPatchOutput `json:"patch_outputs,omitempty"`
+	Validation   []cliJSONValidation   `json:"validation,omitempty"`
 }
 
 type cliJSONFinding struct {
@@ -1319,6 +1497,13 @@ type cliJSONPatchOutput struct {
 	Output string `json:"output,omitempty"`
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
+}
+
+type cliJSONValidation struct {
+	FindingID string `json:"finding_id"`
+	RuleID    string `json:"rule_id"`
+	Status    string `json:"status"`
+	Summary   string `json:"summary"`
 }
 
 func assertValidJSONReport(t *testing.T, output string) cliJSONReport {
@@ -1543,6 +1728,114 @@ subjects:
 	return dir
 }
 
+func writeSplitPreviewFixture(t *testing.T, parent, name string) {
+	t.Helper()
+	dir := filepath.Join(parent, name)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("create split fixture dir: %v", err)
+	}
+	writeFileForTest(t, dir, "service.yaml", `apiVersion: v1
+kind: Service
+metadata:
+  name: public-api
+  namespace: prod
+spec:
+  type: LoadBalancer
+  selector:
+    app: api
+`)
+	writeFileForTest(t, dir, "deployment.yaml", `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: api
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  namespace: prod
+`)
+	writeFileForTest(t, dir, "secret.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+  namespace: prod
+data:
+  password: FAKE_CLI_SECRET_DATA_VALUE_DO_NOT_RETAIN
+stringData:
+  token: FAKE_CLI_SECRET_STRINGDATA_VALUE_DO_NOT_RETAIN
+`)
+	writeFileForTest(t, dir, "role.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-reader
+  namespace: prod
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+`)
+	writeFileForTest(t, dir, "rbac.yaml", `apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-secrets
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: secret-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: prod
+- kind: ServiceAccount
+  name: worker
+  namespace: prod
+`)
+}
+
+func writePartialValidationFixture(t *testing.T, parent, name string) {
+	t.Helper()
+	writeSplitPreviewFixture(t, parent, name)
+	dir := filepath.Join(parent, name)
+	if err := os.Rename(filepath.Join(dir, "rbac.yaml"), filepath.Join(dir, "binding-a.yaml")); err != nil {
+		t.Fatalf("rename binding-a: %v", err)
+	}
+	writeFileForTest(t, dir, "binding-b.yaml", `apiVersion: v1
+kind: Secret
+metadata:
+  name: validation-helper
+  namespace: prod
+data:
+  token: FAKE_VALIDATION_OVERLAY_SECRET_VALUE_DO_NOT_RETAIN
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-secrets-b
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: secret-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: prod
+- kind: ServiceAccount
+  name: worker
+  namespace: prod
+`)
+}
+
 func writePreviewFixture(t *testing.T, parent, name string, secretPayload bool) {
 	t.Helper()
 	dir := filepath.Join(parent, name)
@@ -1622,6 +1915,26 @@ subjects:
 	if err := os.WriteFile(filepath.Join(dir, "resources.yaml"), []byte(content), 0o600); err != nil {
 		t.Fatalf("write preview fixture: %v", err)
 	}
+}
+
+func writeFileForTest(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func listDirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
 }
 
 var _ io.Writer = failingWriter{}

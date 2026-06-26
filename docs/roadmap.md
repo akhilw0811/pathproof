@@ -35,6 +35,10 @@
   copies are written only to a separate new or empty output directory, input
   files are never modified, unsupported actions are reported but not written,
   and Secret-bearing source files are not copied or written.
+- Opt-in validation rescan for written `NarrowBindingSubject` patch output.
+  Validation builds a temporary complete patched manifest set from the input
+  directory plus generated patch files, rescans it locally, and reports
+  remediated, failed, or skipped results for supported `PP-K8S-001` findings.
 - Local Kubernetes YAML scan CLI for `pathproof scan <directory>` with
   human-readable finding, remediation, and optional patch preview output, JSON
   output, and stable exit codes.
@@ -44,7 +48,7 @@
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Remediation verification.
-- In-place patch application, validation rescans, force/clobber behavior, Git
+- In-place patch application, live validation, force/clobber behavior, Git
   commits, and pull request creation.
 - Patch previews for RBAC rule edits, wildcard resources or verbs,
   multi-resource rule splitting, API-group splitting, ClusterRoleBinding scope

@@ -277,6 +277,30 @@ for written files. Unsupported entries omit `output` and explain why no file
 was written. If no supported patches exist, `patch_outputs` is present when
 write mode is requested but no patch files are written.
 
+When `pathproof scan --write-patches <output-directory> --validate-patches` is
+used, CLI JSON also includes top-level `validation` results. This is a CLI
+projection, not part of the graph schema:
+
+```json
+{
+  "validation": [
+    {
+      "finding_id": "finding:...",
+      "rule_id": "PP-K8S-001",
+      "status": "remediated",
+      "summary": "PP-K8S-001 no longer appears in patched output."
+    }
+  ]
+}
+```
+
+Validation statuses are `remediated`, `failed`, and `skipped`.
+`remediated` means the original supported finding ID was absent after
+rescanning the complete temporary patched manifest set. `failed` means the
+same finding ID remained. `skipped` means no generated patch output was
+written for that finding. Validation uses the same local parse, route, and
+analyze pipeline as the original scan and does not use live-cluster state.
+
 Implemented remediation actions are:
 
 - `RemoveSecretsResource`
@@ -337,7 +361,7 @@ resource rules in the same Role or ClusterRole are still modeled.
 
 The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
-in-place patch application, validation rescans, or attack-path rules beyond
+in-place patch application, live validation, or attack-path rules beyond
 `PP-K8S-001`. The scan CLI currently supports local Kubernetes YAML
 directories only. Patch previews and patch output are limited to
 `NarrowBindingSubject` and do not cover RBAC rule edits, Secret-bearing source

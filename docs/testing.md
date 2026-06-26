@@ -139,5 +139,20 @@ absolute-input scan-root-local source references displayed relative to the scan
 root throughout human and JSON reports, input file immutability, and no full
 patched file contents in human or JSON output.
 
+Validation rescan tests cover the opt-in `--validate-patches` flag requiring
+`--write-patches`, boolean flag parsing, extra positional argument rejection,
+and validation running only after patch output succeeds. Coverage asserts that
+validation builds a complete temporary patched manifest set instead of scanning
+only the partial patch output directory, reports `remediated` when the complete
+patched logical set removes the original `PP-K8S-001` finding, reports
+`failed` while preserving exit code `1` when the original finding remains,
+reports `skipped` when no generated patch output was written for a finding,
+and returns exit code `2` with empty stdout when validation scanning fails.
+Tests also verify deterministic human and JSON validation output, temporary
+overlay cleanup, absence of temporary or machine-specific absolute paths in
+output, input file immutability, user-visible output directories containing
+only normal patched copies, and Secret-value absence from stdout, stderr, JSON,
+validation summaries, and validation errors.
+
 Tests must cover positive and negative behavior for changed packages. Do not
 skip, remove, or weaken tests to make a change pass.
