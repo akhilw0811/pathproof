@@ -7,20 +7,24 @@ Secret metadata, detects the `PP-K8S-001` path from a public workload to a
 readable Secret, proposes deterministic remediation, previews and writes
 patched copies, and validates the fix with a rescan. It also detects
 `PP-GHA-001` when a GitHub Actions `uses:` reference is not pinned to a full
-40-character commit SHA, and `PP-GHA-002` when a `pull_request_target`
-workflow checks out untrusted pull request head code with `actions/checkout`.
+40-character commit SHA, `PP-GHA-002` when a `pull_request_target` workflow
+checks out untrusted pull request head code with `actions/checkout`, and
+`PP-GHA-003` when a `pull_request_target` workflow explicitly grants dangerous
+workflow-level or job-level token permissions.
 
 PathProof is currently a defensive Go CLI focused on two small, tested local
 slices. It scans local YAML manifests and workflows, builds an in-memory graph,
 reports `PP-K8S-001` when an internet-facing workload runs as a ServiceAccount
 that can read a Kubernetes Secret, and reports `PP-GHA-001` for unpinned
-GitHub Actions action references and `PP-GHA-002` for unsafe
-`pull_request_target` checkout of pull request head code.
+GitHub Actions action references, `PP-GHA-002` for unsafe
+`pull_request_target` checkout of pull request head code, and `PP-GHA-003` for
+explicit dangerous token permissions under `pull_request_target`.
 
-Cloud provider APIs, full CI/CD attack-path modeling, workflow permissions
-analysis, OIDC trust analysis, reusable workflow resolution, action source
-inspection, broader sensitive-resource types, live cluster scanning, pull
-request creation, AI/ML ranking, and dashboards are not implemented.
+Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
+permission inheritance/override modeling, OIDC trust analysis, reusable
+workflow resolution, action source inspection, broader sensitive-resource
+types, live cluster scanning, pull request creation, AI/ML ranking, and
+dashboards are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, and internal scan errors exit `2`.
@@ -165,7 +169,7 @@ Severity: Medium
 
 ## GitHub Actions Security
 
-PathProof currently implements two small local GitHub Actions checks:
+PathProof currently implements three small local GitHub Actions checks:
 
 - `PP-GHA-001`: a workflow `uses:` reference is not pinned to a full
   40-character commit SHA.
@@ -173,10 +177,16 @@ PathProof currently implements two small local GitHub Actions checks:
   sanitized PR-head selectors such as
   `github.event.pull_request.head.sha`, `github.head_ref`, or
   `github.event.pull_request.head.repo.full_name`.
+- `PP-GHA-003`: a `pull_request_target` workflow explicitly grants dangerous
+  workflow-level or job-level token permissions: `contents: write`,
+  `pull-requests: write`, `actions: write`, `checks: write`,
+  `deployments: write`, `id-token: write`, `security-events: write`, or
+  `permissions: write-all`.
 
 These checks are static and local. PathProof does not execute workflows, call
 GitHub APIs, evaluate expressions, inspect action source, model workflow
-permissions, or claim full CI/CD attack-path coverage.
+permission inheritance or overrides, or claim full CI/CD attack-path coverage.
+Exact GitHub permission inheritance/override modeling is future work.
 
 ## CI / SARIF
 
@@ -220,6 +230,8 @@ only publishes the SARIF file as an artifact.
   pinned to a full 40-character commit SHA.
 - `PP-GHA-002` detection for `pull_request_target` workflows that configure
   `actions/checkout` to check out pull request head code.
+- `PP-GHA-003` detection for `pull_request_target` workflows that explicitly
+  grant dangerous workflow-level or job-level token permissions.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -234,7 +246,8 @@ The scan loop is:
 3. Build an in-memory evidence graph.
 4. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
 5. Add deterministic GitHub Actions workflow/job/action-use edges.
-6. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, and `PP-GHA-002`.
+6. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
+   `PP-GHA-003`.
 7. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
 8. Optionally generate read-only `NarrowBindingSubject` patch previews.
@@ -259,6 +272,7 @@ Implemented:
 - `PP-GHA-001` finding for action references not pinned to a full commit SHA.
 - `PP-GHA-002` finding for unsafe `pull_request_target` checkout of pull
   request head code.
+- `PP-GHA-003` finding for dangerous `pull_request_target` token permissions.
 - SARIF 2.1.0 finding export.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
@@ -269,7 +283,7 @@ Not implemented:
 - Live cluster scanning.
 - Cloud provider APIs.
 - Full CI/CD attack-path modeling.
-- Workflow permissions analysis.
+- Exact GitHub workflow permission inheritance/override modeling.
 - OIDC trust analysis.
 - Reusable workflow resolution.
 - Action source inspection.
@@ -311,6 +325,7 @@ go run ./cmd/pathproof scan --format json ./cmd/pathproof/testdata/scan-vulnerab
 go run ./cmd/pathproof scan --format sarif ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --preview-patches ./examples/kubernetes/public-secret-path
 go run ./cmd/pathproof scan ./examples/github-actions/unpinned-action
+go run ./cmd/pathproof scan ./examples/github-actions/dangerous-permissions
 ```
 
 Scan exit codes are stable:

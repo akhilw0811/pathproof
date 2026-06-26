@@ -106,6 +106,7 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 							sarifPublicWorkloadCanReadSecretRule(),
 							sarifGitHubActionsUnpinnedActionRule(),
 							sarifGitHubActionsUnsafePullRequestTargetCheckoutRule(),
+							sarifGitHubActionsDangerousPermissionsRule(),
 						},
 					},
 				},
@@ -157,6 +158,20 @@ func sarifGitHubActionsUnsafePullRequestTargetCheckoutRule() sarifRule {
 	}
 }
 
+func sarifGitHubActionsDangerousPermissionsRule() sarifRule {
+	const title = "pull_request_target workflow grants dangerous token permissions"
+	return sarifRule{
+		ID:               string(analysis.RuleGitHubActionsDangerousPermissions),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects GitHub Actions pull_request_target workflows with explicit workflow-level or job-level dangerous token permission grants."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "error",
+		},
+		Help: sarifMessage{Text: "Avoid granting write-like token permissions in pull_request_target workflows unless explicitly required. PathProof reports explicit workflow-level and job-level grants; exact GitHub permission inheritance and override modeling is future work."},
+	}
+}
+
 func newSARIFResult(root string, finding scanFinding) sarifResult {
 	sourceReferences := sarifSourceReferences(root, finding)
 	locations := make([]sarifLocation, 0, len(sourceReferences))
@@ -189,7 +204,7 @@ func newSARIFResult(root string, finding scanFinding) sarifResult {
 }
 
 func sarifFindingMessage(finding scanFinding) string {
-	if finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout && finding.Summary != "" {
+	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions) && finding.Summary != "" {
 		return finding.Summary
 	}
 	parts := make([]string, 0, len(finding.Path))

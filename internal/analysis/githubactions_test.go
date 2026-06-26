@@ -228,6 +228,297 @@ jobs:
 	}
 }
 
+func TestAnalyzeGitHubActionsDangerousPermissionsFindings(t *testing.T) {
+	tests := []struct {
+		name     string
+		workflow string
+		want     int
+	}{
+		{
+			name: "contents write",
+			workflow: `on: pull_request_target
+permissions:
+  contents: write
+`,
+			want: 1,
+		},
+		{
+			name: "pull requests write",
+			workflow: `on: pull_request_target
+permissions:
+  pull-requests: write
+`,
+			want: 1,
+		},
+		{
+			name: "id token write",
+			workflow: `on: pull_request_target
+permissions:
+  id-token: write
+`,
+			want: 1,
+		},
+		{
+			name: "write all",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			want: 1,
+		},
+		{
+			name: "contents read",
+			workflow: `on: pull_request_target
+permissions:
+  contents: read
+`,
+		},
+		{
+			name: "read all",
+			workflow: `on: pull_request_target
+permissions: read-all
+`,
+		},
+		{
+			name: "pull request only",
+			workflow: `on: pull_request
+permissions:
+  contents: write
+`,
+		},
+		{
+			name: "omitted permissions",
+			workflow: `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - run: echo test
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := Analyze(githubActionsGraphFromWorkflow(t, tt.workflow))
+			got := countFindingsByRule(findings, RuleGitHubActionsDangerousPermissions)
+			if got != tt.want {
+				t.Fatalf("PP-GHA-003 count = %d, want %d: %#v", got, tt.want, findings)
+			}
+			if tt.want == 0 {
+				return
+			}
+			finding := onlyFindingByRule(t, findings, RuleGitHubActionsDangerousPermissions)
+			if finding.Title != githubActionsDangerousPermissionsTitle {
+				t.Fatalf("title = %q, want %q", finding.Title, githubActionsDangerousPermissionsTitle)
+			}
+			if finding.Severity != SeverityHigh {
+				t.Fatalf("severity = %q, want High", finding.Severity)
+			}
+			if len(finding.NodeIDs) != 1 || len(finding.EdgeIDs) != 0 || len(finding.Evidence) != 0 {
+				t.Fatalf("workflow-level finding shape = %#v/%#v/%#v, want one node and zero edges/evidence", finding.NodeIDs, finding.EdgeIDs, finding.Evidence)
+			}
+			if !strings.Contains(finding.Summary, "pull_request_target") {
+				t.Fatalf("summary = %q, want pull_request_target", finding.Summary)
+			}
+			if strings.Contains(finding.Summary, "all: write") {
+				t.Fatalf("summary renders write-all confusingly: %q", finding.Summary)
+			}
+		})
+	}
+}
+
+func TestAnalyzeGitHubActionsDangerousJobPermissionsFinding(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+jobs:
+  test:
+    permissions:
+      security-events: write
+`))
+
+	finding := onlyFindingByRule(t, findings, RuleGitHubActionsDangerousPermissions)
+	if len(finding.NodeIDs) != 2 || len(finding.EdgeIDs) != 1 || len(finding.Evidence) != 1 {
+		t.Fatalf("job-level finding shape = %#v/%#v/%#v, want workflow -> job", finding.NodeIDs, finding.EdgeIDs, finding.Evidence)
+	}
+	if !strings.Contains(finding.Summary, "job test") || !strings.Contains(finding.Summary, "security-events: write") {
+		t.Fatalf("summary = %q, want job permission", finding.Summary)
+	}
+	if strings.Contains(finding.Evidence[0].Source.Detail, "security-events: write") {
+		t.Fatalf("shared DefinesJob evidence contains permission text: %q", finding.Evidence[0].Source.Detail)
+	}
+}
+
+func TestAnalyzeGitHubActionsExistingRulesDoNotInheritPermissionEvidence(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+jobs:
+  test:
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`))
+
+	for _, ruleID := range []RuleID{RuleGitHubActionsUnpinnedAction, RuleGitHubActionsUnsafePullRequestTargetCheckout} {
+		finding := onlyFindingByRule(t, findings, ruleID)
+		data, err := json.Marshal(finding)
+		if err != nil {
+			t.Fatalf("marshal %s finding: %v", ruleID, err)
+		}
+		if strings.Contains(string(data), "contents: write") {
+			t.Fatalf("%s finding contains permission text from shared evidence: %s", ruleID, data)
+		}
+	}
+
+	dangerous := onlyFindingByRule(t, findings, RuleGitHubActionsDangerousPermissions)
+	if !strings.Contains(dangerous.Summary, "contents: write") {
+		t.Fatalf("PP-GHA-003 summary = %q, want permission detail", dangerous.Summary)
+	}
+}
+
+func TestAnalyzeGitHubActionsWorkflowAndJobDangerousPermissionsAreDistinct(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+permissions:
+  contents: write
+jobs:
+  test:
+    permissions:
+      id-token: write
+`))
+
+	var dangerous []Finding
+	for _, finding := range findings {
+		if finding.RuleID == RuleGitHubActionsDangerousPermissions {
+			dangerous = append(dangerous, finding)
+		}
+	}
+	if len(dangerous) != 2 {
+		t.Fatalf("PP-GHA-003 count = %d, want 2: %#v", len(dangerous), findings)
+	}
+	if dangerous[0].ID == dangerous[1].ID {
+		t.Fatalf("distinct grants produced duplicate IDs: %#v", dangerous)
+	}
+	shapes := map[int]bool{}
+	for _, finding := range dangerous {
+		shapes[len(finding.NodeIDs)] = true
+	}
+	if !shapes[1] || !shapes[2] {
+		t.Fatalf("finding shapes = %#v, want workflow-level and job-level", dangerous)
+	}
+}
+
+func TestAnalyzeGitHubActionsDangerousPermissionsFindingIDsAreStableAndSensitive(t *testing.T) {
+	base := graph.GitHubActionsPermissionGrant{Scope: "workflow", Permission: "contents", Access: "write"}
+	same := graph.GitHubActionsPermissionGrant{Scope: "workflow", Permission: "contents", Access: "write"}
+	changedPermission := graph.GitHubActionsPermissionGrant{Scope: "workflow", Permission: "actions", Access: "write"}
+	changedAccess := graph.GitHubActionsPermissionGrant{Scope: "workflow", Permission: "all", Access: "write-all"}
+
+	baseID, err := stableGitHubActionsDangerousPermissionsFindingID(".github/workflows/build.yml", base)
+	if err != nil {
+		t.Fatalf("base ID: %v", err)
+	}
+	sameID, err := stableGitHubActionsDangerousPermissionsFindingID(".github/workflows/build.yml", same)
+	if err != nil {
+		t.Fatalf("same ID: %v", err)
+	}
+	permissionID, err := stableGitHubActionsDangerousPermissionsFindingID(".github/workflows/build.yml", changedPermission)
+	if err != nil {
+		t.Fatalf("changed permission ID: %v", err)
+	}
+	accessID, err := stableGitHubActionsDangerousPermissionsFindingID(".github/workflows/build.yml", changedAccess)
+	if err != nil {
+		t.Fatalf("changed access ID: %v", err)
+	}
+
+	if baseID != sameID {
+		t.Fatalf("finding ID changed across repeated identity: %q vs %q", baseID, sameID)
+	}
+	if baseID == permissionID {
+		t.Fatalf("finding ID did not change when permission changed: %q", baseID)
+	}
+	if baseID == accessID {
+		t.Fatalf("finding ID did not change when access changed: %q", baseID)
+	}
+}
+
+func TestAnalyzeGitHubActionsDangerousPermissionsExcludesSecretLikeWorkflowValues(t *testing.T) {
+	const envSecret = "FAKE_ANALYSIS_GHA_ENV_SECRET_DO_NOT_RETAIN"
+	const withSecret = "FAKE_ANALYSIS_GHA_WITH_SECRET_DO_NOT_RETAIN"
+	const runSecret = "FAKE_ANALYSIS_GHA_RUN_SECRET_DO_NOT_RETAIN"
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+permissions:
+  contents: write
+  actions: ${{ secrets.PERMISSION_ACCESS }}
+env:
+  TOKEN: FAKE_ANALYSIS_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_ANALYSIS_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: owner/repo@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_ANALYSIS_GHA_WITH_SECRET_DO_NOT_RETAIN
+`))
+
+	if countFindingsByRule(findings, RuleGitHubActionsDangerousPermissions) != 1 {
+		t.Fatalf("findings = %#v, want one PP-GHA-003", findings)
+	}
+	data, err := json.Marshal(findings)
+	if err != nil {
+		t.Fatalf("marshal findings: %v", err)
+	}
+	for _, forbidden := range []string{envSecret, withSecret, runSecret, "secrets.PERMISSION_ACCESS", "token:", "run:", "${{"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("finding JSON contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestAnalyzeGitHubActionsInvalidPermissionMapValuesAreIgnoredAndExcluded(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+permissions:
+  contents: write-all
+  actions: ${{ inputs.permission }}
+jobs:
+  test:
+    permissions:
+      contents: read-all
+      checks: unknown
+`))
+
+	if got := countFindingsByRule(findings, RuleGitHubActionsDangerousPermissions); got != 0 {
+		t.Fatalf("PP-GHA-003 count = %d, want 0: %#v", got, findings)
+	}
+	data, err := json.Marshal(findings)
+	if err != nil {
+		t.Fatalf("marshal findings: %v", err)
+	}
+	for _, forbidden := range []string{"write-all", "read-all", "inputs.permission", "${{", "unknown"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("finding JSON contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestAnalyzeGitHubActionsUnsafeCheckoutAndDangerousPermissionsBothFire(t *testing.T) {
+	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
+permissions:
+  contents: write
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`))
+
+	if got := countFindingsByRule(findings, RuleGitHubActionsUnsafePullRequestTargetCheckout); got != 1 {
+		t.Fatalf("PP-GHA-002 count = %d, want 1: %#v", got, findings)
+	}
+	if got := countFindingsByRule(findings, RuleGitHubActionsDangerousPermissions); got != 1 {
+		t.Fatalf("PP-GHA-003 count = %d, want 1: %#v", got, findings)
+	}
+}
+
 func TestAnalyzeGitHubActionsNonCheckoutHeadSelectorCanStillEmitUnpinnedOnly(t *testing.T) {
 	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
 jobs:

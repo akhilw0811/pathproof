@@ -1,0 +1,9 @@
+name: Dangerous permissions
+on: pull_request_target
+
+permissions: write-all
+
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567

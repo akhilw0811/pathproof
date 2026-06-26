@@ -49,6 +49,7 @@ type Node struct {
 	Kind     NodeKind         `json:"kind"`
 	Name     string           `json:"name"`
 	Evidence []SourceEvidence `json:"evidence,omitempty"`
+	Metadata *NodeMetadata    `json:"metadata,omitempty"`
 }
 
 type SourceEvidence struct {
@@ -56,9 +57,38 @@ type SourceEvidence struct {
 	Detail string `json:"detail"`
 }
 
+type NodeMetadata struct {
+	GitHubActionsWorkflow *GitHubActionsWorkflow `json:"github_actions_workflow,omitempty"`
+}
+
 type EdgeMetadata struct {
 	KubernetesCanReadAuthorizations []KubernetesCanReadAuthorization `json:"kubernetes_can_read_authorizations,omitempty"`
 	GitHubActionUse                 *GitHubActionUse                 `json:"github_action_use,omitempty"`
+	GitHubActionsWorkflowJob        *GitHubActionsWorkflowJob        `json:"github_actions_workflow_job,omitempty"`
+}
+
+type GitHubActionsWorkflow struct {
+	WorkflowSourceReference   string                         `json:"workflow_source_reference"`
+	WorkflowFile              string                         `json:"workflow_file"`
+	WorkflowName              string                         `json:"workflow_name,omitempty"`
+	TriggersPullRequestTarget bool                           `json:"triggers_pull_request_target,omitempty"`
+	PermissionGrants          []GitHubActionsPermissionGrant `json:"permission_grants,omitempty"`
+}
+
+type GitHubActionsWorkflowJob struct {
+	WorkflowSourceReference   string                         `json:"workflow_source_reference"`
+	WorkflowFile              string                         `json:"workflow_file"`
+	WorkflowName              string                         `json:"workflow_name,omitempty"`
+	TriggersPullRequestTarget bool                           `json:"triggers_pull_request_target,omitempty"`
+	JobID                     string                         `json:"job_id"`
+	PermissionGrants          []GitHubActionsPermissionGrant `json:"permission_grants,omitempty"`
+}
+
+type GitHubActionsPermissionGrant struct {
+	Scope      string `json:"scope"`
+	JobID      string `json:"job_id,omitempty"`
+	Permission string `json:"permission"`
+	Access     string `json:"access"`
 }
 
 type GitHubActionUse struct {
@@ -314,6 +344,15 @@ func (g *Graph) MarshalJSON() ([]byte, error) {
 
 func cloneNode(node Node) Node {
 	node.Evidence = cloneEvidence(node.Evidence)
+	if node.Metadata != nil {
+		metadata := *node.Metadata
+		if metadata.GitHubActionsWorkflow != nil {
+			workflow := *metadata.GitHubActionsWorkflow
+			workflow.PermissionGrants = cloneGitHubActionsPermissionGrants(workflow.PermissionGrants)
+			metadata.GitHubActionsWorkflow = &workflow
+		}
+		node.Metadata = &metadata
+	}
 	return node
 }
 
@@ -334,6 +373,11 @@ func cloneEdge(edge Edge) Edge {
 		actionUse := *metadata.GitHubActionUse
 		actionUse.CheckoutHeadSelectors = cloneGitHubActionsCheckoutHeadSelectors(actionUse.CheckoutHeadSelectors)
 		metadata.GitHubActionUse = &actionUse
+	}
+	if metadata.GitHubActionsWorkflowJob != nil {
+		job := *metadata.GitHubActionsWorkflowJob
+		job.PermissionGrants = cloneGitHubActionsPermissionGrants(job.PermissionGrants)
+		metadata.GitHubActionsWorkflowJob = &job
 	}
 	edge.Metadata = &metadata
 	return edge
@@ -367,6 +411,13 @@ func cloneGitHubActionsCheckoutHeadSelectors(selectors []GitHubActionsCheckoutHe
 		return nil
 	}
 	return append([]GitHubActionsCheckoutHeadSelector(nil), selectors...)
+}
+
+func cloneGitHubActionsPermissionGrants(grants []GitHubActionsPermissionGrant) []GitHubActionsPermissionGrant {
+	if grants == nil {
+		return nil
+	}
+	return append([]GitHubActionsPermissionGrant(nil), grants...)
 }
 
 func nodeID(kind NodeKind, name string) NodeID {

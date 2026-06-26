@@ -147,6 +147,38 @@ jobs:
 	}
 }
 
+func TestAddRoutesGraphJSONExcludesInvalidPermissionMapValues(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflowForRoutingTest(t, root, "permissions.yml", `on: pull_request_target
+permissions:
+  contents: write-all
+  actions: ${{ inputs.permission }}
+jobs:
+  test:
+    permissions:
+      contents: read-all
+      checks: unknown
+`)
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+	data, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("marshal graph: %v", err)
+	}
+	for _, forbidden := range []string{"write-all", "read-all", "inputs.permission", "${{", "unknown"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("graph JSON contains %q: %s", forbidden, data)
+		}
+	}
+}
+
 func writeWorkflowForRoutingTest(t *testing.T, root, name, content string) {
 	t.Helper()
 	dir := filepath.Join(root, ".github", "workflows")
@@ -213,5 +245,100 @@ func TestAddRoutesPreservesPullRequestTargetCheckoutSelectorMetadata(t *testing.
 	}
 	if !strings.Contains(gotUses.Evidence.Detail, "ref=github.event.pull_request.head.sha") {
 		t.Fatalf("evidence detail = %q, want sanitized selector", gotUses.Evidence.Detail)
+	}
+}
+
+func TestAddRoutesPreservesGitHubActionsPermissionGrantMetadata(t *testing.T) {
+	resources := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
+		Name: "Permissions",
+		Source: parsergithubactions.Source{
+			Filename:     "/repo/.github/workflows/permissions.yml",
+			RelativePath: ".github/workflows/permissions.yml",
+			Document:     1,
+		},
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []parsergithubactions.PermissionGrant{{
+			Scope:      "workflow",
+			Permission: "all",
+			Access:     "write-all",
+		}},
+		Jobs: []parsergithubactions.Job{{
+			ID: "test",
+			PermissionGrants: []parsergithubactions.PermissionGrant{{
+				Scope:      "job",
+				JobID:      "test",
+				Permission: "contents",
+				Access:     "write",
+			}},
+		}},
+	}}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	workflow := graph.NewNode(graph.Workflow, "githubactions://.github/workflows/permissions.yml")
+	gotWorkflow, ok := g.Node(workflow.ID)
+	if !ok {
+		t.Fatalf("missing workflow node %q", workflow.ID)
+	}
+	if gotWorkflow.Metadata == nil || gotWorkflow.Metadata.GitHubActionsWorkflow == nil {
+		t.Fatalf("workflow metadata = %#v, want github actions workflow metadata", gotWorkflow.Metadata)
+	}
+	wantWorkflow := graph.GitHubActionsWorkflow{
+		WorkflowSourceReference:   "/repo/.github/workflows/permissions.yml#document=1",
+		WorkflowFile:              ".github/workflows/permissions.yml",
+		WorkflowName:              "Permissions",
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []graph.GitHubActionsPermissionGrant{{
+			Scope:      "workflow",
+			Permission: "all",
+			Access:     "write-all",
+		}},
+	}
+	if !reflect.DeepEqual(*gotWorkflow.Metadata.GitHubActionsWorkflow, wantWorkflow) {
+		t.Fatalf("workflow metadata = %#v, want %#v", *gotWorkflow.Metadata.GitHubActionsWorkflow, wantWorkflow)
+	}
+	if len(gotWorkflow.Evidence) != 1 || !strings.Contains(gotWorkflow.Evidence[0].Detail, "permissions: write-all") {
+		t.Fatalf("workflow evidence = %#v, want permissions: write-all", gotWorkflow.Evidence)
+	}
+	if strings.Contains(gotWorkflow.Evidence[0].Detail, "all: write") {
+		t.Fatalf("workflow evidence renders write-all confusingly: %q", gotWorkflow.Evidence[0].Detail)
+	}
+
+	job := graph.NewNode(graph.WorkflowJob, "githubactions://.github/workflows/permissions.yml/job/test")
+	defines := graph.NewEdge(graph.DefinesJob, workflow.ID, job.ID, graph.SourceEvidence{})
+	gotDefines, ok := g.Edge(defines.ID)
+	if !ok {
+		t.Fatalf("missing DefinesJob edge %q", defines.ID)
+	}
+	if gotDefines.Metadata == nil || gotDefines.Metadata.GitHubActionsWorkflowJob == nil {
+		t.Fatalf("DefinesJob metadata = %#v, want github actions workflow job metadata", gotDefines.Metadata)
+	}
+	wantJob := graph.GitHubActionsWorkflowJob{
+		WorkflowSourceReference:   "/repo/.github/workflows/permissions.yml#document=1",
+		WorkflowFile:              ".github/workflows/permissions.yml",
+		WorkflowName:              "Permissions",
+		TriggersPullRequestTarget: true,
+		JobID:                     "test",
+		PermissionGrants: []graph.GitHubActionsPermissionGrant{{
+			Scope:      "job",
+			JobID:      "test",
+			Permission: "contents",
+			Access:     "write",
+		}},
+	}
+	if !reflect.DeepEqual(*gotDefines.Metadata.GitHubActionsWorkflowJob, wantJob) {
+		t.Fatalf("job metadata = %#v, want %#v", *gotDefines.Metadata.GitHubActionsWorkflowJob, wantJob)
+	}
+	if strings.Contains(gotDefines.Evidence.Detail, "all: write") {
+		t.Fatalf("evidence detail renders write-all confusingly: %q", gotDefines.Evidence.Detail)
+	}
+	if strings.Contains(gotDefines.Evidence.Detail, "contents: write") {
+		t.Fatalf("DefinesJob evidence contains shared permission text: %q", gotDefines.Evidence.Detail)
+	}
+	if gotDefines.Evidence.Detail != "github actions workflow defines job test" {
+		t.Fatalf("DefinesJob evidence detail = %q, want generic job evidence", gotDefines.Evidence.Detail)
 	}
 }

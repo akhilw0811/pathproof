@@ -597,6 +597,92 @@ func TestGraphEdgeMetadataIsCloned(t *testing.T) {
 	}
 }
 
+func TestGraphGitHubActionsWorkflowNodeMetadataIsCloned(t *testing.T) {
+	g := New()
+	workflow := NewNode(Workflow, "githubactions://.github/workflows/build.yml")
+	workflow.Metadata = &NodeMetadata{GitHubActionsWorkflow: &GitHubActionsWorkflow{
+		WorkflowSourceReference:   ".github/workflows/build.yml#document=1",
+		WorkflowFile:              ".github/workflows/build.yml",
+		WorkflowName:              "Build",
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []GitHubActionsPermissionGrant{{
+			Scope:      "workflow",
+			Permission: "contents",
+			Access:     "write",
+		}},
+	}}
+
+	added := mustAddNode(t, g, workflow)
+	workflow.Metadata.GitHubActionsWorkflow.PermissionGrants[0].Access = "read"
+	added.Metadata.GitHubActionsWorkflow.PermissionGrants[0].Permission = "actions"
+
+	got, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found", added.ID)
+	}
+	if got.Metadata == nil || got.Metadata.GitHubActionsWorkflow == nil {
+		t.Fatalf("metadata = %#v, want github actions workflow metadata", got.Metadata)
+	}
+	grant := got.Metadata.GitHubActionsWorkflow.PermissionGrants[0]
+	if grant.Permission != "contents" || grant.Access != "write" {
+		t.Fatalf("stored grant = %#v, want original contents/write", grant)
+	}
+
+	got.Metadata.GitHubActionsWorkflow.PermissionGrants[0].Access = "none"
+	again, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after mutation", added.ID)
+	}
+	if again.Metadata.GitHubActionsWorkflow.PermissionGrants[0].Access != "write" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.GitHubActionsWorkflow.PermissionGrants[0])
+	}
+}
+
+func TestGraphGitHubActionsWorkflowJobEdgeMetadataIsCloned(t *testing.T) {
+	g := New()
+	workflow := mustAddNode(t, g, NewNode(Workflow, "githubactions://.github/workflows/build.yml"))
+	job := mustAddNode(t, g, NewNode(WorkflowJob, "githubactions://.github/workflows/build.yml/job/test"))
+	edge := NewEdge(DefinesJob, workflow.ID, job.ID, SourceEvidence{Source: "build.yml", Detail: "defines"})
+	edge.Metadata = &EdgeMetadata{GitHubActionsWorkflowJob: &GitHubActionsWorkflowJob{
+		WorkflowSourceReference:   ".github/workflows/build.yml#document=1",
+		WorkflowFile:              ".github/workflows/build.yml",
+		WorkflowName:              "Build",
+		TriggersPullRequestTarget: true,
+		JobID:                     "test",
+		PermissionGrants: []GitHubActionsPermissionGrant{{
+			Scope:      "job",
+			JobID:      "test",
+			Permission: "id-token",
+			Access:     "write",
+		}},
+	}}
+
+	added := mustAddEdge(t, g, edge)
+	edge.Metadata.GitHubActionsWorkflowJob.PermissionGrants[0].Access = "read"
+	added.Metadata.GitHubActionsWorkflowJob.PermissionGrants[0].Permission = "checks"
+
+	got, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found", added.ID)
+	}
+	if got.Metadata == nil || got.Metadata.GitHubActionsWorkflowJob == nil {
+		t.Fatalf("metadata = %#v, want github actions workflow job metadata", got.Metadata)
+	}
+	grant := got.Metadata.GitHubActionsWorkflowJob.PermissionGrants[0]
+	if grant.Permission != "id-token" || grant.Access != "write" {
+		t.Fatalf("stored grant = %#v, want original id-token/write", grant)
+	}
+
+	got.Metadata.GitHubActionsWorkflowJob.PermissionGrants[0].Access = "none"
+	again, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found after mutation", added.ID)
+	}
+	if again.Metadata.GitHubActionsWorkflowJob.PermissionGrants[0].Access != "write" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.GitHubActionsWorkflowJob.PermissionGrants[0])
+	}
+}
+
 func TestGraphAddEdgeRejectsMissingEndpoints(t *testing.T) {
 	g := New()
 	from := mustAddNode(t, g, NewNode(PublicEndpoint, "public-api"))
