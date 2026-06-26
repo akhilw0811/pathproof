@@ -9,17 +9,20 @@ and local Kubernetes YAML directory scans with:
 - `pathproof scan --format=json <directory>`
 - `pathproof scan --preview-patches <directory>`
 - `pathproof scan --write-patches <output-directory> <directory>`
+- `pathproof scan --write-patches <output-directory> --validate-patches <directory>`
 
 The scan command is intentionally only an orchestration layer. It validates the
 local directory input, parses Kubernetes manifests, constructs the in-memory
 graph, runs deterministic analysis, builds advisory remediation plans for
 supported findings, optionally builds read-only patch previews for supported
 remediation changes, optionally writes patched copies for supported generated
-previews to a separate output directory, projects findings, plans, previews,
-and patch output summaries into a private CLI report shape, and writes either
-human-readable output or JSON. It does not persist the graph or expose graph
-internals beyond the ordered finding path, evidence, remediation plan fields,
-optional preview fields, and optional patch output summaries.
+previews to a separate output directory, optionally validates written patches
+by rescanning a temporary complete patched manifest overlay, projects findings,
+plans, previews, patch output summaries, and validation results into a private
+CLI report shape, and writes either human-readable output or JSON. It does not
+persist the graph or expose graph internals beyond the ordered finding path,
+evidence, remediation plan fields, optional preview fields, optional patch
+output summaries, and optional validation results.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -122,7 +125,16 @@ and patch output summaries. Unsupported previews are reported but not written.
 Source files containing core `v1` Secret payload fields are not copied or
 written.
 
-No live Kubernetes authorization evaluation, verification rescans, in-place
-patch application, persistence, AI, dashboard, plugin system, external service
+Optional patch validation is private to the CLI orchestration layer. It runs
+only after patch output succeeds, creates a temporary directory containing the
+same top-level YAML/YML files that the parser scans, substitutes generated
+patched files by source-relative path, rescans that complete logical manifest
+set with the existing parse, route, and analyze pipeline, and removes the
+temporary directory before returning. Validation never scans only the partial
+patch output directory, never writes copied input files to the user-visible
+output directory, and never prints temporary paths or manifest contents.
+
+No live Kubernetes authorization evaluation, live validation, in-place patch
+application, persistence, AI, dashboard, plugin system, external service
 integration, pull request creation, or live Kubernetes cluster integration is
 implemented.

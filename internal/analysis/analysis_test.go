@@ -386,6 +386,26 @@ func TestAnalyzeFindingIDIgnoresEvidence(t *testing.T) {
 	}
 }
 
+func TestAnalyzeFindingIDIgnoresSourceReferencePathChanges(t *testing.T) {
+	firstDir := t.TempDir()
+	secondDir := t.TempDir()
+	writeManifest(t, firstDir, "first.yaml", sourcePathIdentityManifest())
+	writeManifest(t, secondDir, "second.yaml", sourcePathIdentityManifest())
+
+	firstFindings := analyzeManifestDir(t, firstDir)
+	secondFindings := analyzeManifestDir(t, secondDir)
+
+	if len(firstFindings) != 1 || len(secondFindings) != 1 {
+		t.Fatalf("finding counts = %d and %d, want 1 and 1", len(firstFindings), len(secondFindings))
+	}
+	if firstFindings[0].ID != secondFindings[0].ID {
+		t.Fatalf("finding IDs differ by source path only: first %q second %q", firstFindings[0].ID, secondFindings[0].ID)
+	}
+	if reflect.DeepEqual(firstFindings[0].SourceReferences, secondFindings[0].SourceReferences) {
+		t.Fatalf("source references are identical, want path-only evidence difference: %#v", firstFindings[0].SourceReferences)
+	}
+}
+
 func TestAnalyzeFindingIDChangesWhenIdentityInputChanges(t *testing.T) {
 	firstGraph, _, _, _, _, _ := completeFindingGraph(t)
 	secondGraph, _, workload, _, secret, _ := completeFindingGraph(t)
@@ -831,4 +851,79 @@ func writeManifest(t *testing.T, dir, name, content string) {
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
+}
+
+func analyzeManifestDir(t *testing.T, dir string) []Finding {
+	t.Helper()
+	resources, err := parserkubernetes.ParseDir(dir)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+	if err := routingkubernetes.AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+	return Analyze(g)
+}
+
+func sourcePathIdentityManifest() string {
+	return `apiVersion: v1
+kind: Service
+metadata:
+  name: public-api
+  namespace: prod
+spec:
+  type: LoadBalancer
+  selector:
+    app: api
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: prod
+spec:
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: api
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  namespace: prod
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-password
+  namespace: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-reader
+  namespace: prod
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-secrets
+  namespace: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: secret-reader
+subjects:
+- kind: ServiceAccount
+  name: api
+  namespace: prod
+`
 }

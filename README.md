@@ -39,6 +39,10 @@ Implemented Kubernetes support is intentionally small:
   previews to a separate new or empty output directory. Source files are never
   modified, unsupported patch actions are reported but not written, and files
   with Secret payload fields are not copied or written.
+- Optionally validate written patches by rescanning a temporary complete
+  logical manifest set made from the original input files with generated
+  patched files substituted. Validation does not scan the partial patch output
+  directory by itself.
 - Run the local scan pipeline from the CLI for Kubernetes YAML directories.
 
 `PP-K8S-001` findings use fixed rule-based `High` severity. Finding IDs are
@@ -55,6 +59,7 @@ go run ./cmd/pathproof scan --format json ./cmd/pathproof/testdata/scan-vulnerab
 go run ./cmd/pathproof scan --format=json ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --preview-patches ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --write-patches ./patched-yaml ./cmd/pathproof/testdata/scan-vulnerable
+go run ./cmd/pathproof scan --write-patches ./patched-yaml --validate-patches ./cmd/pathproof/testdata/scan-vulnerable
 go run ./cmd/pathproof scan --preview-patches --write-patches ./patched-yaml ./cmd/pathproof/testdata/scan-vulnerable
 ```
 
@@ -117,11 +122,24 @@ references are displayed relative to the scan root in human and JSON output.
 Unsupported actions such as `RemoveSecretsResource` and `RemoveSecretReadVerb`
 are reported but not written.
 
+Patch validation is opt-in with `--validate-patches` and requires
+`--write-patches <output-directory>`. After patch output is written
+successfully, PathProof builds a temporary validation overlay from the complete
+input manifest set, substitutes generated patched files, and rescans that
+overlay with the same local parse, route, and analyze pipeline. It does not
+run `kubectl`, contact a live cluster, apply patches in place, or treat the
+partial patch output directory alone as proof of remediation. If no generated
+patch file was written for a finding, validation is reported as skipped. If an
+original finding remains after the complete patched logical rescan, validation
+is reported as failed, but the scan exit code remains `1` because the original
+scan succeeded with findings.
+
 Scan exit codes are stable:
 
 - `0`: scan succeeded and found zero findings.
 - `1`: scan succeeded and found one or more findings.
-- `2`: usage, parsing, routing, output, or internal scan error.
+- `2`: usage, parsing, routing, patch output, validation, or internal scan
+  error.
 
 ## Development
 
@@ -138,7 +156,7 @@ The built binary is written to `bin/pathproof`.
 - GitHub Actions parsing
 - SBOM parsing
 - Kubernetes Secret values, live-cluster verification, in-place patch
-  application, validation rescans, or pull request creation
+  application, or pull request creation
 - Patch previews for RBAC rule edits, Secret-bearing source files, wildcard
   resources or verbs, API-group splitting, ClusterRoleBinding scope changes,
   `resourceNames`, or namespace-less binding subjects

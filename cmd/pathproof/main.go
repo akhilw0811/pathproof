@@ -17,10 +17,11 @@ import (
 	"pathproof/internal/patchpreview"
 	"pathproof/internal/remediation"
 	routingkubernetes "pathproof/internal/routing/kubernetes"
+	"pathproof/internal/validation"
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json] [--preview-patches] [--write-patches <output-directory>] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
@@ -30,11 +31,14 @@ const (
 )
 
 type scanOptions struct {
-	format         scanFormat
-	previewPatches bool
-	writePatches   string
-	directory      string
+	format          scanFormat
+	previewPatches  bool
+	writePatches    string
+	validatePatches bool
+	directory       string
 }
+
+var scanValidationDirectory = scanDirectory
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -75,35 +79,44 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, stdout, stderr)
+	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, stdout, stderr)
 }
 
-func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, stdout, stderr io.Writer) int {
+func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, stdout, stderr io.Writer) int {
 	plans, err := remediation.Build(g, findings)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
 		return 2
 	}
-	var previews []patchpreview.Preview
+	var reportPreviews []patchpreview.Preview
 	var patchOutputs []patchpreview.WrittenFile
+	var validationResults []validation.Result
 	includePatchOutputs := writePatches != ""
 	if writePatches != "" {
-		patchOutputs, previews, err = patchpreview.Write(root, writePatches, plans)
+		var writePreviews []patchpreview.Preview
+		patchOutputs, writePreviews, err = patchpreview.Write(root, writePatches, plans)
 		if err != nil {
 			printError(stderr, "write patch output: "+err.Error())
 			return 2
 		}
-		if !previewPatches {
-			previews = nil
+		if previewPatches {
+			reportPreviews = writePreviews
+		}
+		if validatePatches {
+			validationResults, err = validatePatchOutput(root, writePatches, findings, plans, writePreviews, patchOutputs)
+			if err != nil {
+				printError(stderr, "validate patch output: "+err.Error())
+				return 2
+			}
 		}
 	} else if previewPatches {
-		previews, err = patchpreview.Build(root, plans)
+		reportPreviews, err = patchpreview.Build(root, plans)
 		if err != nil {
 			printError(stderr, "internal scan error: build patch previews: "+err.Error())
 			return 2
 		}
 	}
-	report, err := newScanReport(root, findings, g, plans, previews, patchOutputs, includePatchOutputs)
+	report, err := newScanReport(root, findings, g, plans, reportPreviews, patchOutputs, includePatchOutputs, validationResults)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -140,6 +153,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	formatValue := flags.String("format", string(scanFormatHuman), "output format")
 	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
 	writePatches := flags.String("write-patches", "", "write patched copies to an output directory")
+	validatePatches := flags.Bool("validate-patches", false, "rescan a temporary patched manifest set after writing patches")
 	if err := flags.Parse(args); err != nil {
 		return scanOptions{}, fmt.Errorf("invalid scan arguments: %w; %s", err, usage)
 	}
@@ -177,7 +191,10 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	if writePatchesSet {
 		writePatchesValue = *writePatches
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, directory: dir}, nil
+	if *validatePatches && !writePatchesSet {
+		return scanOptions{}, fmt.Errorf("--validate-patches requires --write-patches")
+	}
+	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, directory: dir}, nil
 }
 
 func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
@@ -192,10 +209,145 @@ func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
 	return analysis.Analyze(g), g, nil
 }
 
+func validatePatchOutput(root, outputRoot string, findings []analysis.Finding, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile) ([]validation.Result, error) {
+	patchedFindingIDs := patchedFindingIDsByGeneratedOutput(plans, previews, patchOutputs)
+	if len(patchedFindingIDs) == 0 {
+		return validation.ValidatePatchedOutput(findings, nil, patchedFindingIDs), nil
+	}
+
+	overlay, cleanup, err := createValidationOverlay(root, outputRoot, patchOutputs)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	patchedFindings, _, err := scanValidationDirectory(overlay)
+	if err != nil {
+		return nil, fmt.Errorf("scan patched manifest set: %s", sanitizeValidationError(err, overlay))
+	}
+	return validation.ValidatePatchedOutput(findings, patchedFindings, patchedFindingIDs), nil
+}
+
+func patchedFindingIDsByGeneratedOutput(plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile) map[analysis.FindingID]bool {
+	generatedSources := make(map[string]struct{})
+	for _, output := range patchOutputs {
+		if output.PreviewStatus != patchpreview.StatusGenerated || output.Source == "" {
+			continue
+		}
+		generatedSources[output.Source] = struct{}{}
+	}
+	if len(generatedSources) == 0 {
+		return nil
+	}
+
+	findingByPlanID := make(map[remediation.PlanID]analysis.FindingID, len(plans))
+	for _, plan := range plans {
+		findingByPlanID[plan.ID] = plan.FindingID
+	}
+
+	patched := make(map[analysis.FindingID]bool)
+	for _, preview := range previews {
+		if preview.Status != patchpreview.StatusGenerated || preview.File == "" {
+			continue
+		}
+		if _, ok := generatedSources[preview.File]; !ok {
+			continue
+		}
+		findingID, ok := findingByPlanID[preview.PlanID]
+		if !ok {
+			continue
+		}
+		patched[findingID] = true
+	}
+	return patched
+}
+
+func createValidationOverlay(root, outputRoot string, patchOutputs []patchpreview.WrittenFile) (string, func(), error) {
+	overlay, err := os.MkdirTemp("", "pathproof-validation-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create temporary validation directory")
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(overlay)
+	}
+
+	generatedOutputBySource := make(map[string]string)
+	for _, output := range patchOutputs {
+		if output.PreviewStatus != patchpreview.StatusGenerated || output.Source == "" {
+			continue
+		}
+		if !isSafeRelativePath(output.Source) {
+			cleanup()
+			return "", nil, fmt.Errorf("prepare validation overlay")
+		}
+		generatedOutputBySource[output.Source] = filepath.Join(outputRoot, filepath.FromSlash(output.Source))
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("read scan directory for validation")
+	}
+	copied := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() || !isYAMLFile(entry.Name()) {
+			continue
+		}
+		rel := filepath.ToSlash(entry.Name())
+		sourcePath := filepath.Join(root, entry.Name())
+		if patchedPath, ok := generatedOutputBySource[rel]; ok {
+			sourcePath = patchedPath
+		}
+		content, err := os.ReadFile(sourcePath)
+		if err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("read validation manifest")
+		}
+		if err := os.WriteFile(filepath.Join(overlay, entry.Name()), content, 0o600); err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("write validation manifest")
+		}
+		copied[rel] = struct{}{}
+	}
+	for source := range generatedOutputBySource {
+		if _, ok := copied[source]; !ok {
+			cleanup()
+			return "", nil, fmt.Errorf("generated patch output does not match a scanned manifest")
+		}
+	}
+
+	return overlay, cleanup, nil
+}
+
+func isYAMLFile(name string) bool {
+	ext := filepath.Ext(name)
+	return ext == ".yaml" || ext == ".yml"
+}
+
+func isSafeRelativePath(value string) bool {
+	if value == "" || filepath.IsAbs(value) {
+		return false
+	}
+	clean := filepath.Clean(filepath.FromSlash(value))
+	return clean != "." && clean != ".." && !strings.HasPrefix(clean, ".."+string(filepath.Separator))
+}
+
+func sanitizeValidationError(err error, overlay string) string {
+	message := strings.TrimSpace(strings.ReplaceAll(err.Error(), "\n", " "))
+	if overlay != "" {
+		message = strings.ReplaceAll(message, overlay, "validation-overlay")
+	}
+	if message == "" {
+		return "validation scan failed"
+	}
+	return message
+}
+
 type scanReport struct {
-	Findings     []scanFinding      `json:"findings"`
-	FindingCount int                `json:"finding_count"`
-	PatchOutputs *[]scanPatchOutput `json:"patch_outputs,omitempty"`
+	Findings     []scanFinding       `json:"findings"`
+	FindingCount int                 `json:"finding_count"`
+	PatchOutputs *[]scanPatchOutput  `json:"patch_outputs,omitempty"`
+	Validation   []validation.Result `json:"validation,omitempty"`
 }
 
 type scanFinding struct {
@@ -277,7 +429,7 @@ type scanPatchOutput struct {
 	Reason string              `json:"reason,omitempty"`
 }
 
-func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool) (scanReport, error) {
+func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool, validationResults []validation.Result) (scanReport, error) {
 	planByFinding := make(map[analysis.FindingID]remediation.Plan, len(plans))
 	for _, plan := range plans {
 		planByFinding[plan.FindingID] = plan
@@ -285,6 +437,7 @@ func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, pla
 	report := scanReport{
 		Findings:     make([]scanFinding, 0, len(findings)),
 		FindingCount: len(findings),
+		Validation:   append([]validation.Result(nil), validationResults...),
 	}
 	for _, finding := range findings {
 		item, err := projectFinding(root, finding, g)
@@ -570,7 +723,10 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 		if _, err := fmt.Fprintln(w, "No findings."); err != nil {
 			return err
 		}
-		return writeHumanPatchOutputs(w, report)
+		if err := writeHumanPatchOutputs(w, report); err != nil {
+			return err
+		}
+		return writeHumanValidation(w, report)
 	}
 	for _, finding := range report.Findings {
 		if _, err := fmt.Fprintf(w, "\nFinding: %s\n", finding.ID); err != nil {
@@ -673,7 +829,10 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 			}
 		}
 	}
-	return writeHumanPatchOutputs(w, report)
+	if err := writeHumanPatchOutputs(w, report); err != nil {
+		return err
+	}
+	return writeHumanValidation(w, report)
 }
 
 func writeHumanPatchOutputs(w io.Writer, report scanReport) error {
@@ -710,6 +869,24 @@ func writeHumanPatchOutputs(w io.Writer, report scanReport) error {
 			if _, err := fmt.Fprintf(w, "    Reason: %s\n", output.Reason); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func writeHumanValidation(w io.Writer, report scanReport) error {
+	if len(report.Validation) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "\nValidation:"); err != nil {
+		return err
+	}
+	for _, result := range report.Validation {
+		if _, err := fmt.Fprintf(w, "Finding %s: %s\n", result.FindingID, result.Status); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "Summary: %s\n", result.Summary); err != nil {
+			return err
 		}
 	}
 	return nil
