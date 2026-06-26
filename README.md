@@ -29,6 +29,9 @@ Implemented Kubernetes support is intentionally small:
 - Analyze the in-memory graph for `PP-K8S-001`, which reports when a public
   Kubernetes endpoint routes to a workload, that workload runs as a
   ServiceAccount, and that ServiceAccount can read a parsed Secret.
+- Build deterministic, evidence-backed remediation plans for `PP-K8S-001`
+  findings. Plans are advisory and read-only. They do not edit YAML, generate
+  patches, open pull requests, or rescan modified files.
 - Run the local scan pipeline from the CLI for Kubernetes YAML directories.
 
 `PP-K8S-001` findings use fixed rule-based `High` severity. Finding IDs are
@@ -59,7 +62,27 @@ uses a stable top-level shape:
 Each JSON finding contains the finding ID, rule ID, title, severity, summary,
 ordered `path`, ordered `evidence`, and source references. Each path entry
 contains node `id`, `kind`, and `name`. Each evidence entry contains `edge_id`,
-`kind`, `source`, and `detail`.
+`kind`, `source`, and `detail`. When a complete remediation plan can be built
+from structured RBAC evidence, the finding also contains `remediation` with a
+stable plan ID and ordered options.
+
+Implemented remediation actions are intentionally narrow:
+
+- `RemoveSecretsResource`: for core-only `apiGroups: [""]` permissions, remove
+  `secrets` from a non-wildcard contributing RBAC rule, or split a
+  multi-resource rule so unrelated resource access remains. Wildcard or mixed
+  API groups and wildcard resource rules are omitted for safety.
+- `RemoveSecretReadVerb`: for core-only `apiGroups: [""]`, Secret-only resource
+  rules, remove `get`, `list`, or `watch`, or replace `*` with explicit
+  least-privilege verbs that exclude modeled Secret read access.
+  Multi-resource, wildcard-resource, wildcard API-group, and mixed API-group
+  rules use safer split/remove guidance when available or are omitted.
+- `NarrowBindingSubject`: remove only the affected ServiceAccount from a
+  multi-subject RoleBinding or ClusterRoleBinding.
+
+Every listed option is complete for the modeled finding. When multiple
+independent RBAC chains grant the same Secret read edge, one option includes
+all required changes and states that they must be applied together.
 
 Scan exit codes are stable:
 
@@ -81,7 +104,9 @@ The built binary is written to `bin/pathproof`.
 - Terraform parsing
 - GitHub Actions parsing
 - SBOM parsing
-- Kubernetes Secret values, live-cluster verification, or remediation
+- Kubernetes Secret values, live-cluster verification, YAML editing, patch
+  generation, remediation application, validation rescans, or pull request
+  creation
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
   ClusterRoles, and live authorization evaluation
 - AI agents

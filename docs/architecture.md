@@ -10,9 +10,11 @@ and local Kubernetes YAML directory scans with:
 
 The scan command is intentionally only an orchestration layer. It validates the
 local directory input, parses Kubernetes manifests, constructs the in-memory
-graph, runs deterministic analysis, projects findings into a private CLI report
+graph, runs deterministic analysis, builds advisory remediation plans for
+supported findings, projects findings and plans into a private CLI report
 shape, and writes either human-readable output or JSON. It does not persist the
-graph or expose graph internals beyond the ordered finding path and evidence.
+graph or expose graph internals beyond the ordered finding path, evidence, and
+remediation plan fields.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -52,6 +54,13 @@ resolved binding scope, resolved ServiceAccount identity, and observed Secret
 metadata show that a supported rule can read a parsed Secret. It does not claim
 that a workload actually issued a Secret read request.
 
+`CanRead` edges also carry typed Kubernetes authorization metadata for the
+chains that produced the edge. This metadata is narrow and deterministic:
+binding identity and source, affected ServiceAccount, role identity and source,
+canonical permission, matched verb, effective scope, and parsed Secret identity
+and source references. It does not include Secret values, raw manifests, YAML
+snippets, or arbitrary metadata maps.
+
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
 graph storage, routing construction, analysis, and CLI presentation remain
 separate. The CLI report projection is private to `cmd/pathproof`; it resolves
@@ -73,6 +82,17 @@ ML-ranked or score-based.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
-redaction. No live Kubernetes authorization evaluation, verification,
-remediation, persistence, AI, dashboard, plugin system, external service
-integration, or live Kubernetes cluster integration is implemented.
+redaction.
+
+Implemented remediation planning lives under `internal/remediation`. It is
+read-only: it consumes the graph and analysis findings, validates supported
+`PP-K8S-001` finding shape and edge continuity, inspects structured `CanRead`
+authorization metadata, and emits complete advisory options. It does not parse
+human-readable evidence prose and does not modify source manifests. The
+implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
+`NarrowBindingSubject`.
+
+No live Kubernetes authorization evaluation, verification rescans, YAML
+editing, patch generation, remediation application, persistence, AI, dashboard,
+plugin system, external service integration, pull request creation, or live
+Kubernetes cluster integration is implemented.

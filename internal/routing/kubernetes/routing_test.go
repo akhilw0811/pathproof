@@ -2305,6 +2305,74 @@ func TestAddRoutesPublicDeploymentServiceAccountCanReadSecret(t *testing.T) {
 	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "role_kind=Role", "matched_verb=get", "secret_sources=secret.yaml#document=1")
 }
 
+func TestAddRoutesCanReadEdgeIncludesStructuredAuthorizationMetadata(t *testing.T) {
+	g := graph.New()
+	resources := secretReadResources(secretRule([]string{""}, []string{"secrets", "configmaps"}, nil, []string{"get"}))
+	resources.RoleBindings[0].Subjects = append(resources.RoleBindings[0].Subjects, serviceAccountSubject("prod", "worker"))
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	assertEdgeKindCount(t, g, graph.CanRead, 2)
+	apiServiceAccount := graph.NewNode(graph.ServiceAccount, "kubernetes://prod/serviceaccount/api")
+	edge := graph.Edge{}
+	for _, candidate := range edgesOfKind(g, graph.CanRead) {
+		if candidate.From == apiServiceAccount.ID {
+			edge = candidate
+			break
+		}
+	}
+	if edge.ID == "" {
+		t.Fatalf("api ServiceAccount CanRead edge not found: %#v", edgesOfKind(g, graph.CanRead))
+	}
+	if edge.Metadata == nil {
+		t.Fatal("can-read metadata = nil, want structured authorization metadata")
+	}
+	authorizations := edge.Metadata.KubernetesCanReadAuthorizations
+	if len(authorizations) != 1 {
+		t.Fatalf("authorization count = %d, want 1: %#v", len(authorizations), authorizations)
+	}
+	auth := authorizations[0]
+	if auth.BindingKind != "RoleBinding" || auth.BindingNamespace != "prod" || auth.BindingName != "read-secrets" {
+		t.Fatalf("binding metadata = %#v", auth)
+	}
+	if auth.BindingSourceReference != "binding.yaml#document=1" {
+		t.Fatalf("binding source = %q, want binding.yaml#document=1", auth.BindingSourceReference)
+	}
+	if auth.BindingSupportedServiceAccountCount != 2 {
+		t.Fatalf("supported ServiceAccount subject count = %d, want 2", auth.BindingSupportedServiceAccountCount)
+	}
+	if auth.ServiceAccountNamespace != "prod" || auth.ServiceAccountName != "api" {
+		t.Fatalf("service account metadata = %#v", auth)
+	}
+	if auth.RoleKind != "Role" || auth.RoleNamespace != "prod" || auth.RoleName != "secret-reader" || auth.RoleSourceReference != "role.yaml#document=1" {
+		t.Fatalf("role metadata = %#v", auth)
+	}
+	if auth.PermissionSHA256 == "" {
+		t.Fatal("permission sha256 is empty")
+	}
+	wantPermission := graph.KubernetesPermission{
+		APIGroups:     []string{""},
+		Resources:     []string{"configmaps", "secrets"},
+		ResourceNames: nil,
+		Verbs:         []string{"get"},
+	}
+	if !reflect.DeepEqual(auth.Permission, wantPermission) {
+		t.Fatalf("permission = %#v, want %#v", auth.Permission, wantPermission)
+	}
+	if auth.MatchedVerb != "get" || auth.ScopeKind != "namespace" || auth.ScopeName != "prod" {
+		t.Fatalf("matched verb/scope metadata = %#v", auth)
+	}
+	if auth.SecretNamespace != "prod" || auth.SecretName != "database-password" {
+		t.Fatalf("secret metadata = %#v", auth)
+	}
+	if !reflect.DeepEqual(auth.SecretSourceReferences, []string{"secret.yaml#document=1"}) {
+		t.Fatalf("secret source references = %#v", auth.SecretSourceReferences)
+	}
+	assertEvidenceRecordContains(t, edge.Evidence.Detail, "binding_kind=RoleBinding", "permission_json=")
+}
+
 func TestAddRoutesSecretNodesAggregateAllDistinctSources(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -2728,6 +2796,12 @@ func TestAddRoutesSecretReadEvidenceAndJSONAreDeterministic(t *testing.T) {
 	}
 	edge := edgesOfKind(g, graph.CanRead)[0]
 	assertEvidenceRecordContains(t, edge.Evidence.Detail, "secret_sources=a-secret.yaml#document=1,z-secret.yaml#document=1")
+	if edge.Metadata == nil {
+		t.Fatal("can-read metadata = nil, want metadata")
+	}
+	if got := edge.Metadata.KubernetesCanReadAuthorizations[0].SecretSourceReferences; !reflect.DeepEqual(got, []string{"a-secret.yaml#document=1", "z-secret.yaml#document=1"}) {
+		t.Fatalf("metadata secret sources = %#v, want deterministic sorted sources", got)
+	}
 }
 
 func TestAddRoutesDuplicateSecretReadEvidenceDeduplicates(t *testing.T) {
@@ -2838,6 +2912,10 @@ subjects:
 	}
 	graphJSON := mustMarshalGraph(t, g)
 	evidence := allGraphEvidence(g)
+	metadataJSON, err := json.Marshal(edgesOfKind(g, graph.CanRead)[0].Metadata)
+	if err != nil {
+		t.Fatalf("marshal can-read metadata: %v", err)
+	}
 
 	badDir := t.TempDir()
 	const malformedFakeValue = "FAKE_SECRET_MALFORMED_VALUE_DO_NOT_RETAIN"
@@ -2857,6 +2935,7 @@ data:
 			"parser resources": string(parserJSON),
 			"graph json":       string(graphJSON),
 			"evidence":         evidence,
+			"metadata":         string(metadataJSON),
 			"parse error":      parseErr.Error(),
 		} {
 			if strings.Contains(output, value) {

@@ -54,8 +54,9 @@ duplicate conflict handling. Secret access routing tests cover Secret node
 source aggregation, static RBAC `CanRead` authorization for `get`, `list`,
 `watch`, and `*`, `resourceNames` limits, RoleBinding and ClusterRoleBinding
 scope, unsupported inputs, deterministic evidence aggregation, duplicate
-evidence deduplication, conflict atomicity, and regression checks that Secret
-values are absent from graph JSON and evidence.
+evidence deduplication, conflict atomicity, typed structured `CanRead`
+authorization metadata, deterministic metadata ordering, and regression checks
+that Secret values are absent from graph JSON, metadata, and evidence.
 
 Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
 edge semantics, exact required node and edge kind validation, unrelated graph
@@ -69,6 +70,29 @@ node and edge evidence preservation, nil and empty graph behavior, and fixed
 `High` severity. The Secret-value regression for analysis runs through the real
 Kubernetes parser and routing pipeline before marshalling findings; analysis
 preserves graph evidence and does not perform generic redaction.
+
+Remediation tests cover the read-only `internal/remediation.Build` API for
+`PP-K8S-001`. Coverage asserts complete advisory options for
+`RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`;
+multi-resource rule summaries that preserve unrelated access; omission of
+unsafe wildcard-resource `RemoveSecretsResource` options; `RemoveSecretReadVerb`
+only for core-only Secret-only resource rules; omission of resource-removal and
+verb-removal options for wildcard, mixed, empty, and non-core API groups;
+wildcard verb guidance that replaces `*` with explicit least-privilege verbs;
+omission of single-subject binding narrowing; coordinated multi-chain options
+with one required change per contributing authorization chain; duplicate
+authorization deduplication; deterministic plan ordering and byte-identical
+JSON across repeated and reversed inputs; stable plan IDs; plan ID changes when
+canonical identity inputs change; plan ID stability when evidence prose
+changes; graph and finding immutability; unsupported rule skipping; malformed
+supported finding errors; and Secret-value exclusion from plan JSON and errors.
+
+CLI remediation tests cover human remediation sections under findings,
+structured JSON remediation output, safe scans with no remediation plans,
+multiple findings with matching deterministic plans, planning/projection
+errors that leave stdout empty and return exit code `2`, unchanged successful
+scan exit codes, and Secret-value exclusion from human output, JSON output,
+and stderr.
 
 Tests must cover positive and negative behavior for changed packages. Do not
 skip, remove, or weaken tests to make a change pass.

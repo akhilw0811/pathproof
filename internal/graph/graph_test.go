@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -534,6 +535,68 @@ func TestGraphAddEdgeEmptyIDsDoNotDropUnrelatedEvidence(t *testing.T) {
 	}
 }
 
+func TestGraphEdgeMetadataIsCloned(t *testing.T) {
+	g, _, _, serviceAccount, secret := exampleGraphNodes(t)
+	edge := NewEdge(CanRead, serviceAccount.ID, secret.ID, SourceEvidence{Source: "fixture", Detail: "secret read"})
+	edge.Metadata = &EdgeMetadata{KubernetesCanReadAuthorizations: []KubernetesCanReadAuthorization{{
+		BindingKind:                         "RoleBinding",
+		BindingNamespace:                    "prod",
+		BindingName:                         "read-secrets",
+		BindingSourceReference:              "binding.yaml#document=1",
+		BindingSupportedServiceAccountCount: 1,
+		ServiceAccountNamespace:             "prod",
+		ServiceAccountName:                  "api",
+		RoleKind:                            "Role",
+		RoleNamespace:                       "prod",
+		RoleName:                            "secret-reader",
+		RoleSourceReference:                 "role.yaml#document=1",
+		PermissionSHA256:                    "abc123",
+		Permission: KubernetesPermission{
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"get"},
+		},
+		MatchedVerb:            "get",
+		ScopeKind:              "namespace",
+		ScopeName:              "prod",
+		SecretNamespace:        "prod",
+		SecretName:             "database-password",
+		SecretSourceReferences: []string{"secret.yaml#document=1"},
+	}}}
+
+	added := mustAddEdge(t, g, edge)
+	edge.Metadata.KubernetesCanReadAuthorizations[0].BindingName = "changed"
+	edge.Metadata.KubernetesCanReadAuthorizations[0].Permission.Resources[0] = "pods"
+	added.Metadata.KubernetesCanReadAuthorizations[0].MatchedVerb = "watch"
+
+	got, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found", added.ID)
+	}
+	if got.Metadata == nil {
+		t.Fatal("metadata = nil, want metadata")
+	}
+	auth := got.Metadata.KubernetesCanReadAuthorizations[0]
+	if auth.BindingName != "read-secrets" {
+		t.Fatalf("stored binding name = %q, want original", auth.BindingName)
+	}
+	if auth.Permission.Resources[0] != "secrets" {
+		t.Fatalf("stored permission resource = %q, want original", auth.Permission.Resources[0])
+	}
+	if auth.MatchedVerb != "get" {
+		t.Fatalf("stored matched verb = %q, want original", auth.MatchedVerb)
+	}
+
+	got.Metadata.KubernetesCanReadAuthorizations[0].SecretSourceReferences[0] = "changed-secret.yaml#document=1"
+	again, ok := g.Edge(added.ID)
+	if !ok {
+		t.Fatalf("edge %q not found after mutation", added.ID)
+	}
+	if again.Metadata.KubernetesCanReadAuthorizations[0].SecretSourceReferences[0] != "secret.yaml#document=1" {
+		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.KubernetesCanReadAuthorizations[0])
+	}
+}
+
 func TestGraphAddEdgeRejectsMissingEndpoints(t *testing.T) {
 	g := New()
 	from := mustAddNode(t, g, NewNode(PublicEndpoint, "public-api"))
@@ -697,6 +760,50 @@ func TestEmptyGraphJSON(t *testing.T) {
 	}
 	if want := `{"nodes":[],"edges":[]}`; string(got) != want {
 		t.Fatalf("json = %s, want %s", got, want)
+	}
+}
+
+func TestGraphEdgeJSONOmitsEmptyMetadataAndIncludesTypedMetadata(t *testing.T) {
+	g, endpoint, workload, serviceAccount, secret := exampleGraphNodes(t)
+	mustAddEdge(t, g, NewEdge(RoutesTo, endpoint.ID, workload.ID, SourceEvidence{Source: "fixture", Detail: "route"}))
+	canRead := NewEdge(CanRead, serviceAccount.ID, secret.ID, SourceEvidence{Source: "fixture", Detail: "secret read"})
+	canRead.Metadata = &EdgeMetadata{KubernetesCanReadAuthorizations: []KubernetesCanReadAuthorization{{
+		BindingKind:                         "RoleBinding",
+		BindingNamespace:                    "prod",
+		BindingName:                         "read-secrets",
+		BindingSourceReference:              "binding.yaml#document=1",
+		BindingSupportedServiceAccountCount: 1,
+		ServiceAccountNamespace:             "prod",
+		ServiceAccountName:                  "api",
+		RoleKind:                            "Role",
+		RoleNamespace:                       "prod",
+		RoleName:                            "secret-reader",
+		RoleSourceReference:                 "role.yaml#document=1",
+		PermissionSHA256:                    "abc123",
+		Permission: KubernetesPermission{
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"get"},
+		},
+		MatchedVerb:            "get",
+		ScopeKind:              "namespace",
+		ScopeName:              "prod",
+		SecretNamespace:        "prod",
+		SecretName:             "database-password",
+		SecretSourceReferences: []string{"secret.yaml#document=1"},
+	}}}
+	mustAddEdge(t, g, canRead)
+
+	data, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("marshal graph: %v", err)
+	}
+	got := string(data)
+	if strings.Count(got, `"metadata"`) != 1 {
+		t.Fatalf("metadata count in graph JSON = %d, want 1: %s", strings.Count(got, `"metadata"`), got)
+	}
+	if !strings.Contains(got, `"kubernetes_can_read_authorizations"`) || !strings.Contains(got, `"binding_name":"read-secrets"`) {
+		t.Fatalf("graph JSON missing typed metadata: %s", got)
 	}
 }
 

@@ -51,12 +51,46 @@ type SourceEvidence struct {
 	Detail string `json:"detail"`
 }
 
+type EdgeMetadata struct {
+	KubernetesCanReadAuthorizations []KubernetesCanReadAuthorization `json:"kubernetes_can_read_authorizations,omitempty"`
+}
+
+type KubernetesCanReadAuthorization struct {
+	BindingKind                         string               `json:"binding_kind"`
+	BindingNamespace                    string               `json:"binding_namespace,omitempty"`
+	BindingName                         string               `json:"binding_name"`
+	BindingSourceReference              string               `json:"binding_source_reference"`
+	BindingSupportedServiceAccountCount int                  `json:"binding_supported_service_account_count"`
+	ServiceAccountNamespace             string               `json:"service_account_namespace"`
+	ServiceAccountName                  string               `json:"service_account_name"`
+	RoleKind                            string               `json:"role_kind"`
+	RoleNamespace                       string               `json:"role_namespace,omitempty"`
+	RoleName                            string               `json:"role_name"`
+	RoleSourceReference                 string               `json:"role_source_reference"`
+	PermissionSHA256                    string               `json:"permission_sha256"`
+	Permission                          KubernetesPermission `json:"permission"`
+	MatchedVerb                         string               `json:"matched_verb"`
+	ScopeKind                           string               `json:"scope_kind"`
+	ScopeName                           string               `json:"scope_name,omitempty"`
+	SecretNamespace                     string               `json:"secret_namespace"`
+	SecretName                          string               `json:"secret_name"`
+	SecretSourceReferences              []string             `json:"secret_source_references,omitempty"`
+}
+
+type KubernetesPermission struct {
+	APIGroups     []string `json:"apiGroups"`
+	Resources     []string `json:"resources"`
+	ResourceNames []string `json:"resourceNames"`
+	Verbs         []string `json:"verbs"`
+}
+
 type Edge struct {
 	ID       EdgeID         `json:"id"`
 	Kind     EdgeKind       `json:"kind"`
 	From     NodeID         `json:"from"`
 	To       NodeID         `json:"to"`
 	Evidence SourceEvidence `json:"evidence"`
+	Metadata *EdgeMetadata  `json:"metadata,omitempty"`
 }
 
 type Graph struct {
@@ -145,27 +179,31 @@ func (g *Graph) AddEdge(edge Edge) (Edge, error) {
 	}
 
 	if existing, ok := g.edges[edge.ID]; ok {
-		return existing, nil
+		return cloneEdge(existing), nil
 	}
 
+	edge = cloneEdge(edge)
 	g.edges[edge.ID] = edge
 	if g.outgoing[edge.From] == nil {
 		g.outgoing[edge.From] = make(map[EdgeID]Edge)
 	}
 	g.outgoing[edge.From][edge.ID] = edge
 
-	return edge, nil
+	return cloneEdge(edge), nil
 }
 
 func (g *Graph) Edge(id EdgeID) (Edge, bool) {
 	edge, ok := g.edges[id]
-	return edge, ok
+	if !ok {
+		return Edge{}, false
+	}
+	return cloneEdge(edge), true
 }
 
 func (g *Graph) Edges() []Edge {
 	edges := make([]Edge, 0, len(g.edges))
 	for _, edge := range g.edges {
-		edges = append(edges, edge)
+		edges = append(edges, cloneEdge(edge))
 	}
 
 	sort.Slice(edges, func(i, j int) bool {
@@ -178,7 +216,7 @@ func (g *Graph) Edges() []Edge {
 func (g *Graph) Outgoing(from NodeID) []Edge {
 	edges := make([]Edge, 0, len(g.outgoing[from]))
 	for _, edge := range g.outgoing[from] {
-		edges = append(edges, edge)
+		edges = append(edges, cloneEdge(edge))
 	}
 
 	sort.Slice(edges, func(i, j int) bool {
@@ -257,6 +295,39 @@ func cloneEvidence(evidence []SourceEvidence) []SourceEvidence {
 		return nil
 	}
 	return append([]SourceEvidence(nil), evidence...)
+}
+
+func cloneEdge(edge Edge) Edge {
+	if edge.Metadata == nil {
+		return edge
+	}
+	metadata := *edge.Metadata
+	metadata.KubernetesCanReadAuthorizations = cloneKubernetesCanReadAuthorizations(metadata.KubernetesCanReadAuthorizations)
+	edge.Metadata = &metadata
+	return edge
+}
+
+func cloneKubernetesCanReadAuthorizations(authorizations []KubernetesCanReadAuthorization) []KubernetesCanReadAuthorization {
+	if authorizations == nil {
+		return nil
+	}
+	cloned := make([]KubernetesCanReadAuthorization, len(authorizations))
+	for i, authorization := range authorizations {
+		cloned[i] = authorization
+		cloned[i].Permission.APIGroups = cloneStrings(authorization.Permission.APIGroups)
+		cloned[i].Permission.Resources = cloneStrings(authorization.Permission.Resources)
+		cloned[i].Permission.ResourceNames = cloneStrings(authorization.Permission.ResourceNames)
+		cloned[i].Permission.Verbs = cloneStrings(authorization.Permission.Verbs)
+		cloned[i].SecretSourceReferences = cloneStrings(authorization.SecretSourceReferences)
+	}
+	return cloned
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
 }
 
 func nodeID(kind NodeKind, name string) NodeID {

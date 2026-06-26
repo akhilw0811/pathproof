@@ -12,6 +12,7 @@ import (
 	"pathproof/internal/analysis"
 	"pathproof/internal/graph"
 	parserkubernetes "pathproof/internal/parser/kubernetes"
+	"pathproof/internal/remediation"
 	routingkubernetes "pathproof/internal/routing/kubernetes"
 )
 
@@ -68,7 +69,12 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 }
 
 func writeScanResult(findings []analysis.Finding, g *graph.Graph, format scanFormat, stdout, stderr io.Writer) int {
-	report, err := newScanReport(findings, g)
+	plans, err := remediation.Build(g, findings)
+	if err != nil {
+		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
+		return 2
+	}
+	report, err := newScanReport(findings, g, plans)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -154,6 +160,7 @@ type scanFinding struct {
 	Path             []scanPathNode     `json:"path"`
 	Evidence         []scanEvidence     `json:"evidence"`
 	SourceReferences []string           `json:"source_references"`
+	Remediation      *scanRemediation   `json:"remediation,omitempty"`
 }
 
 type scanPathNode struct {
@@ -169,7 +176,45 @@ type scanEvidence struct {
 	Detail string         `json:"detail"`
 }
 
-func newScanReport(findings []analysis.Finding, g *graph.Graph) (scanReport, error) {
+type scanRemediation struct {
+	ID        remediation.PlanID      `json:"id"`
+	FindingID analysis.FindingID      `json:"finding_id"`
+	RuleID    analysis.RuleID         `json:"rule_id"`
+	Summary   string                  `json:"summary"`
+	Options   []scanRemediationOption `json:"options"`
+}
+
+type scanRemediationOption struct {
+	Priority           int                     `json:"priority"`
+	Action             remediation.Action      `json:"action"`
+	Summary            string                  `json:"summary"`
+	Rationale          string                  `json:"rationale"`
+	RequiresAllChanges bool                    `json:"requires_all_changes"`
+	Changes            []scanRemediationChange `json:"changes"`
+	Constraints        []string                `json:"constraints,omitempty"`
+}
+
+type scanRemediationChange struct {
+	Action           remediation.Action    `json:"action"`
+	Target           scanRemediationTarget `json:"target"`
+	Summary          string                `json:"summary"`
+	SourceReference  string                `json:"source_reference"`
+	PermissionSHA256 string                `json:"permission_sha256,omitempty"`
+	MatchedVerb      string                `json:"matched_verb,omitempty"`
+	Subject          string                `json:"subject,omitempty"`
+}
+
+type scanRemediationTarget struct {
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+}
+
+func newScanReport(findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan) (scanReport, error) {
+	planByFinding := make(map[analysis.FindingID]remediation.Plan, len(plans))
+	for _, plan := range plans {
+		planByFinding[plan.FindingID] = plan
+	}
 	report := scanReport{
 		Findings:     make([]scanFinding, 0, len(findings)),
 		FindingCount: len(findings),
@@ -178,6 +223,9 @@ func newScanReport(findings []analysis.Finding, g *graph.Graph) (scanReport, err
 		item, err := projectFinding(finding, g)
 		if err != nil {
 			return scanReport{}, err
+		}
+		if plan, ok := planByFinding[finding.ID]; ok {
+			item.Remediation = projectRemediation(plan)
 		}
 		report.Findings = append(report.Findings, item)
 	}
@@ -249,6 +297,44 @@ func projectFinding(finding analysis.Finding, g *graph.Graph) (scanFinding, erro
 	}, nil
 }
 
+func projectRemediation(plan remediation.Plan) *scanRemediation {
+	projected := scanRemediation{
+		ID:        plan.ID,
+		FindingID: plan.FindingID,
+		RuleID:    plan.RuleID,
+		Summary:   plan.Summary,
+		Options:   make([]scanRemediationOption, 0, len(plan.Options)),
+	}
+	for _, option := range plan.Options {
+		projectedOption := scanRemediationOption{
+			Priority:           option.Priority,
+			Action:             option.Action,
+			Summary:            option.Summary,
+			Rationale:          option.Rationale,
+			RequiresAllChanges: option.RequiresAllChanges,
+			Constraints:        append([]string(nil), option.Constraints...),
+			Changes:            make([]scanRemediationChange, 0, len(option.Changes)),
+		}
+		for _, change := range option.Changes {
+			projectedOption.Changes = append(projectedOption.Changes, scanRemediationChange{
+				Action: change.Action,
+				Target: scanRemediationTarget{
+					Kind:      change.Target.Kind,
+					Namespace: change.Target.Namespace,
+					Name:      change.Target.Name,
+				},
+				Summary:          change.Summary,
+				SourceReference:  change.SourceReference,
+				PermissionSHA256: change.PermissionSHA256,
+				MatchedVerb:      change.MatchedVerb,
+				Subject:          change.Subject,
+			})
+		}
+		projected.Options = append(projected.Options, projectedOption)
+	}
+	return &projected
+}
+
 func writeHumanReport(w io.Writer, report scanReport) error {
 	if _, err := fmt.Fprintf(w, "Finding count: %d\n", report.FindingCount); err != nil {
 		return err
@@ -294,8 +380,49 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 				return err
 			}
 		}
+		if finding.Remediation != nil {
+			if _, err := fmt.Fprintln(w, "Remediation:"); err != nil {
+				return err
+			}
+			for i, option := range finding.Remediation.Options {
+				if _, err := fmt.Fprintf(w, "  Option %d: %s (priority %d)\n", i+1, option.Action, option.Priority); err != nil {
+					return err
+				}
+				if _, err := fmt.Fprintf(w, "    Summary: %s\n", option.Summary); err != nil {
+					return err
+				}
+				if _, err := fmt.Fprintf(w, "    Rationale: %s\n", option.Rationale); err != nil {
+					return err
+				}
+				if option.RequiresAllChanges {
+					if _, err := fmt.Fprintln(w, "    All listed changes in this option must be applied together."); err != nil {
+						return err
+					}
+				}
+				if _, err := fmt.Fprintln(w, "    Changes:"); err != nil {
+					return err
+				}
+				for _, change := range option.Changes {
+					if _, err := fmt.Fprintf(w, "      - %s %s: %s [%s]\n", change.Action, remediationTargetName(change.Target), change.Summary, change.SourceReference); err != nil {
+						return err
+					}
+					if change.PermissionSHA256 != "" || change.MatchedVerb != "" || change.Subject != "" {
+						if _, err := fmt.Fprintf(w, "        Parameters: permission_sha256=%s matched_verb=%s subject=%s\n", change.PermissionSHA256, change.MatchedVerb, change.Subject); err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
 	}
 	return nil
+}
+
+func remediationTargetName(target scanRemediationTarget) string {
+	if target.Namespace == "" {
+		return target.Kind + " " + target.Name
+	}
+	return target.Kind + " " + target.Namespace + "/" + target.Name
 }
 
 func writeJSONReport(w io.Writer, report scanReport) error {
