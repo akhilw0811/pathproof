@@ -109,12 +109,35 @@ subjects, unsupported actions, and source files containing Secret payload
 fields. Tests also verify unsupported reasons do not include Secret keys or
 values.
 
+Patch output tests cover the opt-in `internal/patchpreview.Write` API for the
+same `NarrowBindingSubject` slice. Coverage asserts output directory safety,
+preparation-before-write behavior, cleanup after controlled write failures,
+missing output directory creation only when generated files exist, no writes
+when every preview is unsupported, one deterministic output file for multiple
+compatible changes to the same source file, duplicate same-subject removal
+deduplication, byte-identical repeated and reversed-order writes, stable
+display-safe output paths, source file immutability, Secret-bearing source
+file exclusion, symlink-resolved output-root containment checks, absolute
+source references that must resolve inside the scan root, symlink source escape
+rejection, and unsupported actions being reported but not written.
+
 CLI patch preview tests cover default output remaining free of
 `patch_previews`, generated human and JSON previews when `--preview-patches` is
 enabled, visible unsupported previews, safe scans with no previews, unchanged
 exit codes, preview-builder errors that leave stdout empty and return exit code
 `2`, deterministic repeated preview output, and Secret-value exclusion from
 stdout and stderr.
+
+CLI patch output tests cover `--write-patches` argument validation, unsafe
+input/output directory relationship rejection, output path conflicts returning
+exit code `2` with empty stdout, supported `NarrowBindingSubject` writes,
+unsupported-only vulnerable scans writing no files while preserving exit code
+`1`, safe scans writing no files with exit code `0`, `--preview-patches` alone
+writing nothing, combined preview and write output, JSON `patch_outputs`
+appearing only when requested, stable display-safe paths without temp prefixes,
+absolute-input scan-root-local source references displayed relative to the scan
+root throughout human and JSON reports, input file immutability, and no full
+patched file contents in human or JSON output.
 
 Tests must cover positive and negative behavior for changed packages. Do not
 skip, remove, or weaken tests to make a change pass.

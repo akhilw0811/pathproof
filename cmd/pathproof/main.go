@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"pathproof/internal/analysis"
@@ -18,7 +20,7 @@ import (
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json] [--preview-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json] [--preview-patches] [--write-patches <output-directory>] <directory>"
 
 type scanFormat string
 
@@ -30,6 +32,7 @@ const (
 type scanOptions struct {
 	format         scanFormat
 	previewPatches bool
+	writePatches   string
 	directory      string
 }
 
@@ -72,24 +75,35 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, stdout, stderr)
+	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, stdout, stderr)
 }
 
-func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, stdout, stderr io.Writer) int {
+func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, stdout, stderr io.Writer) int {
 	plans, err := remediation.Build(g, findings)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
 		return 2
 	}
 	var previews []patchpreview.Preview
-	if previewPatches {
+	var patchOutputs []patchpreview.WrittenFile
+	includePatchOutputs := writePatches != ""
+	if writePatches != "" {
+		patchOutputs, previews, err = patchpreview.Write(root, writePatches, plans)
+		if err != nil {
+			printError(stderr, "write patch output: "+err.Error())
+			return 2
+		}
+		if !previewPatches {
+			previews = nil
+		}
+	} else if previewPatches {
 		previews, err = patchpreview.Build(root, plans)
 		if err != nil {
 			printError(stderr, "internal scan error: build patch previews: "+err.Error())
 			return 2
 		}
 	}
-	report, err := newScanReport(findings, g, plans, previews)
+	report, err := newScanReport(root, findings, g, plans, previews, patchOutputs, includePatchOutputs)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -125,9 +139,16 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	flags.SetOutput(io.Discard)
 	formatValue := flags.String("format", string(scanFormatHuman), "output format")
 	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
+	writePatches := flags.String("write-patches", "", "write patched copies to an output directory")
 	if err := flags.Parse(args); err != nil {
 		return scanOptions{}, fmt.Errorf("invalid scan arguments: %w; %s", err, usage)
 	}
+	writePatchesSet := false
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "write-patches" {
+			writePatchesSet = true
+		}
+	})
 	format := scanFormat(*formatValue)
 	switch format {
 	case scanFormatHuman, scanFormatJSON:
@@ -147,7 +168,16 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	if !info.IsDir() {
 		return scanOptions{}, fmt.Errorf("scan path %q is not a directory", dir)
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, directory: dir}, nil
+	if writePatchesSet {
+		if err := patchpreview.ValidateOutputRoot(dir, *writePatches); err != nil {
+			return scanOptions{}, err
+		}
+	}
+	writePatchesValue := ""
+	if writePatchesSet {
+		writePatchesValue = *writePatches
+	}
+	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, directory: dir}, nil
 }
 
 func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
@@ -163,8 +193,9 @@ func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
 }
 
 type scanReport struct {
-	Findings     []scanFinding `json:"findings"`
-	FindingCount int           `json:"finding_count"`
+	Findings     []scanFinding      `json:"findings"`
+	FindingCount int                `json:"finding_count"`
+	PatchOutputs *[]scanPatchOutput `json:"patch_outputs,omitempty"`
 }
 
 type scanFinding struct {
@@ -239,7 +270,14 @@ type scanPatchPreview struct {
 	Reason       string              `json:"reason,omitempty"`
 }
 
-func newScanReport(findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview) (scanReport, error) {
+type scanPatchOutput struct {
+	Source string              `json:"source"`
+	Output string              `json:"output,omitempty"`
+	Status patchpreview.Status `json:"status"`
+	Reason string              `json:"reason,omitempty"`
+}
+
+func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool) (scanReport, error) {
 	planByFinding := make(map[analysis.FindingID]remediation.Plan, len(plans))
 	for _, plan := range plans {
 		planByFinding[plan.FindingID] = plan
@@ -249,19 +287,31 @@ func newScanReport(findings []analysis.Finding, g *graph.Graph, plans []remediat
 		FindingCount: len(findings),
 	}
 	for _, finding := range findings {
-		item, err := projectFinding(finding, g)
+		item, err := projectFinding(root, finding, g)
 		if err != nil {
 			return scanReport{}, err
 		}
 		if plan, ok := planByFinding[finding.ID]; ok {
-			item.Remediation = projectRemediation(plan, previews)
+			item.Remediation = projectRemediation(root, plan, previews)
 		}
 		report.Findings = append(report.Findings, item)
+	}
+	if includePatchOutputs {
+		outputs := make([]scanPatchOutput, 0, len(patchOutputs))
+		for _, output := range patchOutputs {
+			outputs = append(outputs, scanPatchOutput{
+				Source: output.Source,
+				Output: output.Output,
+				Status: output.PreviewStatus,
+				Reason: output.Reason,
+			})
+		}
+		report.PatchOutputs = &outputs
 	}
 	return report, nil
 }
 
-func projectFinding(finding analysis.Finding, g *graph.Graph) (scanFinding, error) {
+func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scanFinding, error) {
 	if g == nil {
 		return scanFinding{}, fmt.Errorf("finding %q cannot be projected without a graph", finding.ID)
 	}
@@ -309,9 +359,14 @@ func projectFinding(finding analysis.Finding, g *graph.Graph) (scanFinding, erro
 		evidence = append(evidence, scanEvidence{
 			EdgeID: item.EdgeID,
 			Kind:   item.Kind,
-			Source: item.Source.Source,
-			Detail: item.Source.Detail,
+			Source: normalizeDisplaySourceReferences(root, item.Source.Source),
+			Detail: normalizeDisplaySourceReferences(root, item.Source.Detail),
 		})
+	}
+
+	sourceReferences := make([]string, 0, len(finding.SourceReferences))
+	for _, source := range finding.SourceReferences {
+		sourceReferences = append(sourceReferences, normalizeDisplaySourceReferences(root, source))
 	}
 
 	return scanFinding{
@@ -322,11 +377,11 @@ func projectFinding(finding analysis.Finding, g *graph.Graph) (scanFinding, erro
 		Summary:          finding.Summary,
 		Path:             path,
 		Evidence:         evidence,
-		SourceReferences: append([]string(nil), finding.SourceReferences...),
+		SourceReferences: sourceReferences,
 	}, nil
 }
 
-func projectRemediation(plan remediation.Plan, previews []patchpreview.Preview) *scanRemediation {
+func projectRemediation(root string, plan remediation.Plan, previews []patchpreview.Preview) *scanRemediation {
 	projected := scanRemediation{
 		ID:        plan.ID,
 		FindingID: plan.FindingID,
@@ -369,7 +424,7 @@ func projectRemediation(plan remediation.Plan, previews []patchpreview.Preview) 
 					Name:      change.Target.Name,
 				},
 				Summary:          change.Summary,
-				SourceReference:  change.SourceReference,
+				SourceReference:  normalizeDisplaySourceReferences(root, change.SourceReference),
 				PermissionSHA256: change.PermissionSHA256,
 				MatchedVerb:      change.MatchedVerb,
 				Subject:          change.Subject,
@@ -380,13 +435,142 @@ func projectRemediation(plan remediation.Plan, previews []patchpreview.Preview) 
 	return &projected
 }
 
+func normalizeDisplaySourceReferences(root, value string) string {
+	if root == "" || value == "" || !strings.Contains(value, "#document=") {
+		return value
+	}
+	var out strings.Builder
+	offset := 0
+	for {
+		index := strings.Index(value[offset:], "#document=")
+		if index < 0 {
+			out.WriteString(value[offset:])
+			break
+		}
+		hash := offset + index
+		end := sourceReferenceEnd(value, hash+len("#document="))
+		start, normalized, ok := normalizeEmbeddedSourceReference(root, value[offset:end], hash-offset)
+		if !ok {
+			out.WriteString(value[offset:end])
+			offset = end
+			continue
+		}
+		out.WriteString(value[offset : offset+start])
+		out.WriteString(normalized)
+		offset = end
+	}
+	return out.String()
+}
+
+func sourceReferenceEnd(value string, start int) int {
+	end := start
+	for end < len(value) && !isSourceReferenceEndDelimiter(value[end]) {
+		end++
+	}
+	return end
+}
+
+func isSourceReferenceEndDelimiter(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '[', ']', '(', ')', ';', ',':
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeEmbeddedSourceReference(root, value string, hash int) (int, string, bool) {
+	for start := 0; start < hash; start++ {
+		if start > 0 && !isPotentialSourceReferenceStart(value[start-1]) {
+			continue
+		}
+		candidate := value[start:]
+		normalized := normalizeDisplaySourceReference(root, candidate)
+		if normalized != candidate {
+			return start, normalized, true
+		}
+	}
+	return 0, "", false
+}
+
+func isPotentialSourceReferenceStart(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '[', '(', ';', ',', '=':
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeDisplaySourceReference(root, value string) string {
+	index := strings.LastIndex(value, "#document=")
+	if index < 0 {
+		return value
+	}
+	filename := value[:index]
+	documentValue := value[index+len("#document="):]
+	if filename == "" || documentValue == "" || strings.Contains(documentValue, "#") {
+		return value
+	}
+	for _, r := range documentValue {
+		if r < '0' || r > '9' {
+			return value
+		}
+	}
+	documentIndex, err := strconv.Atoi(documentValue)
+	if err != nil || documentIndex <= 0 {
+		return value
+	}
+	rel, ok := displayRelativeSourcePath(root, filename)
+	if !ok {
+		return value
+	}
+	return rel + "#document=" + documentValue
+}
+
+func displayRelativeSourcePath(root, filename string) (string, bool) {
+	realRoot, err := filepath.EvalSymlinks(absClean(root))
+	if err != nil {
+		return "", false
+	}
+	candidates := []string{filepath.Clean(filename)}
+	if !filepath.IsAbs(candidates[0]) {
+		if candidates[0] == "." || candidates[0] == ".." || strings.HasPrefix(candidates[0], ".."+string(filepath.Separator)) {
+			return "", false
+		}
+		candidates = append(candidates, filepath.Join(root, candidates[0]))
+	}
+	for _, candidate := range candidates {
+		realCandidate, err := filepath.EvalSymlinks(absClean(candidate))
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(filepath.Clean(realRoot), filepath.Clean(realCandidate))
+		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		return filepath.ToSlash(filepath.Clean(rel)), true
+	}
+	return "", false
+}
+
+func absClean(path string) string {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(absPath)
+}
+
 func writeHumanReport(w io.Writer, report scanReport) error {
 	if _, err := fmt.Fprintf(w, "Finding count: %d\n", report.FindingCount); err != nil {
 		return err
 	}
 	if report.FindingCount == 0 {
-		_, err := fmt.Fprintln(w, "No findings.")
-		return err
+		if _, err := fmt.Fprintln(w, "No findings."); err != nil {
+			return err
+		}
+		return writeHumanPatchOutputs(w, report)
 	}
 	for _, finding := range report.Findings {
 		if _, err := fmt.Fprintf(w, "\nFinding: %s\n", finding.ID); err != nil {
@@ -486,6 +670,45 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 						}
 					}
 				}
+			}
+		}
+	}
+	return writeHumanPatchOutputs(w, report)
+}
+
+func writeHumanPatchOutputs(w io.Writer, report scanReport) error {
+	if report.PatchOutputs == nil {
+		return nil
+	}
+	writtenCount := 0
+	for _, output := range *report.PatchOutputs {
+		if output.Status == patchpreview.StatusGenerated {
+			writtenCount++
+		}
+	}
+	if _, err := fmt.Fprintln(w, "\nPatch Output:"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Written files: %d\n", writtenCount); err != nil {
+		return err
+	}
+	for _, output := range *report.PatchOutputs {
+		if _, err := fmt.Fprintf(w, "  - Status: %s\n", output.Status); err != nil {
+			return err
+		}
+		if output.Source != "" {
+			if _, err := fmt.Fprintf(w, "    Source: %s\n", output.Source); err != nil {
+				return err
+			}
+		}
+		if output.Output != "" {
+			if _, err := fmt.Fprintf(w, "    Output: %s\n", output.Output); err != nil {
+				return err
+			}
+		}
+		if output.Reason != "" {
+			if _, err := fmt.Fprintf(w, "    Reason: %s\n", output.Reason); err != nil {
+				return err
 			}
 		}
 	}

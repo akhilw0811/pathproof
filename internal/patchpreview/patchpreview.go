@@ -22,6 +22,8 @@ const (
 	StatusUnsupported Status = "unsupported"
 )
 
+var openOutputFile = os.OpenFile
+
 type Preview struct {
 	PlanID       remediation.PlanID `json:"plan_id"`
 	OptionIndex  int                `json:"option_index"`
@@ -32,6 +34,18 @@ type Preview struct {
 	File         string             `json:"file,omitempty"`
 	Diff         string             `json:"diff,omitempty"`
 	Reason       string             `json:"reason,omitempty"`
+}
+
+type WrittenFile struct {
+	Source        string `json:"source"`
+	Output        string `json:"output,omitempty"`
+	PreviewStatus Status `json:"status"`
+	Reason        string `json:"reason,omitempty"`
+}
+
+func ValidateOutputRoot(root string, outputRoot string) error {
+	_, _, err := validateOutputRoot(root, outputRoot)
+	return err
 }
 
 type sourceRef struct {
@@ -48,6 +62,27 @@ type resolvedSource struct {
 type documentRange struct {
 	start int
 	end   int
+}
+
+type sourceState struct {
+	source    resolvedSource
+	original  string
+	documents []*yaml.Node
+	ranges    []documentRange
+}
+
+type writeCandidate struct {
+	preview Preview
+	source  resolvedSource
+	change  remediation.Change
+	state   *sourceState
+}
+
+type preparedOutput struct {
+	sourceRel string
+	display   string
+	fullPath  string
+	content   []byte
 }
 
 type diffOpKind int
@@ -96,6 +131,28 @@ func Build(root string, plans []remediation.Plan) ([]Preview, error) {
 		return previews[i].File < previews[j].File
 	})
 	return previews, nil
+}
+
+func Write(root string, outputRoot string, plans []remediation.Plan) ([]WrittenFile, []Preview, error) {
+	if root == "" {
+		return nil, nil, fmt.Errorf("patch preview root is empty")
+	}
+	outputRoot, displayRoot, err := validateOutputRoot(root, outputRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	written, previews, outputs, err := prepareWrite(root, outputRoot, displayRoot, plans)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(outputs) == 0 {
+		return written, previews, nil
+	}
+	if err := writePreparedOutputs(outputRoot, outputs); err != nil {
+		return nil, nil, err
+	}
+	return written, previews, nil
 }
 
 func buildChangePreview(root string, planID remediation.PlanID, optionIndex int, optionAction remediation.Action, changeIndex int, change remediation.Change) Preview {
@@ -173,46 +230,516 @@ func buildChangePreview(root string, planID remediation.PlanID, optionIndex int,
 	return preview
 }
 
+func prepareWrite(root, outputRoot, displayRoot string, plans []remediation.Plan) ([]WrittenFile, []Preview, []preparedOutput, error) {
+	candidates, previews, err := collectWriteCandidates(root, plans)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	unsupported := make([]WrittenFile, 0)
+	bySource := make(map[string][]writeCandidate)
+	for _, candidate := range candidates {
+		previews = append(previews, candidate.preview)
+		if candidate.preview.Status != StatusGenerated {
+			unsupported = append(unsupported, WrittenFile{
+				Source:        candidate.preview.File,
+				PreviewStatus: candidate.preview.Status,
+				Reason:        candidate.preview.Reason,
+			})
+			continue
+		}
+		bySource[candidate.source.relPath] = append(bySource[candidate.source.relPath], candidate)
+	}
+	sortPreviews(previews)
+
+	sourcePaths := make([]string, 0, len(bySource))
+	for source := range bySource {
+		sourcePaths = append(sourcePaths, source)
+	}
+	sort.Strings(sourcePaths)
+
+	written := make([]WrittenFile, 0, len(sourcePaths)+len(unsupported))
+	outputs := make([]preparedOutput, 0, len(sourcePaths))
+	for _, source := range sourcePaths {
+		output, ok, reason, err := prepareSourceOutput(outputRoot, displayRoot, bySource[source])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if !ok {
+			written = append(written, WrittenFile{
+				Source:        source,
+				PreviewStatus: StatusUnsupported,
+				Reason:        reason,
+			})
+			continue
+		}
+		outputs = append(outputs, output)
+		written = append(written, WrittenFile{
+			Source:        output.sourceRel,
+			Output:        output.display,
+			PreviewStatus: StatusGenerated,
+		})
+	}
+	written = append(written, unsupported...)
+	sort.SliceStable(written, func(i, j int) bool {
+		if written[i].PreviewStatus != written[j].PreviewStatus {
+			return written[i].PreviewStatus < written[j].PreviewStatus
+		}
+		if written[i].Source != written[j].Source {
+			return written[i].Source < written[j].Source
+		}
+		if written[i].Output != written[j].Output {
+			return written[i].Output < written[j].Output
+		}
+		return written[i].Reason < written[j].Reason
+	})
+	return written, previews, outputs, nil
+}
+
+func collectWriteCandidates(root string, plans []remediation.Plan) ([]writeCandidate, []Preview, error) {
+	orderedPlans := append([]remediation.Plan(nil), plans...)
+	sort.SliceStable(orderedPlans, func(i, j int) bool {
+		return orderedPlans[i].ID < orderedPlans[j].ID
+	})
+	sourceCache := make(map[string]*sourceState)
+	candidates := make([]writeCandidate, 0)
+	for _, plan := range orderedPlans {
+		for optionIndex, option := range plan.Options {
+			for changeIndex, change := range option.Changes {
+				candidate := buildWriteCandidate(root, sourceCache, plan.ID, optionIndex, option.Action, changeIndex, change)
+				candidates = append(candidates, candidate)
+			}
+		}
+	}
+	return candidates, nil, nil
+}
+
+func buildWriteCandidate(root string, sourceCache map[string]*sourceState, planID remediation.PlanID, optionIndex int, optionAction remediation.Action, changeIndex int, change remediation.Change) writeCandidate {
+	preview := Preview{
+		PlanID:       planID,
+		OptionIndex:  optionIndex,
+		OptionAction: optionAction,
+		ChangeIndex:  changeIndex,
+		Status:       StatusUnsupported,
+		Summary:      change.Summary,
+	}
+	if change.Action != remediation.NarrowBindingSubject || optionAction != remediation.NarrowBindingSubject {
+		preview.Reason = "patch previews support only NarrowBindingSubject"
+		return writeCandidate{preview: preview, change: change}
+	}
+
+	source, reason := resolveSourceReference(root, change.SourceReference)
+	if reason != "" {
+		preview.Reason = reason
+		return writeCandidate{preview: preview, change: change}
+	}
+	preview.File = source.relPath
+
+	state, reason := loadSourceState(sourceCache, source)
+	if reason != "" {
+		preview.Reason = reason
+		return writeCandidate{preview: preview, source: source, change: change}
+	}
+	if source.document < 1 || source.document > len(state.documents) {
+		preview.Reason = "source reference document is outside the file"
+		return writeCandidate{preview: preview, source: source, change: change, state: state}
+	}
+	if sourceFileContainsSecretPayload(state.documents) {
+		preview.Reason = "source file contains a Secret payload, so patch preview is disabled for this file"
+		return writeCandidate{preview: preview, source: source, change: change, state: state}
+	}
+	if len(state.ranges) != len(state.documents) {
+		preview.Reason = "source YAML document structure is unsupported"
+		return writeCandidate{preview: preview, source: source, change: change, state: state}
+	}
+
+	patchedDocument, reason := patchBindingDocument(state.documents[source.document-1], change)
+	if reason != "" {
+		preview.Reason = reason
+		return writeCandidate{preview: preview, source: source, change: change, state: state}
+	}
+	encoded, err := encodeDocument(patchedDocument)
+	if err != nil {
+		preview.Reason = "patched YAML cannot be encoded"
+		return writeCandidate{preview: preview, source: source, change: change, state: state}
+	}
+
+	patched := replaceDocument(state.original, state.ranges[source.document-1], encoded)
+	if _, reason := parseDocuments(patched); reason != "" {
+		preview.Reason = "patched YAML cannot be parsed"
+		return writeCandidate{preview: preview, source: source, change: change, state: state}
+	}
+	diff := unifiedDiff(source.relPath, state.original, patched)
+	if diff == "" {
+		preview.Reason = "patch preview produced no changes"
+		return writeCandidate{preview: preview, source: source, change: change, state: state}
+	}
+
+	preview.Status = StatusGenerated
+	preview.Reason = ""
+	preview.Diff = diff
+	return writeCandidate{preview: preview, source: source, change: change, state: state}
+}
+
+func loadSourceState(sourceCache map[string]*sourceState, source resolvedSource) (*sourceState, string) {
+	if state, ok := sourceCache[source.fullPath]; ok {
+		return state, ""
+	}
+	original, err := os.ReadFile(source.fullPath)
+	if err != nil {
+		return nil, "source file cannot be read"
+	}
+	normalizedOriginal := normalizeLineEndings(string(original))
+	documents, reason := parseDocuments(normalizedOriginal)
+	if reason != "" {
+		return nil, reason
+	}
+	ranges := splitDocumentRanges(normalizedOriginal)
+	state := &sourceState{
+		source:    source,
+		original:  normalizedOriginal,
+		documents: documents,
+		ranges:    ranges,
+	}
+	sourceCache[source.fullPath] = state
+	return state, ""
+}
+
+func prepareSourceOutput(outputRoot, displayRoot string, candidates []writeCandidate) (preparedOutput, bool, string, error) {
+	if len(candidates) == 0 {
+		return preparedOutput{}, false, "no generated patch previews for source file", nil
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i].preview, candidates[j].preview
+		if a.PlanID != b.PlanID {
+			return a.PlanID < b.PlanID
+		}
+		if a.OptionIndex != b.OptionIndex {
+			return a.OptionIndex < b.OptionIndex
+		}
+		if a.ChangeIndex != b.ChangeIndex {
+			return a.ChangeIndex < b.ChangeIndex
+		}
+		return a.File < b.File
+	})
+
+	state := candidates[0].state
+	if state == nil {
+		return preparedOutput{}, false, "source file could not be prepared for writing", nil
+	}
+	working := make([]*yaml.Node, len(state.documents))
+	for i, document := range state.documents {
+		working[i] = cloneNode(document)
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	changed := make(map[int]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		identity := writeChangeIdentity(candidate)
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+
+		documentIndex := candidate.source.document - 1
+		if documentIndex < 0 || documentIndex >= len(working) {
+			return preparedOutput{}, false, "source reference document is outside the file", nil
+		}
+		patchedDocument, reason := patchBindingDocument(working[documentIndex], candidate.change)
+		if reason != "" {
+			return preparedOutput{}, false, "multiple generated patches for this source file conflict", nil
+		}
+		working[documentIndex] = patchedDocument
+		changed[documentIndex] = struct{}{}
+	}
+	if len(changed) == 0 {
+		return preparedOutput{}, false, "patch output produced no changes", nil
+	}
+
+	indexes := make([]int, 0, len(changed))
+	for index := range changed {
+		indexes = append(indexes, index)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(indexes)))
+
+	patched := state.original
+	for _, index := range indexes {
+		encoded, err := encodeDocument(working[index])
+		if err != nil {
+			return preparedOutput{}, false, "patched YAML cannot be encoded", nil
+		}
+		patched = replaceDocument(patched, state.ranges[index], encoded)
+	}
+	if _, reason := parseDocuments(patched); reason != "" {
+		return preparedOutput{}, false, reason, nil
+	}
+
+	sourceRel := candidates[0].source.relPath
+	fullPath := filepath.Join(outputRoot, filepath.FromSlash(sourceRel))
+	if !pathWithinRoot(outputRoot, fullPath) {
+		return preparedOutput{}, false, "", fmt.Errorf("patch output path escapes output directory")
+	}
+	return preparedOutput{
+		sourceRel: sourceRel,
+		display:   filepath.ToSlash(filepath.Join(displayRoot, filepath.FromSlash(sourceRel))),
+		fullPath:  fullPath,
+		content:   []byte(ensureTrailingNewline(patched)),
+	}, true, "", nil
+}
+
+func writeChangeIdentity(candidate writeCandidate) string {
+	target := candidate.change.Target
+	return strings.Join([]string{
+		candidate.source.relPath,
+		strconv.Itoa(candidate.source.document),
+		target.Kind,
+		target.Namespace,
+		target.Name,
+		candidate.change.Subject,
+	}, "\x00")
+}
+
+func sortPreviews(previews []Preview) {
+	sort.SliceStable(previews, func(i, j int) bool {
+		if previews[i].PlanID != previews[j].PlanID {
+			return previews[i].PlanID < previews[j].PlanID
+		}
+		if previews[i].OptionIndex != previews[j].OptionIndex {
+			return previews[i].OptionIndex < previews[j].OptionIndex
+		}
+		if previews[i].ChangeIndex != previews[j].ChangeIndex {
+			return previews[i].ChangeIndex < previews[j].ChangeIndex
+		}
+		return previews[i].File < previews[j].File
+	})
+}
+
 func resolveSourceReference(root, value string) (resolvedSource, string) {
 	ref, reason := parseSourceReference(value)
 	if reason != "" {
 		return resolvedSource{}, reason
 	}
-	if filepath.IsAbs(ref.filename) {
-		return resolvedSource{}, "source reference path must be relative"
-	}
 
-	cleanRoot := filepath.Clean(root)
-	cleanFilename := filepath.Clean(ref.filename)
-	if cleanFilename == "." || strings.HasPrefix(cleanFilename, ".."+string(filepath.Separator)) || cleanFilename == ".." {
-		return resolvedSource{}, "source reference path escapes the scan root"
-	}
-
-	fullPath := filepath.Join(root, cleanFilename)
-	relPath := cleanFilename
-	if rel, ok := relativeToRoot(cleanRoot, cleanFilename); ok {
-		fullPath = cleanFilename
-		relPath = rel
-	}
-
-	absRoot, err := filepath.Abs(root)
+	realRoot, err := evaluateExistingPath(root)
 	if err != nil {
 		return resolvedSource{}, "scan root cannot be resolved"
 	}
-	absFull, err := filepath.Abs(fullPath)
+	candidate, reason := sourceCandidatePath(root, ref.filename)
+	if reason != "" {
+		return resolvedSource{}, reason
+	}
+	realFull, err := evaluatePathForCreation(candidate)
 	if err != nil {
 		return resolvedSource{}, "source reference path cannot be resolved"
 	}
-	rel, err := filepath.Rel(absRoot, absFull)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if realFull == realRoot || !isPathInside(realFull, realRoot) {
+		return resolvedSource{}, "source reference path escapes the scan root"
+	}
+	relPath, err := filepath.Rel(realRoot, realFull)
+	if err != nil || relPath == "." || relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
 		return resolvedSource{}, "source reference path escapes the scan root"
 	}
 	relPath = filepath.ToSlash(filepath.Clean(relPath))
-	if relPath == "." || strings.HasPrefix(relPath, "../") || relPath == ".." {
-		return resolvedSource{}, "source reference path escapes the scan root"
+
+	return resolvedSource{fullPath: candidate, relPath: relPath, document: ref.document}, ""
+}
+
+func validateOutputRoot(root, outputRoot string) (string, string, error) {
+	if outputRoot == "" {
+		return "", "", fmt.Errorf("patch output directory is required")
+	}
+	cleanOutput := filepath.Clean(outputRoot)
+	realRoot, err := evaluateExistingPath(root)
+	if err != nil {
+		return "", "", fmt.Errorf("scan root cannot be resolved")
+	}
+	realOutput, err := evaluatePathForCreation(cleanOutput)
+	if err != nil {
+		return "", "", fmt.Errorf("patch output directory cannot be resolved")
+	}
+	if realRoot == realOutput {
+		return "", "", fmt.Errorf("patch output directory must differ from scan directory")
+	}
+	if isPathInside(realOutput, realRoot) {
+		return "", "", fmt.Errorf("patch output directory must not be inside scan directory")
+	}
+	if isPathInside(realRoot, realOutput) {
+		return "", "", fmt.Errorf("scan directory must not be inside patch output directory")
+	}
+	info, err := os.Stat(cleanOutput)
+	if err == nil {
+		if !info.IsDir() {
+			return "", "", fmt.Errorf("patch output path exists and is not a directory")
+		}
+		entries, err := os.ReadDir(cleanOutput)
+		if err != nil {
+			return "", "", fmt.Errorf("patch output directory cannot be inspected")
+		}
+		if len(entries) > 0 {
+			return "", "", fmt.Errorf("patch output directory must be empty")
+		}
+	} else if !os.IsNotExist(err) {
+		return "", "", fmt.Errorf("patch output path cannot be inspected")
+	}
+	displayRoot := filepath.Base(cleanOutput)
+	if displayRoot == "" || displayRoot == "." || displayRoot == string(filepath.Separator) {
+		displayRoot = "output"
+	}
+	return cleanOutput, displayRoot, nil
+}
+
+func sourceCandidatePath(root, filename string) (string, string) {
+	cleanFilename := filepath.Clean(filename)
+	if filepath.IsAbs(cleanFilename) {
+		return cleanFilename, ""
+	}
+	if cleanFilename == "." || strings.HasPrefix(cleanFilename, ".."+string(filepath.Separator)) || cleanFilename == ".." {
+		return "", "source reference path escapes the scan root"
+	}
+	cleanRoot := filepath.Clean(root)
+	if rel, ok := relativeToRoot(cleanRoot, cleanFilename); ok {
+		return filepath.Clean(filepath.Join(cleanRoot, rel)), ""
+	}
+	return filepath.Join(root, cleanFilename), ""
+}
+
+func evaluateExistingPath(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func evaluatePathForCreation(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absPath = filepath.Clean(absPath)
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+		return filepath.Clean(resolved), nil
 	}
 
-	return resolvedSource{fullPath: fullPath, relPath: relPath, document: ref.document}, ""
+	current := absPath
+	missing := []string{}
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			parts := append([]string{resolved}, missing...)
+			return filepath.Clean(filepath.Join(parts...)), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", os.ErrNotExist
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
+}
+
+func isPathInside(child, parent string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func pathWithinRoot(root, path string) bool {
+	realRoot, err := evaluatePathForCreation(root)
+	if err != nil {
+		return false
+	}
+	realPath, err := evaluatePathForCreation(path)
+	if err != nil {
+		return false
+	}
+	return realPath == realRoot || isPathInside(realPath, realRoot)
+}
+
+func writePreparedOutputs(outputRoot string, outputs []preparedOutput) error {
+	sort.SliceStable(outputs, func(i, j int) bool {
+		return outputs[i].sourceRel < outputs[j].sourceRel
+	})
+	var createdFiles []string
+	var createdDirs []string
+	for _, output := range outputs {
+		if err := mkdirAllTracked(filepath.Dir(output.fullPath), outputRoot, &createdDirs); err != nil {
+			cleanupCreated(createdFiles, createdDirs)
+			return fmt.Errorf("write patch output: %w", err)
+		}
+		file, err := openOutputFile(output.fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			cleanupCreated(createdFiles, createdDirs)
+			return fmt.Errorf("write patch output file: %w", err)
+		}
+		createdFiles = append(createdFiles, output.fullPath)
+		if _, err := file.Write(output.content); err != nil {
+			_ = file.Close()
+			cleanupCreated(createdFiles, createdDirs)
+			return fmt.Errorf("write patch output file: %w", err)
+		}
+		if err := file.Close(); err != nil {
+			cleanupCreated(createdFiles, createdDirs)
+			return fmt.Errorf("write patch output file: %w", err)
+		}
+	}
+	return nil
+}
+
+func mkdirAllTracked(dir, root string, created *[]string) error {
+	cleanRoot := filepath.Clean(root)
+	cleanDir := filepath.Clean(dir)
+	if !pathWithinRoot(cleanRoot, cleanDir) {
+		return fmt.Errorf("patch output path escapes output directory")
+	}
+	stack := []string{}
+	for current := cleanDir; ; current = filepath.Dir(current) {
+		stack = append(stack, current)
+		if current == cleanRoot {
+			break
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			return fmt.Errorf("patch output path escapes output directory")
+		}
+	}
+	for i := len(stack) - 1; i >= 0; i-- {
+		path := stack[i]
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("patch output parent exists and is not a directory")
+			}
+			continue
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("patch output directory cannot be inspected")
+		}
+		if err := os.Mkdir(path, 0o755); err != nil {
+			return err
+		}
+		*created = append(*created, path)
+	}
+	return nil
+}
+
+func cleanupCreated(files, dirs []string) {
+	for i := len(files) - 1; i >= 0; i-- {
+		_ = os.Remove(files[i])
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Remove(dirs[i])
+	}
 }
 
 func parseSourceReference(value string) (sourceRef, string) {
