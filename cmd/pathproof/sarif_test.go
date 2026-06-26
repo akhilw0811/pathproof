@@ -111,8 +111,8 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	}
 	run := report.Runs[0]
 	assertString(t, "driver name", run.Tool.Driver.Name, "PathProof")
-	if len(run.Tool.Driver.Rules) != 5 {
-		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 6 {
+		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-K8S-001")
 	assertString(t, "rule id", rule.ID, "PP-K8S-001")
@@ -181,8 +181,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 5 {
-		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 6 {
+		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-001")
 	assertString(t, "rule id", rule.ID, "PP-GHA-001")
@@ -246,8 +246,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 5 {
-		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 6 {
+		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-002")
 	assertString(t, "rule id", rule.ID, "PP-GHA-002")
@@ -305,8 +305,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 5 {
-		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 6 {
+		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-003")
 	assertString(t, "rule id", rule.ID, "PP-GHA-003")
@@ -365,8 +365,8 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 5 {
-		t.Fatalf("rules len = %d, want 5", len(run.Tool.Driver.Rules))
+	if len(run.Tool.Driver.Rules) != 6 {
+		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
 	}
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-XDOMAIN-001")
 	assertString(t, "rule id", rule.ID, "PP-XDOMAIN-001")
@@ -401,6 +401,67 @@ jobs:
 		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
 	}
 	for _, forbidden := range []string{"FAKE_CLI_XDOMAIN_GHA_ENV_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN_GHA_RUN_SECRET_DO_NOT_RETAIN", "assume_role_policy", "Principal", "Condition", "arn:aws:iam"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanAWSIAMRoleAdminSARIFOutputShapeAndFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeTerraformForTest(t, dir, "infra/admin policy.tf", `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "admin" {
+  role = aws_iam_role.deploy.id
+  policy = <<EOF
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Action": "*:*",
+    "Resource": "*"
+  }
+}
+EOF
+}
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	run := report.Runs[0]
+	if len(run.Tool.Driver.Rules) != 6 {
+		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
+	}
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-AWS-001")
+	assertString(t, "rule id", rule.ID, "PP-AWS-001")
+	assertString(t, "rule name", rule.Name, "AWS IAM role grants administrative permissions")
+	assertContains(t, rule.FullDescription.Text, "local Terraform")
+	assertString(t, "rule default level", rule.DefaultConfiguration.Level, "error")
+	assertContains(t, rule.Help.Text, "does not call AWS APIs")
+
+	if len(run.Results) != 1 {
+		t.Fatalf("results len = %d, want 1: %#v", len(run.Results), run.Results)
+	}
+	result := run.Results[0]
+	assertString(t, "ruleId", result.RuleID, "PP-AWS-001")
+	assertString(t, "level", result.Level, "error")
+	assertContains(t, result.Message.Text, "action_service_star_resource_star")
+	if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+		t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+	}
+	assertString(t, "severity", result.Properties.Severity, "High")
+	if len(result.Properties.NodeIDs) != 2 || len(result.Properties.EdgeIDs) != 1 {
+		t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want AWS permission path", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+	}
+	gotURIs := locationURIs(result.Locations)
+	wantURIs := []string{"infra/admin%20policy.tf#resource=aws_iam_role_policy.admin"}
+	if !reflectDeepEqualStrings(gotURIs, wantURIs) {
+		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
+	}
+	for _, forbidden := range []string{"Statement", "policy =", "assume_role_policy"} {
 		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
 			t.Fatalf("SARIF output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
 		}
@@ -529,6 +590,7 @@ func TestSARIFSourceReferencesUseOnlyCleanStructuredFields(t *testing.T) {
 	}
 	writeFileForTest(t, root, "resources file.yaml", "kind: ConfigMap\n")
 	writeFileForTest(t, root, "plain.yaml", "kind: ConfigMap\n")
+	writeFileForTest(t, root, "iam policy.tf", `resource "aws_iam_role_policy" "admin" {}`)
 	outside := filepath.Join(parent, "outside.yaml")
 	if err := os.WriteFile(outside, []byte("kind: ConfigMap\n"), 0o600); err != nil {
 		t.Fatalf("write outside: %v", err)
@@ -543,6 +605,11 @@ func TestSARIFSourceReferencesUseOnlyCleanStructuredFields(t *testing.T) {
 					filepath.Join(root, "plain.yaml") + "#document=1x",
 					filepath.Join(root, "plain.yaml") + "#document=0",
 					filepath.Join(root, "plain.yaml") + "#document=999999999999999999999999999999",
+					filepath.Join(root, "iam policy.tf") + "#resource=aws_iam_role_policy.admin",
+					filepath.Join(root, "iam policy.tf") + "#resource=aws_iam_role_policy_attachment.admin_attach",
+					filepath.Join(root, "iam policy.tf") + "#resource=aws_iam_role.deploy",
+					filepath.Join(root, "iam policy.tf") + "#resource=aws_iam_role_policy.admin.extra",
+					filepath.Join(root, "iam policy.tf") + "#resource=aws_iam_role_policy.",
 					outside + "#document=1",
 					"source " + filepath.Join(root, "plain.yaml") + "#document=1",
 					"plain.yaml#document=3",
@@ -567,16 +634,16 @@ func TestSARIFSourceReferencesUseOnlyCleanStructuredFields(t *testing.T) {
 	}
 	result := parsed.Runs[0].Results[0]
 	gotURIs := locationURIs(result.Locations)
-	wantURIs := []string{"resources%20file.yaml#document=1", "plain.yaml#document=2", "plain.yaml#document=3"}
+	wantURIs := []string{"resources%20file.yaml#document=1", "plain.yaml#document=2", "iam%20policy.tf#resource=aws_iam_role_policy.admin", "iam%20policy.tf#resource=aws_iam_role_policy_attachment.admin_attach", "plain.yaml#document=3"}
 	if !reflectDeepEqualStrings(gotURIs, wantURIs) {
 		t.Fatalf("SARIF location URIs = %#v, want %#v", gotURIs, wantURIs)
 	}
-	wantDisplay := []string{"resources file.yaml#document=1", "plain.yaml#document=2", "plain.yaml#document=3"}
+	wantDisplay := []string{"resources file.yaml#document=1", "plain.yaml#document=2", "iam policy.tf#resource=aws_iam_role_policy.admin", "iam policy.tf#resource=aws_iam_role_policy_attachment.admin_attach", "plain.yaml#document=3"}
 	if !reflectDeepEqualStrings(result.Properties.SourceReferences, wantDisplay) {
 		t.Fatalf("source_references = %#v, want %#v", result.Properties.SourceReferences, wantDisplay)
 	}
 	output := string(data)
-	for _, forbidden := range []string{root, parent, "document=1x", "document=0", "999999999999999999999999999999", "outside.yaml", "deployment plain.yaml"} {
+	for _, forbidden := range []string{root, parent, "document=1x", "document=0", "999999999999999999999999999999", "outside.yaml", "deployment plain.yaml", "aws_iam_role.deploy", "admin.extra"} {
 		if strings.Contains(output, forbidden) {
 			t.Fatalf("SARIF contains unsafe source text %q: %s", forbidden, output)
 		}

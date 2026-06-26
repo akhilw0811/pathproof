@@ -34,6 +34,9 @@ stable deterministic hashes of typed identities.
 - `AWSIAMRole`: a local Terraform `aws_iam_role` resource with static
   GitHub Actions OIDC trust metadata. Node names use
   `aws://terraform/aws_iam_role/<relative-tf-path>/<resource_name>`.
+- `AWSPermission`: a supported local Terraform AWS IAM role permission fact.
+  Node names use `aws://terraform/aws_permission/<sha256>`, where the hash is
+  over canonical sanitized permission identity.
 
 ## Edge Kinds
 
@@ -42,7 +45,7 @@ stable deterministic hashes of typed identities.
 - `BoundTo`: a ServiceAccount is bound to a Role or ClusterRole by a supported
   RoleBinding or ClusterRoleBinding.
 - `GrantsPermission`: an observed Role or ClusterRole rule grants a canonical
-  Permission.
+  Kubernetes Permission, or an AWSIAMRole grants a supported AWSPermission.
 - `CanRead`: a ServiceAccount can read a parsed Secret under PathProof's static
   RBAC authorization model.
 - `DefinesJob`: a GitHub Actions workflow defines a job.
@@ -326,11 +329,39 @@ permission values.
 
 This metadata is produced only from local static Terraform `aws_iam_role`
 resources whose `assume_role_policy` is a literal heredoc JSON string or
-simple quoted JSON string. It stores only sanitized trust facts: provider,
-resource name, source reference, trusted issuer, supported subject patterns,
-audiences, and statement indexes. It does not include raw Terraform, raw trust
-policy JSON, provider credentials, variables, environment values, access keys,
-secret-like values, ARNs, or unsupported condition values.
+simple quoted JSON string, or whose supported static permissions are attached
+locally. It stores only sanitized trust facts: provider, resource name, source
+reference, trusted issuer, supported subject patterns, audiences, and
+statement indexes. It does not include raw Terraform, raw trust policy JSON,
+provider credentials, variables, environment values, access keys, secret-like
+values, ARNs, or unsupported condition values.
+
+`AWSPermission` nodes include optional typed AWS permission metadata:
+
+```json
+{
+  "metadata": {
+    "aws_permission": {
+      "provider": "aws",
+      "source_reference": "main.tf#resource=aws_iam_role_policy.admin",
+      "policy_resource_name": "admin",
+      "attached_role_resource_name": "deploy",
+      "actions": ["*"],
+      "resources": ["*"],
+      "administrative": true,
+      "admin_reason": "action_star_resource_star"
+    }
+  }
+}
+```
+
+For AdministratorAccess attachments, `attachment_resource_name` and
+`managed_policy_arn` identify the supported attachment. AWS permission
+metadata is produced only for supported static local Terraform role policies
+or the literal AWS managed AdministratorAccess attachment. It does not include
+raw policy JSON, raw Terraform, unsupported actions or resources, conditions,
+`NotAction`, unknown managed policies, variables, provider credentials, access
+keys, or secret-like values.
 
 `CanAssumeRole` edges include optional typed match metadata:
 
@@ -419,6 +450,13 @@ Implemented rules are:
   workflow-level grants use `Workflow`; job-level grants use
   `Workflow --DefinesJob--> WorkflowJob`
 
+- Rule ID: `PP-AWS-001`
+- Title:
+  `AWS IAM role grants administrative permissions`
+- Severity: fixed `High`
+- Required path:
+  `AWSIAMRole --GrantsPermission--> AWSPermission`
+
 - Rule ID: `PP-XDOMAIN-001`
 - Title:
   `Risky GitHub Actions workflow can assume AWS IAM role`
@@ -469,6 +507,18 @@ permission inheritance/override modeling is future work.
 represented only as graph structure until PathProof has modeled cloud trust
 policies or another deterministic unsafe condition.
 
+`PP-AWS-001` is emitted only when an `AWSIAMRole --GrantsPermission-->
+AWSPermission` path exists and the AWSPermission metadata has one of the exact
+supported admin reason identities: `action_star_resource_star`,
+`action_service_star_resource_star`, or
+`administrator_access_managed_policy`. These correspond to static inline
+`Allow` statements with `Action "*" Resource "*"`, static inline `Allow`
+statements with `Action "*:*" Resource "*"`, and the literal
+`arn:aws:iam::aws:policy/AdministratorAccess` attachment. Deny statements,
+`NotAction`, conditions, dynamic policies, unknown managed policies, specific
+actions, and wildcard actions on non-wildcard resources do not create this
+finding.
+
 `PP-XDOMAIN-001` is emitted only when all of the following are true: the
 workflow-level or job-level OIDC path exists in the graph, the OIDC capability
 has a `CanAssumeRole` edge to an `AWSIAMRole`, and the workflow/job has a
@@ -498,6 +548,10 @@ and ordered selector field/expression identities.
 `PP-GHA-003` IDs are SHA-256 hashes of a canonical JSON identity containing
 `rule_id`, workflow file, scope, job ID when scope is `job`, permission name,
 and access value.
+`PP-AWS-001` IDs are SHA-256 hashes of canonical JSON containing `rule_id`,
+the AWS role node ID, the AWS permission node ID, and the precise admin reason
+identity. Evidence, source-reference display paths, summaries, and prose are
+not part of identity.
 `PP-XDOMAIN-001` IDs are SHA-256 hashes of canonical JSON containing `rule_id`,
 ordered path node IDs, ordered path edge IDs, risk signal kind (`PP-GHA-002` or
 `PP-GHA-003`), risk signal identity, and AWS role node ID. Unsafe checkout risk
@@ -567,20 +621,24 @@ shape:
 SARIF scan output is also a private CLI projection, not a graph schema. It is
 selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
 with one PathProof run, deterministic rule entries for `PP-K8S-001`,
-`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`, and one result
-per finding.
+`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and
+`PP-XDOMAIN-001`, and one result per finding.
 Result properties include finding ID, severity, ordered node IDs, ordered edge
 IDs, and clean display source references when available.
 
 SARIF locations are derived only from structured source-reference fields whose
-entire value is a clean `filename#document=N` reference. PathProof does not
-parse arbitrary prose, evidence details, summaries, or remediation text to find
-embedded source references. Malformed references and references outside the
-scan root are omitted. SARIF artifact URIs are relative to the scan root and
-URI-encoded, while `properties.source_references` keeps display-safe relative
-strings such as `resources file.yaml#document=1`. Line numbers and regions are
-not emitted because the parser currently tracks file/document source location,
-not line ranges.
+entire value is a clean `filename#document=N` reference or an exact supported
+Terraform resource reference:
+`file.tf#resource=aws_iam_role_policy.<name>` or
+`file.tf#resource=aws_iam_role_policy_attachment.<name>`. PathProof does not
+parse arbitrary prose, evidence details, summaries, or remediation text to
+find embedded source references. Malformed references and references outside
+the scan root are omitted. SARIF artifact URIs are relative to the scan root
+and URI-encoded, while `properties.source_references` keeps display-safe
+relative strings such as `resources file.yaml#document=1` or
+`infra/iam.tf#resource=aws_iam_role_policy.admin`. Line numbers and regions
+are not emitted because the parser currently tracks file/document or resource
+source location, not line ranges.
 
 SARIF remains findings-only even when patch flags are supplied. Patch previews,
 patch output summaries, validation results, unified diffs, patched file
@@ -763,14 +821,15 @@ workflow execution, GitHub API state, expression evaluation, workflow
 permissions, reusable workflow resolution, action source inspection,
 CI/CD-to-cloud findings beyond `PP-XDOMAIN-001`, in-place patch application,
 live validation, or attack-path rules beyond `PP-K8S-001`, `PP-GHA-001`,
-`PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`. Terraform support is limited
-to static `aws_iam_role` GitHub Actions OIDC trust metadata and optional
-`CanAssumeRole` edges when `--repo OWNER/REPO` is supplied; PathProof does not
-execute Terraform, evaluate modules or variables, call AWS or GitHub, validate
-cloud state, or simulate IAM. The
+`PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and `PP-XDOMAIN-001`. Terraform
+support is limited to static `aws_iam_role` GitHub Actions OIDC trust
+metadata, optional `CanAssumeRole` edges when `--repo OWNER/REPO` is supplied,
+and narrow static AWS IAM role permission facts for `PP-AWS-001`; PathProof
+does not execute Terraform, evaluate modules or variables, call AWS or GitHub,
+validate cloud state, or simulate IAM. The
 scan CLI currently supports local Kubernetes YAML directories and local
 GitHub Actions workflow files under `.github/workflows` plus local `.tf`
 files for that narrow Terraform slice. Patch previews and patch output are
 limited to Kubernetes `NarrowBindingSubject` and do not cover `PP-GHA-001`,
-`PP-GHA-002`, `PP-GHA-003`, Terraform, RBAC rule edits, Secret-bearing source
-files, or broader YAML patch types.
+`PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, Terraform, RBAC
+rule edits, Secret-bearing source files, or broader YAML patch types.

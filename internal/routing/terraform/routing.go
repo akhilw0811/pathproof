@@ -1,6 +1,9 @@
 package terraform
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -21,12 +24,16 @@ func AddRoutes(g *graph.Graph, resources parserterraform.Resources, workflows pa
 		roleNode := graph.NewNode(graph.AWSIAMRole, roleNodeName(role))
 		roleNode.Evidence = []graph.SourceEvidence{{
 			Source: sourceRef(role.Source),
-			Detail: "terraform aws_iam_role " + role.ResourceName + " with static trust policy metadata",
+			Detail: "terraform aws_iam_role " + role.ResourceName + " with static Terraform metadata",
 		}}
 		metadata := roleMetadata(role)
 		roleNode.Metadata = &graph.NodeMetadata{AWSIAMRole: &metadata}
-		if _, err := g.AddNode(roleNode); err != nil {
+		addedRole, err := g.AddNode(roleNode)
+		if err != nil {
 			return fmt.Errorf("add aws iam role %s: %w", role.ResourceName, err)
+		}
+		if err := addRolePermissions(g, addedRole, role); err != nil {
+			return err
 		}
 	}
 	if repo == "" {
@@ -69,6 +76,30 @@ func AddRoutes(g *graph.Graph, resources parserterraform.Resources, workflows pa
 			if _, err := g.AddEdge(edge); err != nil {
 				return fmt.Errorf("add can assume role edge %s: %w", role.ResourceName, err)
 			}
+		}
+	}
+	return nil
+}
+
+func addRolePermissions(g *graph.Graph, roleNode graph.Node, role parserterraform.IAMRole) error {
+	for _, permission := range role.Permissions {
+		permissionNode := graph.NewNode(graph.AWSPermission, permissionNodeName(permission))
+		permissionNode.Evidence = []graph.SourceEvidence{{
+			Source: sourceRef(permission.Source),
+			Detail: permissionEvidenceDetail(permission),
+		}}
+		metadata := permissionMetadata(permission)
+		permissionNode.Metadata = &graph.NodeMetadata{AWSPermission: &metadata}
+		addedPermission, err := g.AddNode(permissionNode)
+		if err != nil {
+			return fmt.Errorf("add aws permission for role %s: %w", role.ResourceName, err)
+		}
+		edge := graph.NewEdge(graph.GrantsPermission, roleNode.ID, addedPermission.ID, graph.SourceEvidence{
+			Source: sourceRef(permission.Source),
+			Detail: permissionEvidenceDetail(permission),
+		})
+		if _, err := g.AddEdge(edge); err != nil {
+			return fmt.Errorf("add aws grants permission edge for role %s: %w", role.ResourceName, err)
 		}
 	}
 	return nil
@@ -234,6 +265,22 @@ func roleMetadata(role parserterraform.IAMRole) graph.AWSIAMRoleMetadata {
 	}
 }
 
+func permissionMetadata(permission parserterraform.IAMPermission) graph.AWSPermissionMetadata {
+	return graph.AWSPermissionMetadata{
+		Provider:                 providerAWS,
+		SourceReference:          sourceRef(permission.Source),
+		PolicyResourceName:       permission.PolicyResourceName,
+		AttachmentResourceName:   permission.AttachmentResourceName,
+		AttachedRoleResourceName: permission.AttachedRoleResourceName,
+		StatementIndex:           permission.StatementIndex,
+		Actions:                  append([]string(nil), permission.Actions...),
+		Resources:                append([]string(nil), permission.Resources...),
+		ManagedPolicyARN:         permission.ManagedPolicyARN,
+		Administrative:           permission.Administrative,
+		AdminReason:              permission.AdminReason,
+	}
+}
+
 func trustStatements(trusts []parserterraform.OIDCTrust) []graph.AWSOIDCTrustStatement {
 	if len(trusts) == 0 {
 		return nil
@@ -291,6 +338,63 @@ func roleNodeName(role parserterraform.IAMRole) string {
 	return "aws://terraform/aws_iam_role/" + role.Source.RelativePath + "/" + role.ResourceName
 }
 
+func permissionNodeName(permission parserterraform.IAMPermission) string {
+	return "aws://terraform/aws_permission/" + permissionIdentityHash(permission)
+}
+
+func permissionIdentityHash(permission parserterraform.IAMPermission) string {
+	data, err := json.Marshal(struct {
+		Provider                 string   `json:"provider"`
+		Kind                     string   `json:"kind"`
+		SourceReference          string   `json:"source_reference"`
+		PolicyResourceName       string   `json:"policy_resource_name,omitempty"`
+		AttachmentResourceName   string   `json:"attachment_resource_name,omitempty"`
+		AttachedRoleResourceName string   `json:"attached_role_resource_name"`
+		StatementIndex           int      `json:"statement_index,omitempty"`
+		Actions                  []string `json:"actions,omitempty"`
+		Resources                []string `json:"resources,omitempty"`
+		ManagedPolicyARN         string   `json:"managed_policy_arn,omitempty"`
+		Administrative           bool     `json:"administrative"`
+		AdminReason              string   `json:"admin_reason,omitempty"`
+	}{
+		Provider:                 providerAWS,
+		Kind:                     permission.Kind,
+		SourceReference:          stableSourceRef(permission.Source),
+		PolicyResourceName:       permission.PolicyResourceName,
+		AttachmentResourceName:   permission.AttachmentResourceName,
+		AttachedRoleResourceName: permission.AttachedRoleResourceName,
+		StatementIndex:           permission.StatementIndex,
+		Actions:                  append([]string(nil), permission.Actions...),
+		Resources:                append([]string(nil), permission.Resources...),
+		ManagedPolicyARN:         permission.ManagedPolicyARN,
+		Administrative:           permission.Administrative,
+		AdminReason:              permission.AdminReason,
+	})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func permissionEvidenceDetail(permission parserterraform.IAMPermission) string {
+	target := permission.PolicyResourceName
+	if target == "" {
+		target = permission.AttachmentResourceName
+	}
+	if permission.Administrative {
+		if permission.ManagedPolicyARN != "" {
+			return fmt.Sprintf("aws iam role %s grants administrative permission via %s %s (%s managed_policy_arn=%s)", permission.AttachedRoleResourceName, permission.Kind, target, permission.AdminReason, permission.ManagedPolicyARN)
+		}
+		return fmt.Sprintf("aws iam role %s grants administrative permission via %s %s (%s action=%s resource=%s)", permission.AttachedRoleResourceName, permission.Kind, target, permission.AdminReason, strings.Join(permission.Actions, ","), strings.Join(permission.Resources, ","))
+	}
+	return fmt.Sprintf("aws iam role %s grants static permission via %s %s", permission.AttachedRoleResourceName, permission.Kind, target)
+}
+
 func sourceRef(source parserterraform.Source) string {
 	return fmt.Sprintf("%s#resource=%s.%s", source.Filename, source.ResourceType, source.ResourceName)
+}
+
+func stableSourceRef(source parserterraform.Source) string {
+	return fmt.Sprintf("%s#resource=%s.%s", source.RelativePath, source.ResourceType, source.ResourceName)
 }

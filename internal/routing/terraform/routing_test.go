@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"pathproof/internal/analysis"
 	"pathproof/internal/graph"
 	parsergithubactions "pathproof/internal/parser/githubactions"
 	parserterraform "pathproof/internal/parser/terraform"
@@ -83,6 +84,184 @@ func TestAddRoutesCreatesCanAssumeRoleForMatchingPullRequestSubject(t *testing.T
 	}
 	if metadata.SubjectCandidate != "repo:owner/repo:pull_request" || metadata.SubjectPattern != "repo:owner/repo:pull_request" || metadata.SubjectOperator != "StringEquals" {
 		t.Fatalf("metadata = %#v, want matching pull_request subject", metadata)
+	}
+}
+
+func TestAddRoutesCreatesAWSPermissionNodeAndGrantsPermissionEdge(t *testing.T) {
+	resources := parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{{
+		Kind:                     "inline_policy",
+		Source:                   parserterraform.Source{Filename: "/repo/iam.tf", RelativePath: "iam.tf", ResourceType: "aws_iam_role_policy", ResourceName: "admin"},
+		PolicyResourceName:       "admin",
+		AttachedRoleResourceName: "deploy",
+		Actions:                  []string{"*"},
+		Resources:                []string{"*"},
+		Administrative:           true,
+		AdminReason:              "action_star_resource_star",
+	}})}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	permissions := nodesOfKind(g, graph.AWSPermission)
+	if len(permissions) != 1 {
+		t.Fatalf("AWSPermission nodes = %d, want 1: %#v", len(permissions), g.Nodes())
+	}
+	metadata := permissions[0].Metadata.AWSPermission
+	if metadata == nil {
+		t.Fatalf("permission metadata missing: %#v", permissions[0])
+	}
+	if metadata.Provider != "aws" || metadata.PolicyResourceName != "admin" || metadata.AttachedRoleResourceName != "deploy" {
+		t.Fatalf("permission metadata = %#v, want role admin metadata", metadata)
+	}
+	if !metadata.Administrative || metadata.AdminReason != "action_star_resource_star" {
+		t.Fatalf("permission metadata = %#v, want admin reason", metadata)
+	}
+	edges := edgesOfKind(g, graph.GrantsPermission)
+	if len(edges) != 1 {
+		t.Fatalf("GrantsPermission edges = %d, want 1: %#v", len(edges), g.Edges())
+	}
+	role := graph.NewNode(graph.AWSIAMRole, "aws://terraform/aws_iam_role/main.tf/deploy")
+	if edges[0].From != role.ID || edges[0].To != permissions[0].ID {
+		t.Fatalf("edge connects %s -> %s, want role -> permission", edges[0].From, edges[0].To)
+	}
+	if !strings.Contains(edges[0].Evidence.Detail, "action_star_resource_star") || strings.Contains(edges[0].Evidence.Detail, "Statement") {
+		t.Fatalf("edge evidence detail = %q, want sanitized admin reason", edges[0].Evidence.Detail)
+	}
+}
+
+func TestAddRoutesAdministratorAccessPermissionMetadataIsSanitized(t *testing.T) {
+	resources := parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{{
+		Kind:                     "managed_policy",
+		Source:                   parserterraform.Source{Filename: "/repo/iam.tf", RelativePath: "iam.tf", ResourceType: "aws_iam_role_policy_attachment", ResourceName: "admin"},
+		AttachmentResourceName:   "admin",
+		AttachedRoleResourceName: "deploy",
+		ManagedPolicyARN:         "arn:aws:iam::aws:policy/AdministratorAccess",
+		Administrative:           true,
+		AdminReason:              "administrator_access_managed_policy",
+	}})}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	data, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("marshal graph: %v", err)
+	}
+	output := string(data)
+	for _, want := range []string{"AWSPermission", "administrator_access_managed_policy", "arn:aws:iam::aws:policy/AdministratorAccess"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("graph JSON missing %q: %s", want, output)
+		}
+	}
+	for _, forbidden := range []string{"Statement", "Action", "Resource", "FAKE_TF_SECRET_DO_NOT_RETAIN", "assume_role_policy"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("graph JSON contains %q: %s", forbidden, output)
+		}
+	}
+}
+
+func TestAddRoutesAWSIAMPermissionGraphJSONIsDeterministic(t *testing.T) {
+	firstResources := parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{
+		testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+			{
+				Kind:                     "inline_policy",
+				Source:                   parserterraform.Source{Filename: "/repo/b.tf", RelativePath: "b.tf", ResourceType: "aws_iam_role_policy", ResourceName: "admin_b"},
+				PolicyResourceName:       "admin_b",
+				AttachedRoleResourceName: "deploy",
+				Actions:                  []string{"*:*"},
+				Resources:                []string{"*"},
+				Administrative:           true,
+				AdminReason:              "action_service_star_resource_star",
+			},
+			{
+				Kind:                     "inline_policy",
+				Source:                   parserterraform.Source{Filename: "/repo/a.tf", RelativePath: "a.tf", ResourceType: "aws_iam_role_policy", ResourceName: "admin_a"},
+				PolicyResourceName:       "admin_a",
+				AttachedRoleResourceName: "deploy",
+				Actions:                  []string{"*"},
+				Resources:                []string{"*"},
+				Administrative:           true,
+				AdminReason:              "action_star_resource_star",
+			},
+		}),
+	}}
+	secondResources := parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{
+		testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+			firstResources.IAMRoles[0].Permissions[1],
+			firstResources.IAMRoles[0].Permissions[0],
+		}),
+	}}
+	first := graph.New()
+	second := graph.New()
+
+	if err := AddRoutes(first, firstResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add first routes: %v", err)
+	}
+	if err := AddRoutes(second, secondResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add second routes: %v", err)
+	}
+	firstJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+	}
+	secondJSON, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second: %v", err)
+	}
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("graph JSON differs:\nfirst: %s\nsecond:%s", firstJSON, secondJSON)
+	}
+}
+
+func TestAddRoutesAWSIAMPermissionIDsDoNotDependOnAbsoluteSourceFilename(t *testing.T) {
+	firstResources := parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{{
+		Kind:                     "inline_policy",
+		Source:                   parserterraform.Source{Filename: "/tmp/checkout-a/infra/iam.tf", RelativePath: "infra/iam.tf", ResourceType: "aws_iam_role_policy", ResourceName: "admin"},
+		PolicyResourceName:       "admin",
+		AttachedRoleResourceName: "deploy",
+		Actions:                  []string{"*"},
+		Resources:                []string{"*"},
+		Administrative:           true,
+		AdminReason:              "action_star_resource_star",
+	}})}}
+	secondResources := parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{{
+		Kind:                     "inline_policy",
+		Source:                   parserterraform.Source{Filename: "/private/var/checkout-b/infra/iam.tf", RelativePath: "infra/iam.tf", ResourceType: "aws_iam_role_policy", ResourceName: "admin"},
+		PolicyResourceName:       "admin",
+		AttachedRoleResourceName: "deploy",
+		Actions:                  []string{"*"},
+		Resources:                []string{"*"},
+		Administrative:           true,
+		AdminReason:              "action_star_resource_star",
+	}})}}
+	first := graph.New()
+	second := graph.New()
+
+	if err := AddRoutes(first, firstResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add first routes: %v", err)
+	}
+	if err := AddRoutes(second, secondResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add second routes: %v", err)
+	}
+
+	firstPermission := onlyNodeOfKind(t, first, graph.AWSPermission)
+	secondPermission := onlyNodeOfKind(t, second, graph.AWSPermission)
+	if firstPermission.ID != secondPermission.ID {
+		t.Fatalf("AWSPermission IDs differ by absolute source path:\nfirst: %s\nsecond:%s", firstPermission.ID, secondPermission.ID)
+	}
+	firstEdge := onlyEdgeOfKind(t, first, graph.GrantsPermission)
+	secondEdge := onlyEdgeOfKind(t, second, graph.GrantsPermission)
+	if firstEdge.ID != secondEdge.ID {
+		t.Fatalf("GrantsPermission edge IDs differ by absolute source path:\nfirst: %s\nsecond:%s", firstEdge.ID, secondEdge.ID)
+	}
+	firstFinding := onlyFindingByRule(t, analysis.Analyze(first), analysis.RuleAWSIAMRoleAdministrativePermissions)
+	secondFinding := onlyFindingByRule(t, analysis.Analyze(second), analysis.RuleAWSIAMRoleAdministrativePermissions)
+	if firstFinding.ID != secondFinding.ID {
+		t.Fatalf("PP-AWS-001 finding IDs differ by absolute source path:\nfirst: %s\nsecond:%s", firstFinding.ID, secondFinding.ID)
 	}
 }
 
@@ -332,6 +511,31 @@ func testRole(name, subject string) parserterraform.IAMRole {
 	}
 }
 
+func testRoleWithPermissions(name string, permissions []parserterraform.IAMPermission) parserterraform.IAMRole {
+	role := testRole(name, "repo:owner/repo:pull_request")
+	role.Permissions = permissions
+	return role
+}
+
+func nodesOfKind(g *graph.Graph, kind graph.NodeKind) []graph.Node {
+	var nodes []graph.Node
+	for _, node := range g.Nodes() {
+		if node.Kind == kind {
+			nodes = append(nodes, node)
+		}
+	}
+	return nodes
+}
+
+func onlyNodeOfKind(t *testing.T, g *graph.Graph, kind graph.NodeKind) graph.Node {
+	t.Helper()
+	nodes := nodesOfKind(g, kind)
+	if len(nodes) != 1 {
+		t.Fatalf("%s node count = %d, want 1: %#v", kind, len(nodes), nodes)
+	}
+	return nodes[0]
+}
+
 func edgesOfKind(g *graph.Graph, kind graph.EdgeKind) []graph.Edge {
 	var edges []graph.Edge
 	for _, edge := range g.Edges() {
@@ -342,8 +546,31 @@ func edgesOfKind(g *graph.Graph, kind graph.EdgeKind) []graph.Edge {
 	return edges
 }
 
+func onlyEdgeOfKind(t *testing.T, g *graph.Graph, kind graph.EdgeKind) graph.Edge {
+	t.Helper()
+	edges := edgesOfKind(g, kind)
+	if len(edges) != 1 {
+		t.Fatalf("%s edge count = %d, want 1: %#v", kind, len(edges), edges)
+	}
+	return edges[0]
+}
+
 func countEdges(g *graph.Graph, kind graph.EdgeKind) int {
 	return len(edgesOfKind(g, kind))
+}
+
+func onlyFindingByRule(t *testing.T, findings []analysis.Finding, ruleID analysis.RuleID) analysis.Finding {
+	t.Helper()
+	var matches []analysis.Finding
+	for _, finding := range findings {
+		if finding.RuleID == ruleID {
+			matches = append(matches, finding)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("%s finding count = %d, want 1: %#v", ruleID, len(matches), findings)
+	}
+	return matches[0]
 }
 
 func writeTerraformForRoutingTest(t *testing.T, root, name, content string) {

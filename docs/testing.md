@@ -61,12 +61,19 @@ omits the cross-domain finding, that safe OIDC trust alone exits `0`, that
 human and JSON output include sanitized workflow/job, OIDC capability, AWS role,
 and risk-signal data, and that patch/write/validation flags do not attach
 remediation, patch previews, or validation results to `PP-XDOMAIN-001`.
+AWS IAM CLI coverage asserts that static Terraform inline admin role policies
+and literal AdministratorAccess role-policy attachments emit `PP-AWS-001` in
+human, JSON, and SARIF output, that non-admin policies exit `0`, that malformed
+inline policy JSON with trailing secret-like content returns a sanitized error,
+and that remediation, patch preview, patch output, and validation are not
+attached to `PP-AWS-001`.
 
 SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
 PathProof driver run, deterministic rule entries for `PP-K8S-001`,
-`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`, one result for
-vulnerable fixtures, zero results for safe fixtures, deterministic rule/result fields,
-byte-identical repeated scans, and unchanged exit codes. GitHub Actions SARIF
+`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and
+`PP-XDOMAIN-001`, one result for vulnerable fixtures, zero results for safe
+fixtures, deterministic rule/result fields, byte-identical repeated scans, and
+unchanged exit codes. GitHub Actions SARIF
 coverage asserts `PP-GHA-001` severity maps to `warning`, `PP-GHA-002` and
 `PP-GHA-003` severities map to `error`, workflow artifact URIs are relative
 and URI-safe, line numbers are not guessed, rule text avoids the old inaccurate
@@ -79,8 +86,10 @@ content and secret-like values.
 Source-location
 tests cover URI-encoded relative artifact URIs for paths with spaces,
 display-safe relative `properties.source_references`, omission of malformed
-document suffixes, omission of outside-root references, and refusal to parse
-source references embedded in arbitrary prose. SARIF patch flag tests verify
+document suffixes, strict Terraform `#resource=aws_iam_role_policy.<name>` and
+`#resource=aws_iam_role_policy_attachment.<name>` handling, omission of
+malformed Terraform resource suffixes, omission of outside-root references, and
+refusal to parse source references embedded in arbitrary prose. SARIF patch flag tests verify
 that write-patch and validation side effects still occur under the existing
 flag contract while SARIF stdout remains findings-only and omits patch
 previews, patch outputs, validation arrays, diffs, patched contents, temporary
@@ -127,9 +136,16 @@ sanitized filename errors, malformed extracted trust JSON with sanitized
 resource errors, trust detection for GitHub Actions OIDC federated principals,
 `sts:AssumeRoleWithWebIdentity`, `StringEquals` and `StringLike`
 `sub`/`aud` conditions, string and array condition values, missing
-issuer/action/sub/aud negatives, simple `*` wildcard pattern support, and
-regression checks that variables, provider credentials, raw trust JSON, and
-secret-like Terraform values are absent from parser output and errors.
+issuer/action/sub/aud negatives, simple `*` wildcard pattern support, static
+`aws_iam_role_policy` heredoc and quoted JSON permissions, AdministratorAccess
+role-policy attachments, conservative literal role-name matching against
+explicit static role names only, ambiguous literal role-name negatives,
+ignored unsupported managed policy ARNs, ignored dynamic policies, ignored
+`NotAction` and conditioned policies, deterministic permission ordering,
+malformed inline policy JSON with sanitized resource errors, and regression
+checks that variables, provider credentials, raw trust or permission JSON,
+unsupported managed policy ARNs, and secret-like Terraform values are absent
+from parser output and errors.
 
 Kubernetes routing tests cover deterministic graph construction, source
 evidence, duplicate conflict rejection before graph mutation, namespace-scoped
@@ -163,14 +179,17 @@ from static action metadata, expression handling, metadata cloning, and
 regression checks that ignored workflow values are absent from graph JSON.
 
 Terraform routing tests cover deterministic `AWSIAMRole` node construction,
-sanitized trust metadata, `CanAssumeRole` edge construction only when
-`--repo OWNER/REPO` supplies repository identity and a static subject candidate
-matches, no cross-domain edge without `--repo`, no edge without a static
-candidate, nonmatching repo/ref negatives, `StringEquals` exact matching,
-simple `StringLike` wildcard matching, metadata cloning, deterministic graph
-JSON, and regression checks that raw Terraform, raw trust policy JSON,
-provider credentials, ARNs, unsupported condition values, and secret-like
-values are absent from graph JSON.
+sanitized trust metadata, `AWSPermission` node construction,
+`AWSIAMRole --GrantsPermission--> AWSPermission` edges, sanitized AWS
+permission metadata, AdministratorAccess metadata, `CanAssumeRole` edge
+construction only when `--repo OWNER/REPO` supplies repository identity and a
+static subject candidate matches, no cross-domain edge without `--repo`, no
+edge without a static candidate, nonmatching repo/ref negatives,
+`StringEquals` exact matching, simple `StringLike` wildcard matching, metadata
+cloning, deterministic graph JSON, and regression checks that raw Terraform,
+raw trust or permission policy JSON, provider credentials, unsupported
+condition values, unsupported managed policy ARNs, and secret-like values are
+absent from graph JSON.
 
 Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
 edge semantics, exact required node and edge kind validation, unrelated graph
@@ -208,6 +227,12 @@ when identity inputs change, sanitized summaries/evidence for
 `permissions: write-all`, secret exclusion, and PP-GHA-002 and PP-GHA-003
 firing on the same workflow. Analysis coverage also asserts that a push
 workflow with graph-only OIDC token capability does not create a finding.
+AWS analysis tests cover `PP-AWS-001` positives for inline `Action "*"
+Resource "*"` and `Action "*:*" Resource "*"` permissions and the literal
+AdministratorAccess attachment, negatives for non-admin permissions and
+unsupported admin reasons, stable and sensitive finding IDs, exact path shape,
+sanitized evidence, and absence of raw Terraform, raw policy JSON, and
+secret-like values from finding JSON.
 Cross-domain analysis tests cover workflow-level OIDC plus workflow-level risk,
 job-level OIDC plus job-level risk, explicit workflow-level and job-level OIDC
 paths to the same AWS role both emitting when both are modeled, exact duplicate

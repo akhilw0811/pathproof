@@ -107,6 +107,7 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 							sarifGitHubActionsUnpinnedActionRule(),
 							sarifGitHubActionsUnsafePullRequestTargetCheckoutRule(),
 							sarifGitHubActionsDangerousPermissionsRule(),
+							sarifAWSIAMRoleAdministrativePermissionsRule(),
 							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule(),
 						},
 					},
@@ -173,6 +174,20 @@ func sarifGitHubActionsDangerousPermissionsRule() sarifRule {
 	}
 }
 
+func sarifAWSIAMRoleAdministrativePermissionsRule() sarifRule {
+	const title = "AWS IAM role grants administrative permissions"
+	return sarifRule{
+		ID:               string(analysis.RuleAWSIAMRoleAdministrativePermissions),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects local Terraform AWS IAM role permissions that obviously grant administrative access."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "error",
+		},
+		Help: sarifMessage{Text: "Review the static local Terraform role policy or AdministratorAccess attachment. PathProof does not call AWS APIs, execute Terraform, simulate IAM, or provide remediation for this rule."},
+	}
+}
+
 func sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule() sarifRule {
 	const title = "Risky GitHub Actions workflow can assume AWS IAM role"
 	return sarifRule{
@@ -219,7 +234,7 @@ func newSARIFResult(root string, finding scanFinding) sarifResult {
 }
 
 func sarifFindingMessage(finding scanFinding) string {
-	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole) && finding.Summary != "" {
+	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions || finding.RuleID == analysis.RuleAWSIAMRoleAdministrativePermissions || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole) && finding.Summary != "" {
 		return finding.Summary
 	}
 	parts := make([]string, 0, len(finding.Path))
@@ -285,16 +300,31 @@ func sarifSourceReferenceFromCleanValue(root, value string) (sarifSourceReferenc
 		return sarifSourceReference{}, false
 	}
 	filename, documentValue, ok := strings.Cut(value, "#document=")
-	if !ok || filename == "" || documentValue == "" || strings.Contains(documentValue, "#") {
-		return sarifSourceReference{}, false
-	}
-	for _, r := range documentValue {
-		if r < '0' || r > '9' {
+	if ok {
+		if filename == "" || documentValue == "" || strings.Contains(documentValue, "#") {
 			return sarifSourceReference{}, false
 		}
+		for _, r := range documentValue {
+			if r < '0' || r > '9' {
+				return sarifSourceReference{}, false
+			}
+		}
+		document, err := strconv.Atoi(documentValue)
+		if err != nil || document <= 0 {
+			return sarifSourceReference{}, false
+		}
+		rel, ok := displayRelativeSourcePath(root, filename)
+		if !ok {
+			return sarifSourceReference{}, false
+		}
+		return sarifSourceReference{
+			display: rel + "#document=" + documentValue,
+			uri:     sarifArtifactURI(rel, "document="+documentValue),
+		}, true
 	}
-	document, err := strconv.Atoi(documentValue)
-	if err != nil || document <= 0 {
+
+	filename, resourceValue, ok := strings.Cut(value, "#resource=")
+	if !ok || filename == "" || resourceValue == "" || strings.Contains(resourceValue, "#") || !supportedTerraformSARIFResource(resourceValue) {
 		return sarifSourceReference{}, false
 	}
 	rel, ok := displayRelativeSourcePath(root, filename)
@@ -302,15 +332,38 @@ func sarifSourceReferenceFromCleanValue(root, value string) (sarifSourceReferenc
 		return sarifSourceReference{}, false
 	}
 	return sarifSourceReference{
-		display: rel + "#document=" + documentValue,
-		uri:     sarifArtifactURI(rel, documentValue),
+		display: rel + "#resource=" + resourceValue,
+		uri:     sarifArtifactURI(rel, "resource="+resourceValue),
 	}, true
 }
 
-func sarifArtifactURI(relPath, documentValue string) string {
+func supportedTerraformSARIFResource(value string) bool {
+	resourceType, resourceName, ok := strings.Cut(value, ".")
+	if !ok || resourceName == "" || strings.Contains(resourceName, ".") {
+		return false
+	}
+	switch resourceType {
+	case "aws_iam_role_policy", "aws_iam_role_policy_attachment":
+	default:
+		return false
+	}
+	for _, r := range resourceName {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func sarifArtifactURI(relPath, fragment string) string {
 	uri := url.URL{
 		Path:     filepath.ToSlash(relPath),
-		Fragment: "document=" + documentValue,
+		Fragment: fragment,
 	}
 	return uri.String()
 }

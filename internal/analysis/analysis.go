@@ -20,6 +20,7 @@ const (
 	RuleGitHubActionsUnpinnedAction                   RuleID   = "PP-GHA-001"
 	RuleGitHubActionsUnsafePullRequestTargetCheckout  RuleID   = "PP-GHA-002"
 	RuleGitHubActionsDangerousPermissions             RuleID   = "PP-GHA-003"
+	RuleAWSIAMRoleAdministrativePermissions           RuleID   = "PP-AWS-001"
 	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole RuleID   = "PP-XDOMAIN-001"
 	SeverityHigh                                      Severity = "High"
 	SeverityMedium                                    Severity = "Medium"
@@ -29,6 +30,7 @@ const publicWorkloadCanReadSecretTitle = "Public workload can read Kubernetes Se
 const githubActionsUnpinnedActionTitle = "GitHub Actions workflow uses an action that is not pinned to a full commit SHA"
 const githubActionsUnsafePullRequestTargetCheckoutTitle = "pull_request_target workflow checks out untrusted pull request head code"
 const githubActionsDangerousPermissionsTitle = "pull_request_target workflow grants dangerous token permissions"
+const awsIAMRoleAdministrativePermissionsTitle = "AWS IAM role grants administrative permissions"
 const crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle = "Risky GitHub Actions workflow can assume AWS IAM role"
 
 type Finding struct {
@@ -114,6 +116,13 @@ type crossDomainFindingIdentity struct {
 	AWSRoleID  graph.NodeID                  `json:"aws_role_node_id"`
 }
 
+type awsAdminPermissionFindingIdentity struct {
+	RuleID           RuleID       `json:"rule_id"`
+	AWSRoleNodeID    graph.NodeID `json:"aws_role_node_id"`
+	PermissionNodeID graph.NodeID `json:"permission_node_id"`
+	AdminReason      string       `json:"admin_reason"`
+}
+
 type crossDomainRiskSignalIdentity struct {
 	WorkflowFile string                          `json:"workflow_file"`
 	JobID        string                          `json:"job_id,omitempty"`
@@ -150,6 +159,7 @@ func Analyze(g *graph.Graph) []Finding {
 	usesActionByJob := make(map[graph.NodeID][]graph.Edge)
 	canRequestOIDCBySource := make(map[graph.NodeID][]graph.Edge)
 	canAssumeRoleByCapability := make(map[graph.NodeID][]graph.Edge)
+	var grantsPermission []graph.Edge
 	for _, edge := range g.Edges() {
 		switch edge.Kind {
 		case graph.RoutesTo:
@@ -166,6 +176,8 @@ func Analyze(g *graph.Graph) []Finding {
 			canRequestOIDCBySource[edge.From] = append(canRequestOIDCBySource[edge.From], edge)
 		case graph.CanAssumeRole:
 			canAssumeRoleByCapability[edge.From] = append(canAssumeRoleByCapability[edge.From], edge)
+		case graph.GrantsPermission:
+			grantsPermission = append(grantsPermission, edge)
 		}
 	}
 
@@ -240,11 +252,81 @@ func Analyze(g *graph.Graph) []Finding {
 		}
 	}
 	findings = append(findings, newCrossDomainGitHubActionsAWSRoleFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, workflowRisks, jobRisks)...)
+	findings = append(findings, newAWSIAMRoleAdministrativePermissionFindings(g, grantsPermission)...)
 
 	sort.Slice(findings, func(i, j int) bool {
 		return findings[i].ID < findings[j].ID
 	})
 	return findings
+}
+
+func newAWSIAMRoleAdministrativePermissionFindings(g *graph.Graph, grantsPermission []graph.Edge) []Finding {
+	findings := make([]Finding, 0)
+	seen := make(map[FindingID]struct{})
+	for _, grants := range grantsPermission {
+		role, ok := nodeOfKind(g, grants.From, graph.AWSIAMRole)
+		if !ok {
+			continue
+		}
+		permission, ok := nodeOfKind(g, grants.To, graph.AWSPermission)
+		if !ok {
+			continue
+		}
+		if permission.Metadata == nil || permission.Metadata.AWSPermission == nil {
+			continue
+		}
+		metadata := *permission.Metadata.AWSPermission
+		if !metadata.Administrative || !supportedAWSAdminReason(metadata.AdminReason) {
+			continue
+		}
+		id, err := stableAWSAdminPermissionFindingID(role.ID, permission.ID, metadata.AdminReason)
+		if err != nil {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		evidence := []FindingEvidence{findingEvidence(grants)}
+		findings = append(findings, Finding{
+			ID:               id,
+			RuleID:           RuleAWSIAMRoleAdministrativePermissions,
+			Title:            awsIAMRoleAdministrativePermissionsTitle,
+			Severity:         SeverityHigh,
+			NodeIDs:          []graph.NodeID{role.ID, permission.ID},
+			EdgeIDs:          []graph.EdgeID{grants.ID},
+			Summary:          "AWS IAM role " + role.Name + " grants administrative permissions (" + metadata.AdminReason + ").",
+			Evidence:         cloneFindingEvidence(evidence),
+			SourceReferences: sourceReferences(evidence),
+		})
+	}
+	sort.Slice(findings, func(i, j int) bool {
+		return findings[i].ID < findings[j].ID
+	})
+	return findings
+}
+
+func supportedAWSAdminReason(reason string) bool {
+	switch reason {
+	case "action_star_resource_star", "action_service_star_resource_star", "administrator_access_managed_policy":
+		return true
+	default:
+		return false
+	}
+}
+
+func stableAWSAdminPermissionFindingID(roleID, permissionID graph.NodeID, adminReason string) (FindingID, error) {
+	data, err := json.Marshal(awsAdminPermissionFindingIdentity{
+		RuleID:           RuleAWSIAMRoleAdministrativePermissions,
+		AWSRoleNodeID:    roleID,
+		PermissionNodeID: permissionID,
+		AdminReason:      adminReason,
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return FindingID("finding:" + string(RuleAWSIAMRoleAdministrativePermissions) + ":" + hex.EncodeToString(sum[:])), nil
 }
 
 func newGitHubActionsDangerousWorkflowPermissionFindings(workflow graph.Node) []Finding {

@@ -69,17 +69,29 @@ sanitized expression marker and treated as unpinned.
 
 Implemented Terraform parsing lives under `internal/parser/terraform`. It
 walks local `.tf` files under the scan root and recognizes only top-level
-`resource "aws_iam_role" "<name>" { ... }` blocks where
-`assume_role_policy` is a static literal heredoc JSON string or a simple
-quoted JSON string. It parses only the extracted trust-policy JSON using
-`encoding/json`. It ignores variables, locals, modules, data sources,
+static `aws_iam_role`, `aws_iam_role_policy`, and
+`aws_iam_role_policy_attachment` resources needed for the current AWS IAM
+trust and permission slices. For role trust, it supports `assume_role_policy`
+as a static literal heredoc JSON string or simple quoted JSON string and parses
+only the extracted trust-policy JSON using `encoding/json`. For role
+permissions, it supports inline `aws_iam_role_policy` JSON attached by
+`aws_iam_role.<name>.id`, `aws_iam_role.<name>.name`, or a literal role name
+only when exactly one parsed role has an explicit static `name` matching that
+literal. It also supports `aws_iam_role_policy_attachment` only for the
+literal AWS managed policy ARN
+`arn:aws:iam::aws:policy/AdministratorAccess`.
+
+The Terraform parser ignores variables, locals, modules, data sources,
 `jsonencode`, function calls, interpolation, dynamic blocks, references to
-`aws_iam_policy_document`, and nonliteral trust policies. It does not execute
-Terraform, evaluate HCL, call AWS, call GitHub, parse remote state, or retain
-raw Terraform files, raw trust JSON, provider credentials, variable values, or
-unsupported condition values. Malformed supported Terraform syntax and
-malformed extracted trust JSON return deterministic sanitized errors with file
-or resource context and no raw policy content.
+`aws_iam_policy_document`, nonliteral trust or permission policies, unknown
+managed policy ARNs, `NotAction`, conditions, unsupported actions/resources,
+ambiguous literal role-name matches, and non-role IAM resources. It does not
+execute Terraform, evaluate HCL, call AWS, call GitHub, parse remote state, or
+retain raw Terraform files, raw policy JSON, provider credentials, variable
+values, access keys, secret-like strings, or unsupported condition values.
+Malformed supported Terraform syntax and malformed extracted JSON return
+deterministic sanitized errors with file or resource context and no raw policy
+content.
 
 Implemented Kubernetes routing lives under `internal/routing/kubernetes`.
 It builds deterministic graph relationships for:
@@ -130,17 +142,25 @@ CI/CD identities, exact workflow permission inheritance or overrides, OIDC
 trust policies, reusable workflow calls, cloud trust, or runtime behavior.
 
 Implemented Terraform routing lives under `internal/routing/terraform`. It
-adds graph-only `AWSIAMRole` nodes for statically parsed local
-`aws_iam_role` resources and stores only sanitized trust metadata: provider,
-resource name, source reference, trusted issuer, supported subject patterns,
-audience values, and statement indexes. When the optional CLI flag
+adds `AWSIAMRole` nodes for statically parsed local `aws_iam_role` resources
+and stores only sanitized trust metadata: provider, resource name, source
+reference, trusted issuer, supported subject patterns, audience values, and
+statement indexes. It also adds `AWSPermission` nodes and
+`AWSIAMRole --GrantsPermission--> AWSPermission` edges for supported static
+role permissions. AWS permission metadata is limited to provider, source
+reference, policy or attachment resource name, attached role resource name,
+sanitized supported action/resource lists, the literal AdministratorAccess ARN
+when applicable, and precise admin reason identities.
+
+When the optional CLI flag
 `--repo OWNER/REPO` is supplied, routing generates a limited set of GitHub
 Actions OIDC subject candidates from parsed workflow data and adds
 `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` only when a candidate
 matches a supported trust statement. Without `--repo`, role trust metadata is
 modeled but no cross-domain edge is created. The routing layer does not infer
 repository identity from Git remotes, call GitHub, call AWS, validate accounts
-or ARNs remotely, simulate IAM, or emit findings.
+or ARNs remotely, simulate IAM, evaluate permission boundaries/SCPs/conditions,
+or emit findings.
 
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
 graph storage, routing construction, analysis, and CLI presentation remain
@@ -189,6 +209,20 @@ access values, omitted permissions, unknown values, and expression-based
 permission values do not produce findings. Exact GitHub permission
 inheritance/override modeling is future work.
 
+`PP-AWS-001` requires this exact directed chain:
+
+`AWSIAMRole --GrantsPermission--> AWSPermission`
+
+The `AWSPermission` metadata must be administrative with one of the precise
+supported reason identities: `action_star_resource_star`,
+`action_service_star_resource_star`, or
+`administrator_access_managed_policy`. Inline admin findings require
+`Effect: Allow` with `Action "*" Resource "*"` or `Action "*:*" Resource "*"`;
+managed-policy findings require the literal AdministratorAccess ARN. The rule
+does not evaluate IAM conditions, `NotAction`, variables, modules, locals,
+unknown managed policies, customer-managed policies, permission boundaries,
+SCPs, or resource-level semantics. Severity is fixed at `High`.
+
 GitHub Actions OIDC token capability modeling is graph-only in this slice.
 The analyzer does not emit a finding for `CanRequestOIDCToken` alone because
 `id-token: write` is not necessarily vulnerable without additional unsafe
@@ -228,9 +262,9 @@ read-only: it consumes the graph and analysis findings, validates supported
 authorization metadata, and emits complete advisory options. It does not parse
 human-readable evidence prose and does not modify source manifests. The
 implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
-`NarrowBindingSubject`. `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, and
-`PP-XDOMAIN-001` receive no remediation plan, patch preview, patch output, or
-validation result in this slice.
+`NarrowBindingSubject`. `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`,
+`PP-AWS-001`, and `PP-XDOMAIN-001` receive no remediation plan, patch preview,
+patch output, or validation result in this slice.
 
 Optional patch preview generation lives under `internal/patchpreview`. It is
 also read-only: it consumes the scan root and remediation plans, resolves

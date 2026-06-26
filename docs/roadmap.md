@@ -44,11 +44,21 @@
   metadata and ignores variables, locals, modules, data sources, `jsonencode`,
   function calls, interpolation, dynamic blocks, nonliteral policies, and
   `aws_iam_policy_document`.
+- Local static Terraform parsing for a narrow AWS IAM role permission slice:
+  supported `aws_iam_role_policy` JSON attached to parsed roles by direct
+  resource reference or an unambiguous explicit static role name, plus
+  `aws_iam_role_policy_attachment` only for the literal AWS managed
+  AdministratorAccess policy ARN. Raw policy JSON, unsupported managed
+  policies, variables, conditions, `NotAction`, provider credentials, access
+  keys, and secret-like values are not retained.
 - AWS IAM OIDC trust modeling with `AWSIAMRole` nodes and optional
   `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edges when
   `pathproof scan --repo OWNER/REPO` supplies repository identity and a static
   GitHub Actions subject candidate matches the trust policy. This trust edge
   does not create a finding by itself.
+- AWS IAM role permission modeling with `AWSPermission` nodes and
+  `AWSIAMRole --GrantsPermission--> AWSPermission` edges for supported static
+  local Terraform permission facts.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
@@ -64,6 +74,11 @@
   workflow-level or job-level token permissions, with fixed rule-based `High`
   severity and deterministic finding IDs. Exact GitHub permission
   inheritance/override modeling is not implemented.
+- Read-only deterministic AWS IAM analysis for `PP-AWS-001`: local Terraform
+  AWS IAM roles with obviously administrative static permissions, limited to
+  inline `Allow` `Action "*"` or `"*:*"` with `Resource "*"`, or the literal
+  AdministratorAccess managed policy attachment. This calls no cloud APIs,
+  performs no IAM simulation, and has no remediation.
 - Read-only deterministic cross-domain analysis for `PP-XDOMAIN-001`: risky
   GitHub Actions workflow or job OIDC capability can assume a locally modeled
   AWS IAM role through a statically parsed OIDC trust. This first slice uses
@@ -92,8 +107,9 @@
   `--repo OWNER/REPO` OIDC trust matching, JSON output, SARIF 2.1.0 finding
   output, and stable exit codes.
 - Local findings-only SARIF export for `PP-K8S-001`, `PP-GHA-001`, and
-  `PP-GHA-002`, `PP-GHA-003`, and `PP-XDOMAIN-001`. SARIF artifact locations
-  use safe relative URIs when clean structured source references are available.
+  `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and `PP-XDOMAIN-001`. SARIF
+  artifact locations use safe relative URIs when clean structured source
+  references are available.
 
 ## Later
 
@@ -104,12 +120,16 @@
 - Broad Terraform/HCL support, modules, variables, locals, functions,
   interpolation, `jsonencode`, and `aws_iam_policy_document`.
 - Cloud provider API validation for OIDC providers, accounts, ARNs, and roles.
-- IAM simulation or broad IAM condition evaluation.
+- IAM simulation, broad IAM condition evaluation, permission boundaries, SCPs,
+  full managed-policy catalogs, customer-managed policy resolution, and
+  resource-level IAM evaluation.
 - Additional GitHub Actions OIDC trust findings beyond the first
   PP-XDOMAIN-001 slice.
 - Broader cloud trust-policy ingestion for GitHub Actions OIDC.
 - Reusable workflow resolution.
 - CI/CD-to-cloud path analysis.
+- Cross-domain admin-path finding from risky GitHub Actions workflow to AWS
+  IAM role administrative permissions.
 - Action source inspection.
 - Automatic GitHub Actions action pinning patches.
 - Automatic GitHub Actions remediation for unsafe `pull_request_target`
