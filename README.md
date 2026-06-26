@@ -3,9 +3,8 @@
 PathProof is a defensive, cloud-agnostic attack-path verification engine.
 
 It ingests infrastructure and software-supply-chain artifacts, models security
-relationships as an evidence-backed graph, detects attack paths, generates
-minimal remediation patches, and proves through rescanning that paths were
-broken.
+relationships as an evidence-backed graph, detects attack paths, and will later
+prove through rescanning that paths were broken.
 
 ## Current milestone
 
@@ -27,6 +26,14 @@ Implemented Kubernetes support is intentionally small:
   deterministic resource permissions granted by reachable observed roles.
 - Model static RBAC-derived `CanRead` relationships from ServiceAccounts to
   parsed Secrets when scoped rules allow supported Secret read access.
+- Analyze the in-memory graph for `PP-K8S-001`, which reports when a public
+  Kubernetes endpoint routes to a workload, that workload runs as a
+  ServiceAccount, and that ServiceAccount can read a parsed Secret.
+
+`PP-K8S-001` findings use fixed rule-based `High` severity. Finding IDs are
+deterministic hashes of the rule ID, ordered node IDs, and ordered edge IDs.
+Secret values are excluded by Kubernetes parsing and graph construction; the
+analysis layer preserves graph evidence and does not redact arbitrary content.
 
 ## Usage
 
@@ -55,6 +62,7 @@ The built binary is written to `bin/pathproof`.
 - GitHub Actions parsing
 - SBOM parsing
 - Kubernetes Secret values, live-cluster verification, or remediation
+- CLI integration for attack-path analysis
 - Kubernetes RBAC User and Group subjects, non-resource URLs, aggregated
   ClusterRoles, and live authorization evaluation
 - AI agents

@@ -42,7 +42,23 @@ metadata show that a supported rule can read a parsed Secret. It does not claim
 that a workload actually issued a Secret read request.
 
 Graph storage lives under `internal/graph` and remains in memory. Parsing,
-graph storage, and routing construction are separate packages. No attack-path
-analysis, live Kubernetes authorization evaluation, verification, remediation,
-persistence, AI, dashboard, plugin system, external service integration, or
-live Kubernetes cluster integration is implemented.
+graph storage, routing construction, and analysis are separate packages.
+
+Implemented graph analysis lives under `internal/analysis`. It is read-only:
+it consumes the in-memory graph and emits structured findings without changing
+nodes, edges, parser output, or routing behavior. The only implemented rule is
+`PP-K8S-001`, which requires this exact directed chain:
+
+`PublicEndpoint --RoutesTo--> Workload --RunsAs--> ServiceAccount --CanRead--> Secret`
+
+The rule does not infer missing relationships. Unresolved roles and unsupported
+authorization inputs create no findings unless routing already produced the
+required `CanRead` edge. Severity is fixed at `High` for this rule and is not
+ML-ranked or score-based.
+
+Secret values are excluded by Kubernetes parsing and graph construction.
+Analysis preserves graph edge evidence as-is and does not implement generic
+redaction. No analysis CLI integration, live Kubernetes authorization
+evaluation, verification, remediation, persistence, AI, dashboard, plugin
+system, external service integration, or live Kubernetes cluster integration is
+implemented.

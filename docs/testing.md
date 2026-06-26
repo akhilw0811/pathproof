@@ -44,5 +44,18 @@ scope, unsupported inputs, deterministic evidence aggregation, duplicate
 evidence deduplication, conflict atomicity, and regression checks that Secret
 values are absent from graph JSON and evidence.
 
+Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
+edge semantics, exact required node and edge kind validation, unrelated graph
+noise, cycles, deterministic finding IDs and ordering, ordered node and edge
+chains, endpoint/workload/ServiceAccount/Secret path cardinality, complete edge
+evidence preservation, evidence-independent finding IDs, direct edge-ID
+participation in finding identity, source-reference ordering and deduplication,
+independent returned finding slices verified by JSON snapshots, overwrite and
+append mutation checks, read-only graph snapshots across repeated analysis with
+node and edge evidence preservation, nil and empty graph behavior, and fixed
+`High` severity. The Secret-value regression for analysis runs through the real
+Kubernetes parser and routing pipeline before marshalling findings; analysis
+preserves graph evidence and does not perform generic redaction.
+
 Tests must cover positive and negative behavior for changed packages. Do not
 skip, remove, or weaken tests to make a change pass.
