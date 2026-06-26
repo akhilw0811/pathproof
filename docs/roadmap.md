@@ -21,12 +21,14 @@
   RBAC-derived ServiceAccount `CanRead` edges. Secret values are never
   ingested.
 - Local GitHub Actions workflow parsing under `.github/workflows` for
-  workflow name, `pull_request_target` trigger presence, sanitized
-  workflow-level and job-level permission grants, job IDs, step indexes,
-  optional step names, sanitized static action identities, and sanitized
-  `actions/checkout` PR-head selector matches. Workflow env values, arbitrary
-  with values, secrets, token values, run scripts, expression-only `uses:`
-  values, unknown or expression-based permission values, and raw workflow
+  workflow name, `pull_request` and `pull_request_target` trigger presence,
+  static push branch literals and static job environment names for OIDC
+  subject matching, sanitized workflow-level and job-level permission grants,
+  job IDs, step indexes, optional step names, sanitized static action
+  identities, and sanitized `actions/checkout` PR-head selector matches.
+  Workflow env values, arbitrary with values, secrets, token values, run
+  scripts, expression-only `uses:` values, unknown or expression-based
+  permission values, dynamic branch/environment expressions, and raw workflow
   documents are not retained.
 - Minimal GitHub Actions graph construction with `Workflow`, `WorkflowJob`,
   `GitHubAction`, `DefinesJob`, and `UsesAction`. `Workflow` and `DefinesJob`
@@ -36,6 +38,17 @@
   `OIDCTokenCapability` nodes and `CanRequestOIDCToken` edges for explicit
   workflow-level or job-level `id-token: write`, including
   `permissions: write-all`. This does not create a finding by itself.
+- Local static Terraform parsing for `aws_iam_role` resources whose
+  `assume_role_policy` is a literal heredoc or simple quoted JSON trust
+  policy. The parser extracts only sanitized GitHub Actions OIDC trust
+  metadata and ignores variables, locals, modules, data sources, `jsonencode`,
+  function calls, interpolation, dynamic blocks, nonliteral policies, and
+  `aws_iam_policy_document`.
+- Graph-only AWS IAM OIDC trust modeling with `AWSIAMRole` nodes and optional
+  `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edges when
+  `pathproof scan --repo OWNER/REPO` supplies repository identity and a static
+  GitHub Actions subject candidate matches the trust policy. This does not
+  create a finding by itself.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
@@ -68,10 +81,11 @@
   Validation builds a temporary complete patched manifest set from the input
   directory plus generated patch files, rescans it locally, and reports
   remediated, failed, or skipped results for supported `PP-K8S-001` findings.
-- Local Kubernetes YAML and GitHub Actions workflow scan CLI for
+- Local Kubernetes YAML, GitHub Actions workflow, and narrow Terraform scan CLI for
   `pathproof scan <directory>` with human-readable finding, supported
-  Kubernetes remediation and optional patch preview output, JSON output, SARIF
-  2.1.0 finding output, and stable exit codes.
+  Kubernetes remediation and optional patch preview output, optional
+  `--repo OWNER/REPO` graph-only OIDC trust matching, JSON output, SARIF 2.1.0
+  finding output, and stable exit codes.
 - Local findings-only SARIF export for `PP-K8S-001`, `PP-GHA-001`, and
   `PP-GHA-002`, and `PP-GHA-003`. SARIF artifact locations use safe relative
   URIs when clean structured source references are available.
@@ -82,8 +96,12 @@
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Full CI/CD attack-path modeling.
 - Exact GitHub Actions workflow permission inheritance/override modeling.
-- GitHub Actions OIDC trust analysis.
-- Cloud trust-policy ingestion for GitHub Actions OIDC.
+- Broad Terraform/HCL support, modules, variables, locals, functions,
+  interpolation, `jsonencode`, and `aws_iam_policy_document`.
+- Cloud provider API validation for OIDC providers, accounts, ARNs, and roles.
+- IAM simulation or broad IAM condition evaluation.
+- GitHub Actions OIDC trust findings.
+- Broader cloud trust-policy ingestion for GitHub Actions OIDC.
 - Reusable workflow resolution.
 - CI/CD-to-cloud path analysis.
 - Action source inspection.

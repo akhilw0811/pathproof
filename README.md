@@ -1,7 +1,8 @@
 # PathProof
 
 PathProof is a Go-based security graph engine that scans local Kubernetes
-manifests and local GitHub Actions workflows. It models the smallest current
+manifests, local GitHub Actions workflows, and a narrow local Terraform slice
+for AWS IAM role OIDC trust policies. It models the smallest current
 Kubernetes slice for public exposure, workloads, ServiceAccounts, RBAC, and
 Secret metadata, detects the `PP-K8S-001` path from a public workload to a
 readable Secret, proposes deterministic remediation, previews and writes
@@ -21,14 +22,16 @@ GitHub Actions action references, `PP-GHA-002` for unsafe
 explicit dangerous token permissions under `pull_request_target`. It also
 models explicit GitHub Actions OIDC token request capability in the internal
 graph when a workflow or job grants `id-token: write` or
-`permissions: write-all`; this graph-only capability does not produce a
-finding by itself.
+`permissions: write-all`; this graph-only capability can be connected to a
+statically parsed AWS IAM role trust policy when `--repo OWNER/REPO` is
+supplied. This cross-domain graph edge does not produce a finding by itself.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
-permission inheritance/override modeling, OIDC trust analysis, reusable
-workflow resolution, action source inspection, broader sensitive-resource
-types, live cluster scanning, pull request creation, AI/ML ranking, and
-dashboards are not implemented.
+permission inheritance/override modeling, broad Terraform/HCL parsing,
+Terraform execution, module or variable evaluation, reusable workflow
+resolution, action source inspection, broader sensitive-resource types, live
+cluster scanning, cloud validation, IAM simulation, cross-domain findings,
+pull request creation, AI/ML ranking, and dashboards are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, and internal scan errors exit `2`.
@@ -192,9 +195,28 @@ PathProof currently implements three small local GitHub Actions checks:
 
 These checks are static and local. PathProof does not execute workflows, call
 GitHub APIs, evaluate expressions, inspect action source, model workflow
-permission inheritance or overrides, ingest cloud trust policies, contact
-cloud providers, or claim full CI/CD attack-path coverage. Exact GitHub
+permission inheritance or overrides, broadly ingest cloud trust policies,
+contact cloud providers, or claim full CI/CD attack-path coverage. Exact GitHub
 permission inheritance/override modeling is future work.
+
+## Terraform AWS IAM OIDC Trust
+
+PathProof scans local `.tf` files under the scan root for only static
+`aws_iam_role` resources whose `assume_role_policy` is a literal heredoc JSON
+string or simple quoted JSON string. It parses the extracted JSON locally with
+Go's standard library and records sanitized AWS IAM role trust metadata for
+GitHub Actions OIDC trust statements.
+
+When `pathproof scan --repo OWNER/REPO <directory>` is used, PathProof can add
+a graph-only `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edge if a
+parsed workflow/job OIDC capability has a static subject candidate that
+matches the role trust conditions. Without `--repo`, Terraform trust metadata
+is still modeled, but cross-domain `CanAssumeRole` edges are not created.
+
+This slice does not execute Terraform, parse modules, evaluate variables,
+locals, functions, `jsonencode`, interpolations, or
+`aws_iam_policy_document`, call AWS or GitHub APIs, verify ARNs or accounts,
+simulate IAM, emit findings, or provide remediation.
 
 ## CI / SARIF
 
@@ -253,11 +275,16 @@ The scan loop is:
 
 1. Parse local Kubernetes YAML manifests.
 2. Parse local GitHub Actions workflow YAML files under `.github/workflows`.
-3. Build an in-memory evidence graph.
-4. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
-5. Add deterministic GitHub Actions workflow/job/action-use edges and
+3. Parse local Terraform `.tf` files for static AWS IAM role OIDC trust
+   metadata.
+4. Build an in-memory evidence graph.
+5. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
+6. Add deterministic GitHub Actions workflow/job/action-use edges and
    graph-only OIDC token capability edges.
-6. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
+7. Add deterministic graph-only AWS IAM role trust nodes and optional
+   `CanAssumeRole` edges when `--repo OWNER/REPO` supplies repository
+   identity for static subject matching.
+8. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, and
    `PP-GHA-003`.
 7. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.

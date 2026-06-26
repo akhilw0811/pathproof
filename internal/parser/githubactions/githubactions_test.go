@@ -389,6 +389,89 @@ jobs:
 	}
 }
 
+func TestParseDirParsesOIDCSubjectCandidateInputs(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "deploy.yml", `on:
+  push:
+    branches:
+      - main
+      - release/prod
+      - feature/*
+      - ${{ inputs.branch }}
+  pull_request:
+  pull_request_target:
+jobs:
+  deploy:
+    environment: prod
+    steps:
+      - run: echo test
+  mapped:
+    environment:
+      name: staging
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	workflow := resources.Workflows[0]
+	if !workflow.TriggersPullRequest || !workflow.TriggersPullRequestTarget {
+		t.Fatalf("triggers = pull_request:%v pull_request_target:%v, want both", workflow.TriggersPullRequest, workflow.TriggersPullRequestTarget)
+	}
+	if !reflect.DeepEqual(workflow.PushBranches, []string{"main", "release/prod"}) {
+		t.Fatalf("push branches = %#v, want static literal branches only", workflow.PushBranches)
+	}
+	gotEnv := map[string]string{}
+	for _, job := range workflow.Jobs {
+		gotEnv[job.ID] = job.Environment
+	}
+	if !reflect.DeepEqual(gotEnv, map[string]string{"deploy": "prod", "mapped": "staging"}) {
+		t.Fatalf("job environments = %#v", gotEnv)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"inputs.branch", "${{", "feature/*"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestParseDirIgnoresDynamicOrUnsafeEnvironmentNames(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "env.yml", `jobs:
+  expression:
+    environment: ${{ inputs.environment }}
+  space:
+    environment: prod secret
+  colon:
+    environment:
+      name: prod:secret
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	for _, job := range resources.Workflows[0].Jobs {
+		if job.Environment != "" {
+			t.Fatalf("job %s environment = %q, want ignored", job.ID, job.Environment)
+		}
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"inputs.environment", "${{", "prod secret", "prod:secret"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
 func TestParseDirParsesSanitizedCheckoutHeadSelectors(t *testing.T) {
 	root := t.TempDir()
 	writeWorkflow(t, root, "unsafe.yml", `on:

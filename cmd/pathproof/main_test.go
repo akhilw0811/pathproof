@@ -108,6 +108,129 @@ func TestRunScanRejectsUnsupportedFormat(t *testing.T) {
 	assertContains(t, stderr, "unsupported scan format \"xml\"")
 }
 
+func TestRunScanRejectsInvalidRepoFlag(t *testing.T) {
+	tests := []string{
+		"owner",
+		"owner/",
+		"/repo",
+		"owner/repo/extra",
+		"own er/repo",
+		"owner/re:po",
+		"owner/re*po",
+	}
+	for _, repo := range tests {
+		t.Run(repo, func(t *testing.T) {
+			stdout, stderr, code := runCommand("scan", "--repo", repo, safeFixture)
+
+			assertCode(t, code, 2)
+			assertString(t, "stdout", stdout, "")
+			assertOneLineStderr(t, stderr)
+			assertContains(t, stderr, "invalid --repo")
+		})
+	}
+}
+
+func TestRunScanTerraformOIDCTrustGraphOnlyOutputUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on:
+  pull_request:
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - run: echo test
+`)
+	writeTerraformForTest(t, dir, "main.tf", terraformOIDCRole("deploy", "repo:owner/repo:pull_request"))
+
+	humanStdout, humanStderr, humanCode := runCommand("scan", "--repo", "owner/repo", dir)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--repo", "owner/repo", "--format=json", dir)
+	sarifStdout, sarifStderr, sarifCode := runCommand("scan", "--repo", "owner/repo", "--format=sarif", dir)
+
+	assertCode(t, humanCode, 0)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "human stdout", humanStdout, "Finding count: 0\nNo findings.\n")
+
+	assertCode(t, jsonCode, 0)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("JSON report = %#v, want no findings", report)
+	}
+	assertString(t, "json stdout", jsonStdout, "{\"findings\":[],\"finding_count\":0}\n")
+
+	assertCode(t, sarifCode, 0)
+	assertString(t, "sarif stderr", sarifStderr, "")
+	sarif := assertValidSARIFReport(t, sarifStdout)
+	if len(sarif.Runs[0].Results) != 0 {
+		t.Fatalf("SARIF results = %#v, want none", sarif.Runs[0].Results)
+	}
+
+	for _, output := range []string{humanStdout, jsonStdout, sarifStdout} {
+		for _, forbidden := range []string{"AWSIAMRole", "CanAssumeRole", "assume_role_policy", "Principal", "Condition", "arn:aws:iam"} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("scan output contains graph-only Terraform text %q: %s", forbidden, output)
+			}
+		}
+	}
+}
+
+func TestScanDirectoryWithRepoCreatesTerraformCanAssumeRoleGraphEdge(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    environment: prod
+    permissions:
+      id-token: write
+`)
+	writeTerraformForTest(t, dir, "main.tf", terraformOIDCRole("deploy", "repo:owner/repo:environment:prod"))
+
+	findings, g, err := scanDirectoryWithRepo(dir, "owner/repo")
+	if err != nil {
+		t.Fatalf("scan directory: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none", findings)
+	}
+	if countGraphEdges(g, graph.CanAssumeRole) != 1 {
+		t.Fatalf("CanAssumeRole edge count = %d, want 1", countGraphEdges(g, graph.CanAssumeRole))
+	}
+
+	_, noRepoGraph, err := scanDirectory(dir)
+	if err != nil {
+		t.Fatalf("scan directory without repo: %v", err)
+	}
+	if countGraphEdges(noRepoGraph, graph.CanAssumeRole) != 0 {
+		t.Fatalf("CanAssumeRole without repo = %d, want 0", countGraphEdges(noRepoGraph, graph.CanAssumeRole))
+	}
+}
+
+func TestRunScanTerraformTrustTrailingContentErrorIsSanitized(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on:
+  pull_request:
+permissions:
+  id-token: write
+`)
+	writeTerraformForTest(t, dir, "main.tf", terraformOIDCRoleWithSuffix("deploy", "repo:owner/repo:pull_request", " FAKE_TF_TRAILING_SECRET_DO_NOT_RETAIN"))
+
+	stdout, stderr, code := runCommand("scan", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "aws_iam_role.deploy")
+	assertContains(t, stderr, "invalid assume_role_policy JSON")
+	for _, forbidden := range []string{"FAKE_TF_TRAILING_SECRET_DO_NOT_RETAIN", "Statement", "Principal", "Condition", "arn:aws:iam"} {
+		if strings.Contains(stderr, forbidden) {
+			t.Fatalf("stderr contains %q: %s", forbidden, stderr)
+		}
+	}
+}
+
 func TestRunScanRejectsUnknownFlagsWithControlledError(t *testing.T) {
 	stdout, stderr, code := runCommand("scan", "--bogus", safeFixture)
 
@@ -2814,6 +2937,54 @@ func writeGitHubActionsWorkflowForTest(t *testing.T, root, name, content string)
 		t.Fatalf("mkdir workflows: %v", err)
 	}
 	writeFileForTest(t, dir, name, content)
+}
+
+func writeTerraformForTest(t *testing.T, root, name, content string) {
+	t.Helper()
+	path := filepath.Join(root, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir terraform dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write terraform: %v", err)
+	}
+}
+
+func terraformOIDCRole(name, subject string) string {
+	return terraformOIDCRoleWithSuffix(name, subject, "")
+}
+
+func terraformOIDCRoleWithSuffix(name, subject, suffix string) string {
+	return `resource "aws_iam_role" "` + name + `" {
+  assume_role_policy = <<EOF
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "` + subject + `"
+      }
+    }
+  }
+}` + suffix + `
+EOF
+}
+`
+}
+
+func countGraphEdges(g *graph.Graph, kind graph.EdgeKind) int {
+	count := 0
+	for _, edge := range g.Edges() {
+		if edge.Kind == kind {
+			count++
+		}
+	}
+	return count
 }
 
 func assertDoesNotContainGitHubActionsSecretValues(t *testing.T, outputs ...string) {

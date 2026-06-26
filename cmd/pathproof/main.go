@@ -10,20 +10,23 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"pathproof/internal/analysis"
 	"pathproof/internal/graph"
 	parsergithubactions "pathproof/internal/parser/githubactions"
 	parserkubernetes "pathproof/internal/parser/kubernetes"
+	parserterraform "pathproof/internal/parser/terraform"
 	"pathproof/internal/patchpreview"
 	"pathproof/internal/remediation"
 	routinggithubactions "pathproof/internal/routing/githubactions"
 	routingkubernetes "pathproof/internal/routing/kubernetes"
+	routingterraform "pathproof/internal/routing/terraform"
 	"pathproof/internal/validation"
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--repo OWNER/REPO] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
@@ -38,6 +41,7 @@ type scanOptions struct {
 	previewPatches  bool
 	writePatches    string
 	validatePatches bool
+	repo            string
 	directory       string
 }
 
@@ -76,7 +80,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	findings, g, err := scanDirectory(options.directory)
+	findings, g, err := scanDirectoryWithRepo(options.directory, options.repo)
 	if err != nil {
 		printError(stderr, err.Error())
 		return 2
@@ -156,6 +160,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	flags := flag.NewFlagSet("scan", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	formatValue := flags.String("format", string(scanFormatHuman), "output format")
+	repoValue := flags.String("repo", "", "repository identity for GitHub Actions OIDC trust matching, in OWNER/REPO form")
 	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
 	writePatches := flags.String("write-patches", "", "write patched copies to an output directory")
 	validatePatches := flags.Bool("validate-patches", false, "rescan a temporary patched manifest set after writing patches")
@@ -199,15 +204,29 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	if *validatePatches && !writePatchesSet {
 		return scanOptions{}, fmt.Errorf("--validate-patches requires --write-patches")
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, directory: dir}, nil
+	repo := *repoValue
+	if repo != "" {
+		if err := validateRepoIdentity(repo); err != nil {
+			return scanOptions{}, err
+		}
+	}
+	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, directory: dir}, nil
 }
 
 func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
+	return scanDirectoryWithRepo(dir, "")
+}
+
+func scanDirectoryWithRepo(dir, repo string) ([]analysis.Finding, *graph.Graph, error) {
 	resources, err := parserkubernetes.ParseDir(dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
 	}
 	workflows, err := parsergithubactions.ParseDir(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
+	}
+	terraformResources, err := parserterraform.ParseDir(dir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
 	}
@@ -218,7 +237,25 @@ func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
 	if err := routinggithubactions.AddRoutes(g, workflows); err != nil {
 		return nil, nil, fmt.Errorf("build scan graph: %w", err)
 	}
+	if err := routingterraform.AddRoutes(g, terraformResources, workflows, repo); err != nil {
+		return nil, nil, fmt.Errorf("build scan graph: %w", err)
+	}
 	return analysis.Analyze(g), g, nil
+}
+
+func validateRepoIdentity(repo string) error {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid --repo %q: expected OWNER/REPO", repo)
+	}
+	for _, part := range parts {
+		for _, r := range part {
+			if unicode.IsSpace(r) || unicode.IsControl(r) || r == '*' || r == ':' || r == '/' || r == '\\' {
+				return fmt.Errorf("invalid --repo %q: OWNER and REPO must not contain whitespace, control characters, '*', ':', or extra slashes", repo)
+			}
+		}
+	}
+	return nil
 }
 
 func validatePatchOutput(root, outputRoot string, findings []analysis.Finding, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile) ([]validation.Result, error) {
