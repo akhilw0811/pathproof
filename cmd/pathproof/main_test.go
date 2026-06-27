@@ -328,6 +328,257 @@ permissions: write-all
 	}
 }
 
+func TestRunScanCrossDomainAdminRoleHumanOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe-admin.yml", `name: Cross domain admin
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN2_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  audit:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN2_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCAdminRole("deploy", "repo:owner/repo:pull_request", "admin", "*", "*")+"\n# FAKE_CLI_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN\n")
+
+	stdout, stderr, code := runCommand("scan", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-XDOMAIN-002\n")
+	assertContains(t, stdout, "Title: Risky GitHub Actions workflow can assume administrative AWS IAM role\n")
+	assertContains(t, stdout, "Severity: High\n")
+	assertContains(t, stdout, "workflow-level OIDC token capability")
+	assertContains(t, stdout, "OIDCTokenCapability githubactions://.github/workflows/unsafe-admin.yml/oidc-token/workflow")
+	assertContains(t, stdout, "AWSIAMRole aws://terraform/aws_iam_role/infra/iam.tf/deploy")
+	assertContains(t, stdout, "AWSPermission aws://terraform/aws_permission/")
+	assertContains(t, stdout, "action_star_resource_star")
+	assertContains(t, stdout, "permissions: write-all")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-XDOMAIN-002 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	assertDoesNotContainCrossDomainAdminSecretValues(t, stdout, stderr)
+	for _, forbidden := range []string{"assume_role_policy", "Principal", "Condition", "Statement", "policy ="} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanCrossDomainAdminRoleJSONRepoMatchingAndNegatives(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe-admin.yml", `on: pull_request_target
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_CLI_XDOMAIN2_GHA_WITH_SECRET_DO_NOT_RETAIN
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCAdminRole("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"))
+
+	stdout, stderr, code := runCommand("scan", "--format=json", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	var crossDomainAdmin []cliJSONFinding
+	for _, finding := range report.Findings {
+		if finding.RuleID == "PP-XDOMAIN-002" {
+			crossDomainAdmin = append(crossDomainAdmin, finding)
+			if finding.RiskSignal == nil {
+				t.Fatalf("risk_signal = nil for PP-XDOMAIN-002: %#v", finding)
+			}
+			if finding.Remediation != nil {
+				t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+			}
+			if len(finding.Path) != 4 || len(finding.Evidence) != 3 {
+				t.Fatalf("path/evidence lengths = %d/%d, want workflow-level admin path", len(finding.Path), len(finding.Evidence))
+			}
+			if finding.Path[2].Kind != "AWSIAMRole" || finding.Path[3].Kind != "AWSPermission" {
+				t.Fatalf("path = %#v, want AWS role to permission suffix", finding.Path)
+			}
+		}
+	}
+	if len(crossDomainAdmin) != 2 {
+		t.Fatalf("PP-XDOMAIN-002 count = %d, want PP-GHA-002 and PP-GHA-003 risk findings: %#v", len(crossDomainAdmin), report.Findings)
+	}
+	seenRisk := map[string]bool{}
+	for _, finding := range crossDomainAdmin {
+		seenRisk[finding.RiskSignal.RuleID] = true
+	}
+	if !seenRisk["PP-GHA-002"] || !seenRisk["PP-GHA-003"] {
+		t.Fatalf("risk signals = %#v, want PP-GHA-002 and PP-GHA-003", seenRisk)
+	}
+	assertDoesNotContainCrossDomainAdminSecretValues(t, stdout, stderr)
+	for _, forbidden := range []string{"${{", "assume_role_policy", "Principal", "Condition", "Statement", "policy ="} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+
+	noRepoStdout, noRepoStderr, noRepoCode := runCommand("scan", "--format=json", dir)
+	assertCode(t, noRepoCode, 1)
+	assertString(t, "no repo stderr", noRepoStderr, "")
+	assertNoRuleInJSONReport(t, noRepoStdout, "PP-XDOMAIN-002")
+
+	nonmatchingStdout, nonmatchingStderr, nonmatchingCode := runCommand("scan", "--format=json", "--repo", "other/repo", dir)
+	assertCode(t, nonmatchingCode, 1)
+	assertString(t, "nonmatching stderr", nonmatchingStderr, "")
+	assertNoRuleInJSONReport(t, nonmatchingStdout, "PP-XDOMAIN-002")
+}
+
+func TestRunScanCrossDomainAdminRoleMixedTrustEmitsFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "mixed-admin.yml", `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: prod
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCSubjectsAdminRole("deploy", []string{
+		"repo:owner/repo:environment:prod",
+		"repo:owner/repo:pull_request",
+	}, "admin", "*", "*")+"\n# FAKE_CLI_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN\n")
+
+	humanStdout, humanStderr, humanCode := runCommand("scan", "--repo", "owner/repo", dir)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", "--repo", "owner/repo", dir)
+
+	assertCode(t, humanCode, 1)
+	assertString(t, "human stderr", humanStderr, "")
+	assertContains(t, humanStdout, "Rule: PP-XDOMAIN-002\n")
+	assertContains(t, humanStdout, "repo:owner/repo:pull_request")
+	assertContains(t, humanStdout, "repo:owner/repo:environment:prod")
+	assertDoesNotContainCrossDomainAdminSecretValues(t, humanStdout, humanStderr)
+	for _, forbidden := range []string{"assume_role_policy", "Principal", "Condition", "Statement", "policy =", "arn:aws:iam"} {
+		if strings.Contains(humanStdout, forbidden) || strings.Contains(humanStderr, forbidden) {
+			t.Fatalf("human output contains %q\nstdout:%s\nstderr:%s", forbidden, humanStdout, humanStderr)
+		}
+	}
+
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	found := false
+	for _, finding := range report.Findings {
+		if finding.RuleID == "PP-XDOMAIN-002" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("JSON report missing PP-XDOMAIN-002: %#v", report.Findings)
+	}
+	if strings.Contains(jsonStdout, dir) {
+		t.Fatalf("JSON output leaked absolute path %q: %s", dir, jsonStdout)
+	}
+	assertDoesNotContainCrossDomainAdminSecretValues(t, jsonStdout, jsonStderr)
+}
+
+func TestRunScanCrossDomainAdminRoleNegatives(t *testing.T) {
+	tests := []struct {
+		name      string
+		workflow  string
+		terraform string
+		repo      string
+	}{
+		{
+			name: "non admin permission",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformOIDCPolicyRole("deploy", "repo:owner/repo:pull_request", "read", "s3:GetObject", "*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "push workflow admin trust no risk",
+			workflow: `on:
+  push:
+    branches: [main]
+permissions:
+  id-token: write
+`,
+			terraform: terraformOIDCAdminRole("deploy", "repo:owner/repo:ref:refs/heads/main", "admin", "*", "*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "branch-only trust with risky workflow",
+			workflow: `on:
+  push:
+    branches: [main]
+  pull_request_target:
+permissions: write-all
+`,
+			terraform: terraformOIDCAdminRole("deploy", "repo:owner/repo:ref:refs/heads/main", "admin", "*", "*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "environment-only trust with risky workflow",
+			workflow: `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: prod
+`,
+			terraform: terraformOIDCAdminRole("deploy", "repo:owner/repo:environment:prod", "admin", "*", "*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "environment-only trust named pull_request with risky workflow",
+			workflow: `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: pull_request
+`,
+			terraform: terraformOIDCAdminRole("deploy", "repo:owner/repo:environment:pull_request", "admin", "*", "*"),
+			repo:      "owner/repo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeGitHubActionsWorkflowForTest(t, dir, "workflow.yml", tt.workflow)
+			writeTerraformForTest(t, dir, "infra/iam.tf", tt.terraform)
+
+			stdout, stderr, code := runCommand("scan", "--format=json", "--repo", tt.repo, dir)
+
+			assertCode(t, code, 1)
+			assertString(t, "stderr", stderr, "")
+			assertNoRuleInJSONReport(t, stdout, "PP-XDOMAIN-002")
+		})
+	}
+}
+
+func TestRunScanCrossDomainAdminRolePatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("mkdir scan root: %v", err)
+	}
+	writeGitHubActionsWorkflowForTest(t, root, "unsafe-admin.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCAdminRole("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"))
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--repo", "owner/repo", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-XDOMAIN-002\n")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 0")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-XDOMAIN-002 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
 func TestScanDirectoryWithRepoCreatesTerraformCanAssumeRoleGraphEdge(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on:
@@ -3379,6 +3630,56 @@ EOF
 `
 }
 
+func terraformOIDCAdminRole(name, subject, policyName, action, resource string) string {
+	return terraformOIDCPolicyRole(name, subject, policyName, action, resource)
+}
+
+func terraformOIDCPolicyRole(name, subject, policyName, action, resource string) string {
+	return terraformOIDCRole(name, subject) + `
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + name + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
+func terraformOIDCSubjectsAdminRole(name string, subjects []string, policyName, action, resource string) string {
+	var patterns strings.Builder
+	for i, subject := range subjects {
+		if i > 0 {
+			patterns.WriteString(", ")
+		}
+		patterns.WriteString(`"`)
+		patterns.WriteString(subject)
+		patterns.WriteString(`"`)
+	}
+	return `resource "aws_iam_role" "` + name + `" {
+  assume_role_policy = <<EOF
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": [` + patterns.String() + `]
+      }
+    }
+  }
+}
+EOF
+}
+
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + name + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
 func countGraphEdges(g *graph.Graph, kind graph.EdgeKind) int {
 	count := 0
 	for _, edge := range g.Edges() {
@@ -3470,6 +3771,22 @@ func assertDoesNotContainCrossDomainSecretValues(t *testing.T, outputs ...string
 		} {
 			if strings.Contains(output, forbidden) {
 				t.Fatalf("output contains cross-domain secret-like value %q: %s", forbidden, output)
+			}
+		}
+	}
+}
+
+func assertDoesNotContainCrossDomainAdminSecretValues(t *testing.T, outputs ...string) {
+	t.Helper()
+	for _, output := range outputs {
+		for _, forbidden := range []string{
+			"FAKE_CLI_XDOMAIN2_GHA_ENV_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN2_GHA_WITH_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN2_GHA_RUN_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN",
+		} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("output contains cross-domain admin secret-like value %q: %s", forbidden, output)
 			}
 		}
 	}

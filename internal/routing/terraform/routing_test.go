@@ -307,6 +307,171 @@ func TestAddRoutesMatchesStaticPushBranchAndEnvironmentSubjects(t *testing.T) {
 	}
 }
 
+func TestAddRoutesAggregatesCanAssumeRoleMatchesForSameCapabilityAndRole(t *testing.T) {
+	workflows := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
+		Name:                      "Deploy",
+		Source:                    parsergithubactions.Source{Filename: "/repo/.github/workflows/deploy.yml", RelativePath: ".github/workflows/deploy.yml", Document: 1},
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []parsergithubactions.PermissionGrant{{
+			Scope:      "workflow",
+			Permission: "id-token",
+			Access:     "write",
+		}},
+		Jobs: []parsergithubactions.Job{{
+			ID:          "deploy",
+			Environment: "prod",
+		}},
+	}}}
+	role := testRoleWithSubjects("deploy", []string{
+		"repo:owner/repo:environment:prod",
+		"repo:owner/repo:pull_request",
+	})
+	g := graph.New()
+	if err := routinggithubactions.AddRoutes(g, workflows); err != nil {
+		t.Fatalf("add github actions routes: %v", err)
+	}
+
+	if err := AddRoutes(g, parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{role}}, workflows, "owner/repo"); err != nil {
+		t.Fatalf("add terraform routes: %v", err)
+	}
+
+	edge := onlyEdgeOfKind(t, g, graph.CanAssumeRole)
+	matches := edge.Metadata.AWSCanAssumeRole.Matches
+	if got := len(matches); got != 2 {
+		t.Fatalf("CanAssumeRole matches = %d, want 2: %#v", got, matches)
+	}
+	gotSubjects := canAssumeMatchSubjects(matches)
+	wantSubjects := []string{"repo:owner/repo:environment:prod", "repo:owner/repo:pull_request"}
+	if !reflect.DeepEqual(gotSubjects, wantSubjects) {
+		t.Fatalf("matched subjects = %#v, want %#v", gotSubjects, wantSubjects)
+	}
+}
+
+func TestAddRoutesCanAssumeRoleMatchAggregationIsDeterministicAndDeduped(t *testing.T) {
+	workflows := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
+		Source:                    parsergithubactions.Source{Filename: "/repo/.github/workflows/deploy.yml", RelativePath: ".github/workflows/deploy.yml", Document: 1},
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []parsergithubactions.PermissionGrant{{
+			Scope:      "workflow",
+			Permission: "id-token",
+			Access:     "write",
+		}},
+		Jobs: []parsergithubactions.Job{{
+			ID:          "deploy",
+			Environment: "prod",
+		}},
+	}}}
+	firstRole := testRoleWithSubjects("deploy", []string{
+		"repo:owner/repo:environment:prod",
+		"repo:owner/repo:pull_request",
+		"repo:owner/repo:pull_request",
+	})
+	secondRole := testRoleWithSubjects("deploy", []string{
+		"repo:owner/repo:pull_request",
+		"repo:owner/repo:environment:prod",
+		"repo:owner/repo:pull_request",
+	})
+	first := graph.New()
+	second := graph.New()
+	if err := routinggithubactions.AddRoutes(first, workflows); err != nil {
+		t.Fatalf("add first github actions routes: %v", err)
+	}
+	if err := AddRoutes(first, parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{firstRole}}, workflows, "owner/repo"); err != nil {
+		t.Fatalf("add first terraform routes: %v", err)
+	}
+	if err := routinggithubactions.AddRoutes(second, workflows); err != nil {
+		t.Fatalf("add second github actions routes: %v", err)
+	}
+	if err := AddRoutes(second, parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{secondRole}}, workflows, "owner/repo"); err != nil {
+		t.Fatalf("add second terraform routes: %v", err)
+	}
+
+	firstJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first graph: %v", err)
+	}
+	secondJSON, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second graph: %v", err)
+	}
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("graph JSON differs:\nfirst: %s\nsecond:%s", firstJSON, secondJSON)
+	}
+	matches := onlyEdgeOfKind(t, first, graph.CanAssumeRole).Metadata.AWSCanAssumeRole.Matches
+	if got := len(matches); got != 2 {
+		t.Fatalf("deduped matches = %d, want 2: %#v", got, matches)
+	}
+}
+
+func TestAddRoutesCanAssumeRolePreservesNonPullRequestMatches(t *testing.T) {
+	workflows := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
+		Source:       parsergithubactions.Source{Filename: "/repo/.github/workflows/deploy.yml", RelativePath: ".github/workflows/deploy.yml", Document: 1},
+		PushBranches: []string{"main"},
+		PermissionGrants: []parsergithubactions.PermissionGrant{{
+			Scope:      "workflow",
+			Permission: "id-token",
+			Access:     "write",
+		}},
+		Jobs: []parsergithubactions.Job{{
+			ID:          "deploy",
+			Environment: "prod",
+		}},
+	}}}
+	role := testRoleWithSubjects("deploy", []string{
+		"repo:owner/repo:environment:prod",
+		"repo:owner/repo:ref:refs/heads/main",
+	})
+	g := graph.New()
+	if err := routinggithubactions.AddRoutes(g, workflows); err != nil {
+		t.Fatalf("add github actions routes: %v", err)
+	}
+
+	if err := AddRoutes(g, parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{role}}, workflows, "owner/repo"); err != nil {
+		t.Fatalf("add terraform routes: %v", err)
+	}
+
+	edge := onlyEdgeOfKind(t, g, graph.CanAssumeRole)
+	gotSubjects := canAssumeMatchSubjects(edge.Metadata.AWSCanAssumeRole.Matches)
+	wantSubjects := []string{"repo:owner/repo:environment:prod", "repo:owner/repo:ref:refs/heads/main"}
+	if !reflect.DeepEqual(gotSubjects, wantSubjects) {
+		t.Fatalf("matched subjects = %#v, want %#v", gotSubjects, wantSubjects)
+	}
+}
+
+func TestAddRoutesPreservesEnvironmentSubjectNamedPullRequest(t *testing.T) {
+	workflows := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
+		Source:                    parsergithubactions.Source{Filename: "/repo/.github/workflows/deploy.yml", RelativePath: ".github/workflows/deploy.yml", Document: 1},
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []parsergithubactions.PermissionGrant{{
+			Scope:      "workflow",
+			Permission: "id-token",
+			Access:     "write",
+		}},
+		Jobs: []parsergithubactions.Job{{
+			ID:          "deploy",
+			Environment: "pull_request",
+		}},
+	}}}
+	role := testRoleWithSubjects("deploy", []string{"repo:owner/repo:environment:pull_request"})
+	g := graph.New()
+	if err := routinggithubactions.AddRoutes(g, workflows); err != nil {
+		t.Fatalf("add github actions routes: %v", err)
+	}
+
+	if err := AddRoutes(g, parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{role}}, workflows, "owner/repo"); err != nil {
+		t.Fatalf("add terraform routes: %v", err)
+	}
+
+	edge := onlyEdgeOfKind(t, g, graph.CanAssumeRole)
+	matches := edge.Metadata.AWSCanAssumeRole.Matches
+	if got := len(matches); got != 1 {
+		t.Fatalf("CanAssumeRole matches = %d, want 1: %#v", got, matches)
+	}
+	if matches[0].SubjectCandidate != "repo:owner/repo:environment:pull_request" {
+		t.Fatalf("subject candidate = %q, want environment pull_request subject", matches[0].SubjectCandidate)
+	}
+}
+
 func TestAddRoutesMatchesStringLikeSimpleWildcardSubject(t *testing.T) {
 	workflows := parsergithubactions.Resources{Workflows: []parsergithubactions.Workflow{{
 		Source:       parsergithubactions.Source{Filename: "/repo/.github/workflows/deploy.yml", RelativePath: ".github/workflows/deploy.yml", Document: 1},
@@ -511,10 +676,30 @@ func testRole(name, subject string) parserterraform.IAMRole {
 	}
 }
 
+func testRoleWithSubjects(name string, subjects []string) parserterraform.IAMRole {
+	role := testRole(name, "")
+	role.Trusts[0].SubjectPatterns = make([]parserterraform.SubjectPattern, 0, len(subjects))
+	for _, subject := range subjects {
+		role.Trusts[0].SubjectPatterns = append(role.Trusts[0].SubjectPatterns, parserterraform.SubjectPattern{
+			Operator: "StringEquals",
+			Pattern:  subject,
+		})
+	}
+	return role
+}
+
 func testRoleWithPermissions(name string, permissions []parserterraform.IAMPermission) parserterraform.IAMRole {
 	role := testRole(name, "repo:owner/repo:pull_request")
 	role.Permissions = permissions
 	return role
+}
+
+func canAssumeMatchSubjects(matches []graph.AWSCanAssumeRoleMatch) []string {
+	subjects := make([]string, 0, len(matches))
+	for _, match := range matches {
+		subjects = append(subjects, match.SubjectCandidate)
+	}
+	return subjects
 }
 
 func nodesOfKind(g *graph.Graph, kind graph.NodeKind) []graph.Node {

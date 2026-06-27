@@ -858,11 +858,23 @@ func TestGraphAWSCanAssumeRoleEdgeMetadataIsCloned(t *testing.T) {
 		SubjectOperator:  "StringEquals",
 		WorkflowFile:     ".github/workflows/deploy.yml",
 		Scope:            "workflow",
+		Matches: []AWSCanAssumeRoleMatch{{
+			Provider:         "aws",
+			RoleResourceName: "deploy",
+			TrustedIssuer:    "token.actions.githubusercontent.com",
+			StatementIndex:   0,
+			Audience:         "sts.amazonaws.com",
+			SubjectCandidate: "repo:owner/repo:pull_request",
+			SubjectPattern:   "repo:owner/repo:pull_request",
+			SubjectOperator:  "StringEquals",
+		}},
 	}}
 
 	added := mustAddEdge(t, g, edge)
 	edge.Metadata.AWSCanAssumeRole.SubjectCandidate = "changed"
+	edge.Metadata.AWSCanAssumeRole.Matches[0].SubjectCandidate = "changed"
 	added.Metadata.AWSCanAssumeRole.SubjectPattern = "changed"
+	added.Metadata.AWSCanAssumeRole.Matches[0].SubjectPattern = "changed"
 
 	got, ok := g.Edge(added.ID)
 	if !ok {
@@ -874,14 +886,21 @@ func TestGraphAWSCanAssumeRoleEdgeMetadataIsCloned(t *testing.T) {
 	if got.Metadata.AWSCanAssumeRole.SubjectCandidate != "repo:owner/repo:pull_request" || got.Metadata.AWSCanAssumeRole.SubjectPattern != "repo:owner/repo:pull_request" {
 		t.Fatalf("stored metadata changed: %#v", got.Metadata.AWSCanAssumeRole)
 	}
+	if len(got.Metadata.AWSCanAssumeRole.Matches) != 1 || got.Metadata.AWSCanAssumeRole.Matches[0].SubjectCandidate != "repo:owner/repo:pull_request" || got.Metadata.AWSCanAssumeRole.Matches[0].SubjectPattern != "repo:owner/repo:pull_request" {
+		t.Fatalf("stored match metadata changed: %#v", got.Metadata.AWSCanAssumeRole.Matches)
+	}
 
 	got.Metadata.AWSCanAssumeRole.SubjectOperator = "changed"
+	got.Metadata.AWSCanAssumeRole.Matches[0].SubjectOperator = "changed"
 	again, ok := g.Edge(added.ID)
 	if !ok {
 		t.Fatalf("edge %q not found after mutation", added.ID)
 	}
 	if again.Metadata.AWSCanAssumeRole.SubjectOperator != "StringEquals" {
 		t.Fatalf("returned metadata mutation changed graph: %#v", again.Metadata.AWSCanAssumeRole)
+	}
+	if again.Metadata.AWSCanAssumeRole.Matches[0].SubjectOperator != "StringEquals" {
+		t.Fatalf("returned match metadata mutation changed graph: %#v", again.Metadata.AWSCanAssumeRole.Matches)
 	}
 }
 
