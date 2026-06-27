@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -196,9 +197,195 @@ func TestParseDirParsesAWSS3BucketWithLiteralBucketName(t *testing.T) {
 		ResourceName: "artifacts",
 		BucketName:   "prod-artifacts",
 		Source:       Source{Filename: path, RelativePath: "s3.tf", ResourceType: "aws_s3_bucket", ResourceName: "artifacts"},
+		SensitivityReasons: []S3BucketSensitivityReason{{
+			Source:       "bucket_name",
+			MatchedToken: "prod",
+			SourceRef:    "s3.tf#resource=aws_s3_bucket.artifacts",
+		}},
 	}}
 	if !reflect.DeepEqual(resources.S3Buckets, want) {
 		t.Fatalf("s3 buckets = %#v, want %#v", resources.S3Buckets, want)
+	}
+}
+
+func TestParseDirClassifiesAWSS3BucketSensitivityFromNameTokens(t *testing.T) {
+	tests := []struct {
+		name       string
+		bucketName string
+		wantTokens []string
+	}{
+		{name: "prod data backups", bucketName: "prod-data-backups", wantTokens: []string{"backups", "prod"}},
+		{name: "mixed case prod data backups", bucketName: "Prod-Data-Backups", wantTokens: []string{"backups", "prod"}},
+		{name: "customer pii store", bucketName: "customer-pii-store", wantTokens: []string{"customer", "pii"}},
+		{name: "product is not prod", bucketName: "myproduct-assets"},
+		{name: "catalogs is not logs", bucketName: "catalogs"},
+		{name: "db full token only", bucketName: "db-backup", wantTokens: []string{"backup", "db"}},
+		{name: "dbbackup is not db", bucketName: "dbbackup"},
+		{name: "customerdb is not db", bucketName: "customerdb"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeTerraform(t, root, "s3.tf", `resource "aws_s3_bucket" "artifacts" {
+  bucket = "`+tt.bucketName+`"
+}
+`)
+
+			resources, err := ParseDir(root)
+			if err != nil {
+				t.Fatalf("parse dir: %v", err)
+			}
+			if len(resources.S3Buckets) != 1 {
+				t.Fatalf("s3 buckets = %#v, want one bucket", resources.S3Buckets)
+			}
+			if resources.S3Buckets[0].BucketName != tt.bucketName {
+				t.Fatalf("bucket name = %q, want literal %q", resources.S3Buckets[0].BucketName, tt.bucketName)
+			}
+			gotTokens := sensitivityNameTokens(resources.S3Buckets[0].SensitivityReasons)
+			if !reflect.DeepEqual(gotTokens, tt.wantTokens) {
+				t.Fatalf("tokens = %#v, want %#v", gotTokens, tt.wantTokens)
+			}
+			data, err := json.Marshal(resources)
+			if err != nil {
+				t.Fatalf("marshal resources: %v", err)
+			}
+			for _, forbidden := range []string{"resource \"aws_s3_bucket\"", "bucket ="} {
+				if strings.Contains(string(data), forbidden) {
+					t.Fatalf("parser output contains raw Terraform %q: %s", forbidden, data)
+				}
+			}
+		})
+	}
+}
+
+func TestParseDirClassifiesAWSS3BucketSensitivityFromAllowedStaticTags(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "s3.tf", `resource "aws_s3_bucket" "artifacts" {
+  bucket = "assets"
+  tags = {
+    DataClassification = "Sensitive"
+    "Classification" = "CONFIDENTIAL"
+    Environment = "production"
+  }
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.S3Buckets) != 1 {
+		t.Fatalf("s3 buckets = %#v, want one bucket", resources.S3Buckets)
+	}
+	got := resources.S3Buckets[0].SensitivityReasons
+	want := []S3BucketSensitivityReason{
+		{Source: "tag", Key: "Classification", Value: "confidential", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "tag", Key: "DataClassification", Value: "sensitive", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "tag", Key: "Environment", Value: "production", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sensitivity reasons = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseDirIgnoresUnsupportedAWSS3BucketSensitivityTags(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "s3.tf", `provider "aws" {
+  default_tags {
+    tags = {
+      Environment = "production"
+      DataClassification = "FAKE_TF_PROVIDER_TAG_SECRET_DO_NOT_RETAIN"
+    }
+  }
+}
+
+resource "aws_iam_role" "tagged" {
+  tags = {
+    DataClassification = "Sensitive"
+  }
+}
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "assets"
+  tags = {
+    Owner = "FAKE_TF_UNRELATED_TAG_SECRET_DO_NOT_RETAIN"
+    DataClassification = var.classification
+    Classification = "${var.classification}"
+    Sensitivity = upper("sensitive")
+    Environment = "dev"
+    "${var.dynamic_key}" = "Sensitive"
+  }
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.S3Buckets) != 1 {
+		t.Fatalf("s3 buckets = %#v, want one bucket", resources.S3Buckets)
+	}
+	if len(resources.S3Buckets[0].SensitivityReasons) != 0 {
+		t.Fatalf("sensitivity reasons = %#v, want none", resources.S3Buckets[0].SensitivityReasons)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{
+		"FAKE_TF_PROVIDER_TAG_SECRET_DO_NOT_RETAIN",
+		"FAKE_TF_UNRELATED_TAG_SECRET_DO_NOT_RETAIN",
+		"Owner",
+		"dev",
+		"var.classification",
+		"${",
+		"upper(",
+		"default_tags",
+		"tags",
+	} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestParseDirAWSS3BucketSensitivityReasonsAreDedupeSortedAndSanitized(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "s3.tf", `resource "aws_s3_bucket" "artifacts" {
+  bucket = "prod-prod-pii"
+  tags = {
+    Environment = "PROD"
+    Environment = "prod"
+    Sensitivity = "PII"
+    Owner = "FAKE_TF_SORTED_TAG_SECRET_DO_NOT_RETAIN"
+  }
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.S3Buckets) != 1 {
+		t.Fatalf("s3 buckets = %#v, want one bucket", resources.S3Buckets)
+	}
+	got := resources.S3Buckets[0].SensitivityReasons
+	want := []S3BucketSensitivityReason{
+		{Source: "bucket_name", MatchedToken: "pii", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "bucket_name", MatchedToken: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "tag", Key: "Environment", Value: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "tag", Key: "Sensitivity", Value: "pii", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sensitivity reasons = %#v, want %#v", got, want)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	if strings.Contains(string(data), "FAKE_TF_SORTED_TAG_SECRET_DO_NOT_RETAIN") || strings.Contains(string(data), "Owner") {
+		t.Fatalf("parser output retained unrelated tag: %s", data)
 	}
 }
 
@@ -228,6 +415,13 @@ func TestParseDirIgnoresAWSS3BucketWithoutStaticLiteralBucketName(t *testing.T) 
 `,
 		},
 		{
+			name: "underscore bucket",
+			terraform: `resource "aws_s3_bucket" "artifacts" {
+  bucket = "prod_data_backups"
+}
+`,
+		},
+		{
 			name: "secret-like bucket",
 			terraform: `resource "aws_s3_bucket" "artifacts" {
   bucket = "prod-token-artifacts"
@@ -251,7 +445,7 @@ func TestParseDirIgnoresAWSS3BucketWithoutStaticLiteralBucketName(t *testing.T) 
 			if err != nil {
 				t.Fatalf("marshal resources: %v", err)
 			}
-			for _, forbidden := range []string{"${", "local.bucket_name", "prod-token-artifacts"} {
+			for _, forbidden := range []string{"${", "local.bucket_name", "prod_data_backups", "prod-token-artifacts"} {
 				if strings.Contains(string(data), forbidden) {
 					t.Fatalf("parser output contains %q: %s", forbidden, data)
 				}
@@ -965,6 +1159,17 @@ EOF
 
 func validTrustPolicyJSON(subject string) string {
 	return `{"Statement":{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com","token.actions.githubusercontent.com:sub":"` + subject + `"}}}}`
+}
+
+func sensitivityNameTokens(reasons []S3BucketSensitivityReason) []string {
+	var tokens []string
+	for _, reason := range reasons {
+		if reason.Source == "bucket_name" {
+			tokens = append(tokens, reason.MatchedToken)
+		}
+	}
+	sort.Strings(tokens)
+	return tokens
 }
 
 func writeTerraform(t *testing.T, root, name, content string) string {

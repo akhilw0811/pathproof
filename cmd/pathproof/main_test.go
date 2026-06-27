@@ -702,6 +702,53 @@ permissions: write-all
 	assertDoesNotContainCrossDomainS3SecretValues(t, stdout, stderr)
 }
 
+func TestRunScanS3SensitivityMetadataDoesNotCreateFindingsOrPublicJSONGraphMetadata(t *testing.T) {
+	dir := t.TempDir()
+	writeTerraformForTest(t, dir, "infra/s3.tf", `provider "aws" {
+  access_key = "FAKE_CLI_S3_SENSITIVITY_ACCESS_KEY_DO_NOT_RETAIN"
+}
+
+resource "aws_s3_bucket" "backups" {
+  bucket = "prod-data-backups"
+  tags = {
+    DataClassification = "Sensitive"
+    Owner = "FAKE_CLI_S3_SENSITIVITY_TAG_SECRET_DO_NOT_RETAIN"
+  }
+}
+`)
+
+	humanStdout, humanStderr, humanCode := runCommand("scan", dir)
+	assertCode(t, humanCode, 0)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "human stdout", humanStdout, "Finding count: 0\nNo findings.\n")
+
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", dir)
+	assertCode(t, jsonCode, 0)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("JSON report = %#v, want no findings", report)
+	}
+	for _, forbidden := range []string{"sensitivity", "prod-data-backups", "DataClassification", "Owner", "FAKE_CLI_S3_SENSITIVITY"} {
+		if strings.Contains(jsonStdout, forbidden) || strings.Contains(jsonStderr, forbidden) || strings.Contains(humanStdout, forbidden) || strings.Contains(humanStderr, forbidden) {
+			t.Fatalf("public output contains graph metadata or secret-like value %q\nhuman stdout:%s\njson stdout:%s", forbidden, humanStdout, jsonStdout)
+		}
+	}
+
+	sarifStdout, sarifStderr, sarifCode := runCommand("scan", "--format=sarif", dir)
+	assertCode(t, sarifCode, 0)
+	assertString(t, "sarif stderr", sarifStderr, "")
+	sarif := assertValidSARIFReport(t, sarifStdout)
+	if len(sarif.Runs[0].Results) != 0 {
+		t.Fatalf("SARIF results = %#v, want none", sarif.Runs[0].Results)
+	}
+	for _, forbidden := range []string{"sensitivity", "prod-data-backups", "DataClassification", "Owner", "FAKE_CLI_S3_SENSITIVITY"} {
+		if strings.Contains(sarifStdout, forbidden) || strings.Contains(sarifStderr, forbidden) {
+			t.Fatalf("SARIF output contains graph metadata or secret-like value %q\nstdout:%s", forbidden, sarifStdout)
+		}
+	}
+}
+
 func TestScanDirectoryWithRepoCreatesTerraformCanAssumeRoleGraphEdge(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on:

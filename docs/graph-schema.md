@@ -38,7 +38,8 @@ stable deterministic hashes of typed identities.
   Node names use `aws://terraform/aws_permission/<sha256>`, where the hash is
   over canonical sanitized permission identity.
 - `AWSS3Bucket`: a supported local Terraform `aws_s3_bucket` with a safe
-  literal bucket name. Node names use
+  literal bucket name and optional conservative local sensitivity metadata.
+  Node names use
   `aws://terraform/aws_s3_bucket/<relative-tf-path>/<resource_name>`.
 
 ## Edge Kinds
@@ -450,11 +451,42 @@ call GitHub.
       "provider": "aws",
       "bucket_name": "prod-artifacts",
       "resource_name": "artifacts",
-      "source_reference": "infra/s3.tf#resource=aws_s3_bucket.artifacts"
+      "source_reference": "infra/s3.tf#resource=aws_s3_bucket.artifacts",
+      "sensitivity_level": "sensitive",
+      "sensitivity_reasons": [
+        {
+          "source": "bucket_name",
+          "matched_token": "prod",
+          "source_ref": "infra/s3.tf#resource=aws_s3_bucket.artifacts"
+        },
+        {
+          "source": "tag",
+          "key": "DataClassification",
+          "value": "sensitive",
+          "source_ref": "infra/s3.tf#resource=aws_s3_bucket.artifacts"
+        }
+      ]
     }
   }
 }
 ```
+
+`sensitivity_level` is always `unknown` or `sensitive`.
+`sensitivity_reasons` is always a deterministic list and is empty when the
+level is `unknown`. Bucket-name reasons store only the allowlisted matched
+token and source reference. Tag reasons store only the allowlisted tag key,
+the allowlisted tag value canonically lowercased, and source reference.
+Reasons are deduplicated and sorted deterministically.
+
+Bucket-name sensitivity uses case-insensitive full-token matching over
+alphanumeric runs split by non-alphanumeric delimiters such as hyphen, dot,
+underscore, and similar separators. It does not match substrings: `prod` does
+not match `myproduct`, `logs` does not match `catalogs`, and `db` does not
+match `dbbackup` or `customerdb`. Tag sensitivity uses only simple static
+literal `tags = { ... }` values directly on the same `aws_s3_bucket` resource
+for allowlisted keys and values. Provider/default tags, variables, locals,
+modules, functions, `jsonencode`, dynamic/interpolated keys or values,
+unsupported keys or values, and tags from other resources are ignored.
 
 S3 access edges include typed metadata with one deduplicated, sorted grant list
 per role, bucket, and access mode:
@@ -494,8 +526,9 @@ on an object ARN creates both read and write access. `Action "*"`, `s3:*`
 with `Resource "*"`, `s3:*Object`, `NotAction`, `NotResource`, conditions,
 wildcard bucket ARNs, wildcard prefixes, dynamic/interpolated ARNs,
 AdministratorAccess, and administrative permission metadata do not create S3
-access edges. Raw Terraform, raw policy JSON, tags, provider credentials, and
-secret-like values are not stored.
+access edges. Raw Terraform, raw policy JSON, unrelated tags, provider
+credentials, backend config, environment values, access keys, tokens, secrets,
+raw source text, unsupported values, and secret-like values are not stored.
 
 PathProof's static Secret read model is:
 
@@ -702,7 +735,8 @@ fields, plus the AWS role node ID, S3 bucket node ID, access mode, ordered S3
 access edge ID, and ordered sanitized S3 grant identities. The grant identity
 uses access mode, access kind, action, resource, policy resource name, attached
 role resource name, and statement index. Evidence prose, source-reference
-display paths, raw policy JSON, and absolute paths are not part of identity.
+display paths, raw policy JSON, absolute paths, and S3 bucket sensitivity
+metadata are not part of identity.
 
 Finding evidence preserves the complete ordered edge evidence for the matched
 path. `source_references` are derived from those edge evidence sources in

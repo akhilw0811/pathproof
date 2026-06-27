@@ -36,10 +36,19 @@ type IAMRole struct {
 }
 
 type S3Bucket struct {
-	ResourceType string `json:"resource_type"`
-	ResourceName string `json:"resource_name"`
-	BucketName   string `json:"bucket_name"`
-	Source       Source `json:"source"`
+	ResourceType       string                      `json:"resource_type"`
+	ResourceName       string                      `json:"resource_name"`
+	BucketName         string                      `json:"bucket_name"`
+	Source             Source                      `json:"source"`
+	SensitivityReasons []S3BucketSensitivityReason `json:"sensitivity_reasons,omitempty"`
+}
+
+type S3BucketSensitivityReason struct {
+	Source       string `json:"source"`
+	MatchedToken string `json:"matched_token,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Value        string `json:"value,omitempty"`
+	SourceRef    string `json:"source_ref"`
 }
 
 type OIDCTrust struct {
@@ -192,11 +201,13 @@ func parseTerraform(root, filename, content string) (Resources, error) {
 			if !bucketName.ok || !supportedS3BucketName(bucketName.value) {
 				continue
 			}
+			reasons := s3BucketSensitivityReasons(block.body, bucketName.value, block.source)
 			buckets = append(buckets, S3Bucket{
-				ResourceType: block.resourceType,
-				ResourceName: block.resourceName,
-				BucketName:   bucketName.value,
-				Source:       block.source,
+				ResourceType:       block.resourceType,
+				ResourceName:       block.resourceName,
+				BucketName:         bucketName.value,
+				Source:             block.source,
+				SensitivityReasons: reasons,
 			})
 		case "aws_iam_role_policy", "aws_iam_role_policy_attachment":
 			permissionBlocks = append(permissionBlocks, block)
@@ -670,6 +681,7 @@ func supportedS3BucketName(value string) bool {
 	for _, r := range value {
 		switch {
 		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
 		case r >= '0' && r <= '9':
 		case r == '.' || r == '-':
 		default:
@@ -677,6 +689,286 @@ func supportedS3BucketName(value string) bool {
 		}
 	}
 	return !strings.Contains(value, "*") && !strings.Contains(value, "/")
+}
+
+func s3BucketSensitivityReasons(body, bucketName string, source Source) []S3BucketSensitivityReason {
+	reasons := make([]S3BucketSensitivityReason, 0)
+	sourceRef := relativeSourceRef(source)
+	for _, token := range s3BucketNameSensitivityTokens(bucketName) {
+		reasons = append(reasons, S3BucketSensitivityReason{
+			Source:       "bucket_name",
+			MatchedToken: token,
+			SourceRef:    sourceRef,
+		})
+	}
+	for _, tag := range s3BucketSensitivityTags(body, sourceRef) {
+		reasons = append(reasons, tag)
+	}
+	return dedupeSortS3BucketSensitivityReasons(reasons)
+}
+
+func s3BucketNameSensitivityTokens(bucketName string) []string {
+	seen := make(map[string]struct{})
+	var tokens []string
+	for _, token := range splitS3BucketNameTokens(bucketName) {
+		if !s3SensitiveNameToken(token) {
+			continue
+		}
+		if _, ok := seen[token]; ok {
+			continue
+		}
+		seen[token] = struct{}{}
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	return tokens
+}
+
+func splitS3BucketNameTokens(bucketName string) []string {
+	var tokens []string
+	var current strings.Builder
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		tokens = append(tokens, strings.ToLower(current.String()))
+		current.Reset()
+	}
+	for _, r := range bucketName {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			current.WriteRune(unicode.ToLower(r))
+			continue
+		}
+		flush()
+	}
+	flush()
+	return tokens
+}
+
+func s3SensitiveNameToken(token string) bool {
+	switch token {
+	case "prod", "production", "backup", "backups", "db", "database", "customer", "customers", "pii", "phi", "financial", "finance", "payroll", "billing", "invoice", "invoices", "logs", "audit":
+		return true
+	default:
+		return false
+	}
+}
+
+func s3BucketSensitivityTags(body, sourceRef string) []S3BucketSensitivityReason {
+	tagBody, ok := topLevelObjectAttributeBody(body, "tags")
+	if !ok {
+		return nil
+	}
+	var reasons []S3BucketSensitivityReason
+	for _, tag := range staticLiteralObjectStringPairs(tagBody) {
+		key, value := tag[0], tag[1]
+		if !s3SensitiveTagKey(key) {
+			continue
+		}
+		canonicalValue := strings.ToLower(value)
+		if !s3SensitiveTagValue(canonicalValue) {
+			continue
+		}
+		reasons = append(reasons, S3BucketSensitivityReason{
+			Source:    "tag",
+			Key:       key,
+			Value:     canonicalValue,
+			SourceRef: sourceRef,
+		})
+	}
+	return dedupeSortS3BucketSensitivityReasons(reasons)
+}
+
+func topLevelObjectAttributeBody(body, name string) (string, bool) {
+	depth := 0
+	for i := 0; i < len(body); {
+		next, err := skipIgnored(body, i)
+		if err != nil {
+			return "", false
+		}
+		if next != i {
+			i = next
+			continue
+		}
+		if depth == 0 && hasIdentifierAt(body, i, name) {
+			i += len(name)
+			i = skipSpaceAndComments(body, i)
+			if i >= len(body) || body[i] != '=' {
+				continue
+			}
+			i = skipSpaceAndComments(body, i+1)
+			if i >= len(body) || body[i] != '{' {
+				return "", false
+			}
+			end, err := matchingBrace(body, i)
+			if err != nil {
+				return "", false
+			}
+			return body[i+1 : end], true
+		}
+		switch body[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		}
+		i++
+	}
+	return "", false
+}
+
+func staticLiteralObjectStringPairs(body string) [][2]string {
+	var pairs [][2]string
+	depth := 0
+	for i := 0; i < len(body); {
+		if depth == 0 {
+			next := skipSpaceAndComments(body, i)
+			if next != i {
+				i = next
+				continue
+			}
+			if i >= len(body) {
+				break
+			}
+			key, next, ok := parseStaticObjectKey(body, i)
+			if ok {
+				i = skipSpaceAndComments(body, next)
+				if i < len(body) && body[i] == '=' {
+					i = skipSpaceAndComments(body, i+1)
+					if i < len(body) && body[i] == '"' {
+						value, end, ok := parseQuotedString(body, i)
+						if ok && !containsTerraformTemplate(value) && objectValueEnds(body, end) {
+							pairs = append(pairs, [2]string{key, value})
+							i = end
+							continue
+						}
+					}
+				}
+			}
+		}
+		next, err := skipIgnored(body, i)
+		if err != nil {
+			return pairs
+		}
+		if next != i {
+			i = next
+			continue
+		}
+		if i >= len(body) {
+			break
+		}
+		switch body[i] {
+		case '{', '[', '(':
+			depth++
+		case '}', ']', ')':
+			if depth > 0 {
+				depth--
+			}
+		}
+		i++
+	}
+	return pairs
+}
+
+func parseStaticObjectKey(body string, i int) (string, int, bool) {
+	if i >= len(body) {
+		return "", i, false
+	}
+	if body[i] == '"' {
+		value, end, ok := parseQuotedString(body, i)
+		if !ok || value == "" || containsTerraformTemplate(value) {
+			return "", i, false
+		}
+		return value, end, true
+	}
+	if !(body[i] == '_' || unicode.IsLetter(rune(body[i]))) {
+		return "", i, false
+	}
+	start := i
+	for i < len(body) {
+		r := rune(body[i])
+		if !(r == '_' || r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			break
+		}
+		i++
+	}
+	if i == start {
+		return "", start, false
+	}
+	return body[start:i], i, true
+}
+
+func objectValueEnds(body string, i int) bool {
+	for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+		i++
+	}
+	if i >= len(body) {
+		return true
+	}
+	if body[i] == '\n' || body[i] == '\r' || body[i] == ',' || body[i] == '}' || body[i] == '#' || strings.HasPrefix(body[i:], "//") {
+		return true
+	}
+	return false
+}
+
+func s3SensitiveTagKey(key string) bool {
+	switch key {
+	case "DataClassification", "Classification", "Sensitivity", "Environment":
+		return true
+	default:
+		return false
+	}
+}
+
+func s3SensitiveTagValue(value string) bool {
+	switch value {
+	case "sensitive", "confidential", "restricted", "private", "pii", "phi", "production", "prod":
+		return true
+	default:
+		return false
+	}
+}
+
+func dedupeSortS3BucketSensitivityReasons(reasons []S3BucketSensitivityReason) []S3BucketSensitivityReason {
+	if len(reasons) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(reasons))
+	out := make([]S3BucketSensitivityReason, 0, len(reasons))
+	for _, reason := range reasons {
+		key := s3BucketSensitivityReasonKey(reason)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, reason)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return s3BucketSensitivityReasonKey(out[i]) < s3BucketSensitivityReasonKey(out[j])
+	})
+	return out
+}
+
+func s3BucketSensitivityReasonKey(reason S3BucketSensitivityReason) string {
+	data, err := json.Marshal(struct {
+		Source       string `json:"source"`
+		MatchedToken string `json:"matched_token,omitempty"`
+		Key          string `json:"key,omitempty"`
+		Value        string `json:"value,omitempty"`
+		SourceRef    string `json:"source_ref"`
+	}{
+		Source:       reason.Source,
+		MatchedToken: reason.MatchedToken,
+		Key:          reason.Key,
+		Value:        reason.Value,
+		SourceRef:    reason.SourceRef,
+	})
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func strictStringList(value any) ([]string, bool) {

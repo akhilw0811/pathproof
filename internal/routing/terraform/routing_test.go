@@ -181,13 +181,109 @@ func TestAddRoutesCreatesAWSS3BucketNodeWithSanitizedMetadata(t *testing.T) {
 		t.Fatalf("bucket metadata = %#v, want aws s3 bucket metadata", got.Metadata)
 	}
 	want := graph.AWSS3BucketMetadata{
-		Provider:        "aws",
-		BucketName:      "prod-artifacts",
-		ResourceName:    "artifacts",
-		SourceReference: "/repo/s3.tf#resource=aws_s3_bucket.artifacts",
+		Provider:           "aws",
+		BucketName:         "prod-artifacts",
+		ResourceName:       "artifacts",
+		SourceReference:    "/repo/s3.tf#resource=aws_s3_bucket.artifacts",
+		SensitivityLevel:   "unknown",
+		SensitivityReasons: []graph.AWSS3BucketSensitivityReason{},
 	}
 	if !reflect.DeepEqual(*got.Metadata.AWSS3Bucket, want) {
 		t.Fatalf("metadata = %#v, want %#v", *got.Metadata.AWSS3Bucket, want)
+	}
+	data, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("marshal graph: %v", err)
+	}
+	if !strings.Contains(string(data), `"sensitivity_level":"unknown"`) || !strings.Contains(string(data), `"sensitivity_reasons":[]`) {
+		t.Fatalf("graph JSON missing explicit unknown sensitivity metadata: %s", data)
+	}
+}
+
+func TestAddRoutesCreatesAWSS3BucketSensitivityMetadata(t *testing.T) {
+	resources := parserterraform.Resources{S3Buckets: []parserterraform.S3Bucket{testS3BucketWithReasons("artifacts", "prod-artifacts", []parserterraform.S3BucketSensitivityReason{
+		{Source: "tag", Key: "DataClassification", Value: "sensitive", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "bucket_name", MatchedToken: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+	})}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	bucket := onlyNodeOfKind(t, g, graph.AWSS3Bucket)
+	got := bucket.Metadata.AWSS3Bucket
+	wantReasons := []graph.AWSS3BucketSensitivityReason{
+		{Source: "bucket_name", MatchedToken: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "tag", Key: "DataClassification", Value: "sensitive", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+	}
+	if got.SensitivityLevel != "sensitive" || !reflect.DeepEqual(got.SensitivityReasons, wantReasons) {
+		t.Fatalf("sensitivity metadata = %#v, want level sensitive reasons %#v", got, wantReasons)
+	}
+}
+
+func TestAddRoutesAWSS3BucketSensitivityReasonsDedupedAndGraphJSONDeterministic(t *testing.T) {
+	firstResources := parserterraform.Resources{S3Buckets: []parserterraform.S3Bucket{testS3BucketWithReasons("artifacts", "prod-artifacts", []parserterraform.S3BucketSensitivityReason{
+		{Source: "tag", Key: "Environment", Value: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "bucket_name", MatchedToken: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		{Source: "tag", Key: "Environment", Value: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+	})}}
+	secondResources := parserterraform.Resources{S3Buckets: []parserterraform.S3Bucket{testS3BucketWithReasons("artifacts", "prod-artifacts", []parserterraform.S3BucketSensitivityReason{
+		firstResources.S3Buckets[0].SensitivityReasons[2],
+		firstResources.S3Buckets[0].SensitivityReasons[1],
+		firstResources.S3Buckets[0].SensitivityReasons[0],
+	})}}
+	first := graph.New()
+	second := graph.New()
+
+	if err := AddRoutes(first, firstResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add first routes: %v", err)
+	}
+	if err := AddRoutes(second, secondResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add second routes: %v", err)
+	}
+
+	firstJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+	}
+	secondJSON, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second: %v", err)
+	}
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("graph JSON differs:\nfirst: %s\nsecond:%s", firstJSON, secondJSON)
+	}
+	bucket := onlyNodeOfKind(t, first, graph.AWSS3Bucket)
+	if got := len(bucket.Metadata.AWSS3Bucket.SensitivityReasons); got != 2 {
+		t.Fatalf("deduped sensitivity reasons = %d, want 2: %#v", got, bucket.Metadata.AWSS3Bucket.SensitivityReasons)
+	}
+}
+
+func TestAddRoutesAWSS3BucketGraphJSONExcludesUnsupportedSensitivityInputs(t *testing.T) {
+	resources := parserterraform.Resources{S3Buckets: []parserterraform.S3Bucket{testS3BucketWithReasons("artifacts", "assets", []parserterraform.S3BucketSensitivityReason{
+		{Source: "tag", Key: "Environment", Value: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+	})}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	data, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("marshal graph: %v", err)
+	}
+	output := string(data)
+	for _, want := range []string{"sensitivity_level", "sensitive", "sensitivity_reasons", "Environment", "prod"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("graph JSON missing %q: %s", want, output)
+		}
+	}
+	for _, forbidden := range []string{"FAKE_TF_TAG_SECRET_DO_NOT_RETAIN", "Owner", "access_key", "backend", "token", "assume_role_policy", "Statement", "policy ="} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("graph JSON contains %q: %s", forbidden, output)
+		}
 	}
 }
 
@@ -390,7 +486,9 @@ func TestAddRoutesS3AccessGrantsDedupedAggregatedAndDeterministic(t *testing.T) 
 
 func TestAddRoutesS3AccessMetadataIsCloned(t *testing.T) {
 	resources := parserterraform.Resources{
-		S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")},
+		S3Buckets: []parserterraform.S3Bucket{testS3BucketWithReasons("artifacts", "prod-artifacts", []parserterraform.S3BucketSensitivityReason{
+			{Source: "bucket_name", MatchedToken: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"},
+		})},
 		IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
 			testS3Permission("deploy", "read", 0, "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
 		})},
@@ -408,9 +506,13 @@ func TestAddRoutesS3AccessMetadataIsCloned(t *testing.T) {
 	}
 	bucket := onlyNodeOfKind(t, g, graph.AWSS3Bucket)
 	bucket.Metadata.AWSS3Bucket.BucketName = "changed"
+	bucket.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken = "changed"
 	storedBucket := onlyNodeOfKind(t, g, graph.AWSS3Bucket)
 	if storedBucket.Metadata.AWSS3Bucket.BucketName != "prod-artifacts" {
 		t.Fatalf("stored bucket name = %q, want original", storedBucket.Metadata.AWSS3Bucket.BucketName)
+	}
+	if storedBucket.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken != "prod" {
+		t.Fatalf("stored sensitivity token = %q, want original", storedBucket.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken)
 	}
 }
 
@@ -956,6 +1058,12 @@ func testS3Bucket(resourceName, bucketName string) parserterraform.S3Bucket {
 			ResourceName: resourceName,
 		},
 	}
+}
+
+func testS3BucketWithReasons(resourceName, bucketName string, reasons []parserterraform.S3BucketSensitivityReason) parserterraform.S3Bucket {
+	bucket := testS3Bucket(resourceName, bucketName)
+	bucket.SensitivityReasons = reasons
+	return bucket
 }
 
 func testS3Permission(roleName, policyName string, statementIndex int, action, resource string) parserterraform.IAMPermission {
