@@ -1,0 +1,10 @@
+name: Unsafe S3 deploy
+on: pull_request_target
+
+permissions: write-all
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "example deploy"

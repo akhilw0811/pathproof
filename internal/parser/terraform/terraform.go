@@ -15,7 +15,8 @@ import (
 const githubActionsIssuer = "token.actions.githubusercontent.com"
 
 type Resources struct {
-	IAMRoles []IAMRole `json:"iam_roles,omitempty"`
+	IAMRoles  []IAMRole  `json:"iam_roles,omitempty"`
+	S3Buckets []S3Bucket `json:"s3_buckets,omitempty"`
 }
 
 type Source struct {
@@ -32,6 +33,13 @@ type IAMRole struct {
 	Source       Source          `json:"source"`
 	Trusts       []OIDCTrust     `json:"trusts,omitempty"`
 	Permissions  []IAMPermission `json:"permissions,omitempty"`
+}
+
+type S3Bucket struct {
+	ResourceType string `json:"resource_type"`
+	ResourceName string `json:"resource_name"`
+	BucketName   string `json:"bucket_name"`
+	Source       Source `json:"source"`
 }
 
 type OIDCTrust struct {
@@ -120,10 +128,19 @@ func ParseDir(root string) (Resources, error) {
 			return Resources{}, err
 		}
 		resources.IAMRoles = append(resources.IAMRoles, fileResources.IAMRoles...)
+		resources.S3Buckets = append(resources.S3Buckets, fileResources.S3Buckets...)
 	}
 	sort.SliceStable(resources.IAMRoles, func(i, j int) bool {
 		a := resources.IAMRoles[i]
 		b := resources.IAMRoles[j]
+		if a.Source.RelativePath != b.Source.RelativePath {
+			return a.Source.RelativePath < b.Source.RelativePath
+		}
+		return a.ResourceName < b.ResourceName
+	})
+	sort.SliceStable(resources.S3Buckets, func(i, j int) bool {
+		a := resources.S3Buckets[i]
+		b := resources.S3Buckets[j]
 		if a.Source.RelativePath != b.Source.RelativePath {
 			return a.Source.RelativePath < b.Source.RelativePath
 		}
@@ -147,6 +164,7 @@ func parseTerraform(root, filename, content string) (Resources, error) {
 	}
 	roles := make(map[string]*iamRoleRecord)
 	var roleOrder []string
+	var buckets []S3Bucket
 	var permissionBlocks []resourceBlock
 	for _, block := range blocks {
 		switch block.resourceType {
@@ -169,6 +187,17 @@ func parseTerraform(root, filename, content string) (Resources, error) {
 			}
 			roles[block.resourceName] = &iamRoleRecord{role: role, include: include}
 			roleOrder = append(roleOrder, block.resourceName)
+		case "aws_s3_bucket":
+			bucketName := quotedStringAttribute(block.body, "bucket")
+			if !bucketName.ok || !supportedS3BucketName(bucketName.value) {
+				continue
+			}
+			buckets = append(buckets, S3Bucket{
+				ResourceType: block.resourceType,
+				ResourceName: block.resourceName,
+				BucketName:   bucketName.value,
+				Source:       block.source,
+			})
 		case "aws_iam_role_policy", "aws_iam_role_policy_attachment":
 			permissionBlocks = append(permissionBlocks, block)
 		}
@@ -214,7 +243,10 @@ func parseTerraform(root, filename, content string) (Resources, error) {
 		role.include = true
 	}
 
-	resources := Resources{IAMRoles: make([]IAMRole, 0, len(roles))}
+	resources := Resources{
+		IAMRoles:  make([]IAMRole, 0, len(roles)),
+		S3Buckets: append([]S3Bucket(nil), buckets...),
+	}
 	for _, name := range roleOrder {
 		record := roles[name]
 		if !record.include {
@@ -223,6 +255,14 @@ func parseTerraform(root, filename, content string) (Resources, error) {
 		sortPermissions(record.role.Permissions)
 		resources.IAMRoles = append(resources.IAMRoles, record.role)
 	}
+	sort.SliceStable(resources.S3Buckets, func(i, j int) bool {
+		a := resources.S3Buckets[i]
+		b := resources.S3Buckets[j]
+		if a.Source.RelativePath != b.Source.RelativePath {
+			return a.Source.RelativePath < b.Source.RelativePath
+		}
+		return a.ResourceName < b.ResourceName
+	})
 	return resources, nil
 }
 
@@ -270,7 +310,7 @@ func resourceBlocks(root, filename, content string) ([]resourceBlock, error) {
 
 func supportedResourceType(resourceType string) bool {
 	switch resourceType {
-	case "aws_iam_role", "aws_iam_role_policy", "aws_iam_role_policy_attachment":
+	case "aws_iam_role", "aws_iam_role_policy", "aws_iam_role_policy_attachment", "aws_s3_bucket":
 		return true
 	default:
 		return false
@@ -519,6 +559,9 @@ func permissionsFromStatement(index int, statement map[string]any, source Source
 	if _, hasNotAction := statement["NotAction"]; hasNotAction {
 		return nil
 	}
+	if _, hasNotResource := statement["NotResource"]; hasNotResource {
+		return nil
+	}
 	if _, hasCondition := statement["Condition"]; hasCondition {
 		return nil
 	}
@@ -580,17 +623,12 @@ func supportedIAMAction(value string) bool {
 	if value == "" || containsTerraformTemplate(value) || containsSecretLike(value) {
 		return false
 	}
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '*' || r == ':' || r == '_' || r == '-':
-		default:
-			return false
-		}
+	switch value {
+	case "*", "*:*", "s3:GetObject", "s3:ListBucket", "s3:PutObject", "s3:DeleteObject", "s3:*":
+		return true
+	default:
+		return false
 	}
-	return true
 }
 
 func supportedIAMResources(value any) []string {
@@ -600,11 +638,45 @@ func supportedIAMResources(value any) []string {
 	}
 	var supported []string
 	for _, value := range values {
-		if value == "*" {
+		if value == "*" || supportedS3ResourceARN(value) {
 			supported = append(supported, value)
 		}
 	}
 	return uniqueStrings(supported)
+}
+
+func supportedS3ResourceARN(value string) bool {
+	if value == "" || containsTerraformTemplate(value) || containsSecretLike(value) {
+		return false
+	}
+	const prefix = "arn:aws:s3:::"
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	target := strings.TrimPrefix(value, prefix)
+	bucket := target
+	if strings.HasSuffix(target, "/*") {
+		bucket = strings.TrimSuffix(target, "/*")
+	} else if strings.Contains(target, "/") {
+		return false
+	}
+	return supportedS3BucketName(bucket)
+}
+
+func supportedS3BucketName(value string) bool {
+	if value == "" || containsTerraformTemplate(value) || containsSecretLike(value) {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '-':
+		default:
+			return false
+		}
+	}
+	return !strings.Contains(value, "*") && !strings.Contains(value, "/")
 }
 
 func strictStringList(value any) ([]string, bool) {

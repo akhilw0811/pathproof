@@ -179,6 +179,213 @@ resource "aws_iam_role_policy_attachment" "admin" {
 	}
 }
 
+func TestParseDirParsesAWSS3BucketWithLiteralBucketName(t *testing.T) {
+	root := t.TempDir()
+	path := writeTerraform(t, root, "s3.tf", `resource "aws_s3_bucket" "artifacts" {
+  bucket = "prod-artifacts"
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []S3Bucket{{
+		ResourceType: "aws_s3_bucket",
+		ResourceName: "artifacts",
+		BucketName:   "prod-artifacts",
+		Source:       Source{Filename: path, RelativePath: "s3.tf", ResourceType: "aws_s3_bucket", ResourceName: "artifacts"},
+	}}
+	if !reflect.DeepEqual(resources.S3Buckets, want) {
+		t.Fatalf("s3 buckets = %#v, want %#v", resources.S3Buckets, want)
+	}
+}
+
+func TestParseDirIgnoresAWSS3BucketWithoutStaticLiteralBucketName(t *testing.T) {
+	tests := []struct {
+		name      string
+		terraform string
+	}{
+		{
+			name: "omitted bucket",
+			terraform: `resource "aws_s3_bucket" "artifacts" {
+}
+`,
+		},
+		{
+			name: "interpolated bucket",
+			terraform: `resource "aws_s3_bucket" "artifacts" {
+  bucket = "prod-${var.name}"
+}
+`,
+		},
+		{
+			name: "reference bucket",
+			terraform: `resource "aws_s3_bucket" "artifacts" {
+  bucket = local.bucket_name
+}
+`,
+		},
+		{
+			name: "secret-like bucket",
+			terraform: `resource "aws_s3_bucket" "artifacts" {
+  bucket = "prod-token-artifacts"
+}
+`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeTerraform(t, root, "s3.tf", tt.terraform)
+
+			resources, err := ParseDir(root)
+			if err != nil {
+				t.Fatalf("parse dir: %v", err)
+			}
+			if len(resources.S3Buckets) != 0 {
+				t.Fatalf("s3 buckets = %#v, want none", resources.S3Buckets)
+			}
+			data, err := json.Marshal(resources)
+			if err != nil {
+				t.Fatalf("marshal resources: %v", err)
+			}
+			for _, forbidden := range []string{"${", "local.bucket_name", "prod-token-artifacts"} {
+				if strings.Contains(string(data), forbidden) {
+					t.Fatalf("parser output contains %q: %s", forbidden, data)
+				}
+			}
+		})
+	}
+}
+
+func TestParseDirAWSS3BucketOutputExcludesTagsAndProviderValues(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "s3.tf", `provider "aws" {
+  access_key = "FAKE_TF_S3_ACCESS_KEY_DO_NOT_RETAIN"
+}
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "prod-artifacts"
+  tags = {
+    Owner = "FAKE_TF_S3_TAG_SECRET_DO_NOT_RETAIN"
+  }
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.S3Buckets) != 1 {
+		t.Fatalf("s3 buckets = %#v, want one", resources.S3Buckets)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"FAKE_TF_S3_ACCESS_KEY_DO_NOT_RETAIN", "FAKE_TF_S3_TAG_SECRET_DO_NOT_RETAIN", "access_key", "tags"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestParseDirParsesInlineS3ReadPolicyForStaticBucketARNs(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "iam.tf", `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "read_artifacts" {
+  role = aws_iam_role.deploy.id
+  policy = `+strconvQuote(`{"Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::prod-artifacts"},{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::prod-artifacts/*"}]}`)+`
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.IAMRoles) != 1 || len(resources.IAMRoles[0].Permissions) != 2 {
+		t.Fatalf("resources = %#v, want two S3 read permissions", resources)
+	}
+	gotActions := []string{resources.IAMRoles[0].Permissions[0].Actions[0], resources.IAMRoles[0].Permissions[1].Actions[0]}
+	gotResources := []string{resources.IAMRoles[0].Permissions[0].Resources[0], resources.IAMRoles[0].Permissions[1].Resources[0]}
+	wantActions := []string{"s3:ListBucket", "s3:GetObject"}
+	wantResources := []string{"arn:aws:s3:::prod-artifacts", "arn:aws:s3:::prod-artifacts/*"}
+	if !reflect.DeepEqual(gotActions, wantActions) || !reflect.DeepEqual(gotResources, wantResources) {
+		t.Fatalf("actions/resources = %#v/%#v, want %#v/%#v", gotActions, gotResources, wantActions, wantResources)
+	}
+}
+
+func TestParseDirParsesInlineS3WritePolicyForStaticObjectARNs(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "iam.tf", `resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "write_artifacts" {
+  role = aws_iam_role.deploy.id
+  policy = `+strconvQuote(`{"Statement":[{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::prod-artifacts/*"},{"Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::prod-artifacts/*"}]}`)+`
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.IAMRoles) != 1 || len(resources.IAMRoles[0].Permissions) != 2 {
+		t.Fatalf("resources = %#v, want two S3 write permissions", resources)
+	}
+	gotActions := []string{resources.IAMRoles[0].Permissions[0].Actions[0], resources.IAMRoles[0].Permissions[1].Actions[0]}
+	wantActions := []string{"s3:PutObject", "s3:DeleteObject"}
+	if !reflect.DeepEqual(gotActions, wantActions) {
+		t.Fatalf("actions = %#v, want %#v", gotActions, wantActions)
+	}
+}
+
+func TestParseDirIgnoresUnsupportedS3PolicyInputs(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "iam.tf", `variable "bucket" {
+  default = "FAKE_TF_S3_VARIABLE_SECRET_DO_NOT_RETAIN"
+}
+
+resource "aws_iam_role" "deploy" {
+}
+
+resource "aws_iam_role_policy" "unsupported" {
+  role = aws_iam_role.deploy.id
+  policy = `+strconvQuote(`{"Statement":[
+    {"Effect":"Allow","Action":"s3:*Object","Resource":"arn:aws:s3:::prod-artifacts/*"},
+    {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::*"},
+    {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::prod-artifacts/prefix/*"},
+    {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::prod-*"},
+    {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::${bucket}/*"},
+    {"Effect":"Allow","NotAction":"s3:DeleteObject","Resource":"arn:aws:s3:::prod-artifacts/*"},
+    {"Effect":"Allow","Action":"s3:GetObject","NotResource":"arn:aws:s3:::prod-artifacts/*"},
+    {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::prod-artifacts/*","Condition":{"StringEquals":{"aws:username":"FAKE_TF_S3_CONDITION_SECRET_DO_NOT_RETAIN"}}}
+  ]}`)+`
+}
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.IAMRoles) != 0 {
+		t.Fatalf("resources = %#v, want unsupported S3 policy ignored", resources)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{"s3:*Object", "arn:aws:s3:::*", "prefix", "prod-*", "${bucket}", "NotAction", "NotResource", "Condition", "FAKE_TF_S3_VARIABLE_SECRET_DO_NOT_RETAIN", "FAKE_TF_S3_CONDITION_SECRET_DO_NOT_RETAIN"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
 func TestParseDirIAMRolePolicyRoleReferenceMustBeExact(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -493,7 +700,7 @@ func TestParseDirIgnoresUnsupportedTerraformInputs(t *testing.T) {
 }
 
 resource "aws_s3_bucket" "bucket" {
-  bucket = "example"
+  bucket = "example-${var.name}"
 }
 
 resource "aws_iam_role" "dynamic" {

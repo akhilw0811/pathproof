@@ -464,6 +464,74 @@ jobs:
 	}
 }
 
+func TestRunScanCrossDomainS3SARIFOutputShapeAndFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "cross domain s3.yml", `name: Cross domain S3
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "write", "s3:PutObject", "arn:aws:s3:::prod-artifacts/*")+"\n# FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN\n")
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+	repeatedStdout, repeatedStderr, repeatedCode := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertCode(t, repeatedCode, 1)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "repeated stderr", repeatedStderr, "")
+	if stdout != repeatedStdout {
+		t.Fatalf("PP-XDOMAIN-003 SARIF output changed across repeated runs:\nfirst:%s\nsecond:%s", stdout, repeatedStdout)
+	}
+	report := assertValidSARIFReport(t, stdout)
+	run := report.Runs[0]
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-XDOMAIN-003")
+	assertString(t, "rule id", rule.ID, "PP-XDOMAIN-003")
+	assertString(t, "rule name", rule.Name, "Risky GitHub Actions workflow can access AWS S3 bucket")
+	assertContains(t, rule.FullDescription.Text, "S3 access")
+	assertString(t, "rule default level", rule.DefaultConfiguration.Level, "error")
+	assertContains(t, rule.Help.Text, "does not execute workflows")
+	assertContains(t, rule.Help.Text, "simulate IAM permissions")
+
+	var result cliSARIFResult
+	for _, candidate := range run.Results {
+		if candidate.RuleID == "PP-XDOMAIN-003" {
+			result = candidate
+			break
+		}
+	}
+	if result.RuleID == "" {
+		t.Fatalf("PP-XDOMAIN-003 SARIF result not found: %#v", run.Results)
+	}
+	assertString(t, "level", result.Level, "error")
+	assertContains(t, result.Message.Text, "workflow-level OIDC token capability")
+	assertContains(t, result.Message.Text, "AWS IAM role")
+	assertContains(t, result.Message.Text, "write access")
+	assertContains(t, result.Message.Text, "prod-artifacts")
+	if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+		t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+	}
+	assertString(t, "severity", result.Properties.Severity, "High")
+	if len(result.Properties.NodeIDs) != 4 || len(result.Properties.EdgeIDs) != 3 {
+		t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want S3 cross-domain path", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+	}
+	gotURIs := locationURIs(result.Locations)
+	if len(gotURIs) == 0 || gotURIs[0] != ".github/workflows/cross%20domain%20s3.yml#document=1" {
+		t.Fatalf("SARIF location URIs = %#v, want workflow source first", gotURIs)
+	}
+	for _, forbidden := range []string{"FAKE_CLI_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN", "assume_role_policy", "Principal", "Condition", "Statement", "policy =", "arn:aws:iam"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
 func TestRunScanCrossDomainAdminRoleMixedTrustSARIFEmitsFinding(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "mixed admin.yml", `on: pull_request_target
@@ -858,6 +926,7 @@ func assertSARIFRuleSet(t *testing.T, rules []cliSARIFRule) {
 		"PP-AWS-001",
 		"PP-XDOMAIN-001",
 		"PP-XDOMAIN-002",
+		"PP-XDOMAIN-003",
 	}
 	counts := make(map[string]int, len(rules))
 	for _, rule := range rules {

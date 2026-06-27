@@ -37,6 +37,9 @@ stable deterministic hashes of typed identities.
 - `AWSPermission`: a supported local Terraform AWS IAM role permission fact.
   Node names use `aws://terraform/aws_permission/<sha256>`, where the hash is
   over canonical sanitized permission identity.
+- `AWSS3Bucket`: a supported local Terraform `aws_s3_bucket` with a safe
+  literal bucket name. Node names use
+  `aws://terraform/aws_s3_bucket/<relative-tf-path>/<resource_name>`.
 
 ## Edge Kinds
 
@@ -59,6 +62,10 @@ stable deterministic hashes of typed identities.
   when `--repo OWNER/REPO` is supplied. Edge identity remains kind/from/to, so
   multiple matched subjects for the same capability and role are aggregated in
   edge metadata.
+- `CanReadObject`: an `AWSIAMRole` has explicit static read/list access to a
+  modeled `AWSS3Bucket` through exact supported S3 action/resource matching.
+- `CanWriteObject`: an `AWSIAMRole` has explicit static write/delete access to
+  a modeled `AWSS3Bucket` through exact supported S3 action/resource matching.
 
 ## Evidence
 
@@ -434,6 +441,62 @@ static job environment names. PathProof does not infer branch names, expand
 matrices, evaluate expressions, infer repository identity from Git remotes, or
 call GitHub.
 
+`AWSS3Bucket` nodes include sanitized metadata:
+
+```json
+{
+  "metadata": {
+    "aws_s3_bucket": {
+      "provider": "aws",
+      "bucket_name": "prod-artifacts",
+      "resource_name": "artifacts",
+      "source_reference": "infra/s3.tf#resource=aws_s3_bucket.artifacts"
+    }
+  }
+}
+```
+
+S3 access edges include typed metadata with one deduplicated, sorted grant list
+per role, bucket, and access mode:
+
+```json
+{
+  "metadata": {
+    "aws_s3_access": {
+      "provider": "aws",
+      "role_resource_name": "deploy",
+      "bucket_name": "prod-artifacts",
+      "bucket_resource_name": "artifacts",
+      "bucket_source_reference": "infra/s3.tf#resource=aws_s3_bucket.artifacts",
+      "access_mode": "read",
+      "grants": [
+        {
+          "access_mode": "read",
+          "access_kind": "get_object",
+          "action": "s3:GetObject",
+          "resource": "arn:aws:s3:::prod-artifacts/*",
+          "policy_source_reference": "infra/iam.tf#resource=aws_iam_role_policy.read",
+          "policy_resource_name": "read",
+          "attached_role_resource_name": "deploy",
+          "statement_index": 0
+        }
+      ]
+    }
+  }
+}
+```
+
+The only S3 access matches are exact `s3:ListBucket` with the exact bucket ARN,
+exact `s3:GetObject` with the exact object ARN, exact `s3:PutObject` or
+`s3:DeleteObject` with the exact object ARN, and exact `s3:*` with the exact
+bucket or object ARN. `s3:*` on a bucket ARN creates read access only; `s3:*`
+on an object ARN creates both read and write access. `Action "*"`, `s3:*`
+with `Resource "*"`, `s3:*Object`, `NotAction`, `NotResource`, conditions,
+wildcard bucket ARNs, wildcard prefixes, dynamic/interpolated ARNs,
+AdministratorAccess, and administrative permission metadata do not create S3
+access edges. Raw Terraform, raw policy JSON, tags, provider credentials, and
+secret-like values are not stored.
+
 PathProof's static Secret read model is:
 
 - `get` or `*` with empty `resourceNames` matches every parsed Secret in the
@@ -508,6 +571,16 @@ Implemented rules are:
   `Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --GrantsPermission--> AWSPermission`;
   job-level OIDC uses
   `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --GrantsPermission--> AWSPermission`
+
+- Rule ID: `PP-XDOMAIN-003`
+- Title:
+  `Risky GitHub Actions workflow can access AWS S3 bucket`
+- Severity: fixed `High`
+- Required path:
+  workflow-level OIDC uses
+  `Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`;
+  job-level OIDC uses
+  `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`
 
 `PP-K8S-001` is emitted only when all four Kubernetes nodes exist with the
 expected kinds and all three directed edges exist with the expected kinds. The
@@ -586,6 +659,15 @@ must have `administrative=true` and one supported admin reason identity:
 `CanAssumeRole` matches do not trigger this finding, even when the workflow is
 risky and the role has administrative permissions.
 
+`PP-XDOMAIN-003` is emitted only when the same risky pull request OIDC context
+also reaches a modeled S3 bucket through
+`AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`. The S3 access edge
+metadata must identify access mode `read` or `write` and at least one
+sanitized matched grant. Branch-only or environment-only `CanAssumeRole`
+matches do not trigger this finding. AdministratorAccess, `Action "*"
+Resource "*"`, and existing administrative `AWSPermission` metadata do not
+imply S3 bucket access in this slice.
+
 Finding IDs are deterministic and stable. `PP-K8S-001` IDs are SHA-256 hashes of a
 canonical JSON identity containing only fixed field names for `rule_id`,
 ordered `node_ids`, and ordered `edge_ids`. Evidence, source references,
@@ -615,15 +697,22 @@ fields, plus the AWS role node ID, AWS permission node ID, and precise admin
 reason identity. The administrative permission is part of the finding identity,
 so two distinct admin permissions on the same reachable role produce distinct
 findings.
+`PP-XDOMAIN-003` IDs use the same canonical path and risk signal identity
+fields, plus the AWS role node ID, S3 bucket node ID, access mode, ordered S3
+access edge ID, and ordered sanitized S3 grant identities. The grant identity
+uses access mode, access kind, action, resource, policy resource name, attached
+role resource name, and statement index. Evidence prose, source-reference
+display paths, raw policy JSON, and absolute paths are not part of identity.
 
 Finding evidence preserves the complete ordered edge evidence for the matched
 path. `source_references` are derived from those edge evidence sources in
 chain order, omit empty strings, and deduplicate exact repeated references
 while preserving first appearance. They are not globally sorted.
 
-`PP-XDOMAIN-001` and `PP-XDOMAIN-002` keep only the actual cross-domain graph
-path in `node_ids`, `edge_ids`, and ordered evidence. Non-path risk evidence is
-represented in an optional structured `risk_signal` field:
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003` keep only the actual
+cross-domain graph path in `node_ids`, `edge_ids`, and ordered evidence.
+Non-path risk evidence is represented in an optional structured `risk_signal`
+field:
 
 ```json
 {
@@ -678,7 +767,8 @@ SARIF scan output is also a private CLI projection, not a graph schema. It is
 selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
 with one PathProof run, deterministic rule entries for `PP-K8S-001`,
 `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and
-`PP-XDOMAIN-001`, and `PP-XDOMAIN-002`, and one result per finding.
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`, and one result per
+finding.
 Result properties include finding ID, severity, ordered node IDs, ordered edge
 IDs, and clean display source references when available.
 
@@ -686,7 +776,8 @@ SARIF locations are derived only from structured source-reference fields whose
 entire value is a clean `filename#document=N` reference or an exact supported
 Terraform resource reference:
 `file.tf#resource=aws_iam_role_policy.<name>` or
-`file.tf#resource=aws_iam_role_policy_attachment.<name>`. PathProof does not
+`file.tf#resource=aws_iam_role_policy_attachment.<name>` or
+`file.tf#resource=aws_s3_bucket.<name>`. PathProof does not
 parse arbitrary prose, evidence details, summaries, or remediation text to
 find embedded source references. Malformed references and references outside
 the scan root are omitted. SARIF artifact URIs are relative to the scan root
@@ -875,19 +966,22 @@ The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
 workflow execution, GitHub API state, expression evaluation, workflow
 permissions, reusable workflow resolution, action source inspection,
-CI/CD-to-cloud findings beyond `PP-XDOMAIN-001` and `PP-XDOMAIN-002`,
+CI/CD-to-cloud findings beyond `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and
+`PP-XDOMAIN-003`,
 in-place patch application, live validation, or attack-path rules beyond
 `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
-`PP-XDOMAIN-001`, and `PP-XDOMAIN-002`. Terraform
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`. Terraform
 support is limited to static `aws_iam_role` GitHub Actions OIDC trust
 metadata, optional `CanAssumeRole` edges when `--repo OWNER/REPO` is supplied,
-and narrow static AWS IAM role permission facts for `PP-AWS-001`; PathProof
-does not execute Terraform, evaluate modules or variables, call AWS or GitHub,
-validate cloud state, or simulate IAM. The
+static `aws_s3_bucket` names, narrow static AWS IAM role permission facts for
+`PP-AWS-001`, and exact static S3 role access edges for modeled buckets;
+PathProof does not execute Terraform, evaluate modules or variables, call AWS
+or GitHub, validate cloud state, parse S3 bucket policies, model KMS, model S3
+objects, or simulate IAM. The
 scan CLI currently supports local Kubernetes YAML directories and local
 GitHub Actions workflow files under `.github/workflows` plus local `.tf`
 files for that narrow Terraform slice. Patch previews and patch output are
 limited to Kubernetes `NarrowBindingSubject` and do not cover `PP-GHA-001`,
 `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`,
-`PP-XDOMAIN-002`, Terraform, RBAC rule edits, Secret-bearing source files, or
-broader YAML patch types.
+`PP-XDOMAIN-002`, `PP-XDOMAIN-003`, Terraform, RBAC rule edits,
+Secret-bearing source files, or broader YAML patch types.

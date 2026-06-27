@@ -579,6 +579,129 @@ permissions: write-all
 	}
 }
 
+func TestRunScanCrossDomainS3HumanOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe-s3.yml", `name: Cross domain S3
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  audit:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*")+"\n# FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN\n")
+
+	stdout, stderr, code := runCommand("scan", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-XDOMAIN-003\n")
+	assertContains(t, stdout, "Title: Risky GitHub Actions workflow can access AWS S3 bucket\n")
+	assertContains(t, stdout, "Severity: High\n")
+	assertContains(t, stdout, "workflow-level OIDC token capability")
+	assertContains(t, stdout, "AWSIAMRole aws://terraform/aws_iam_role/infra/iam.tf/deploy")
+	assertContains(t, stdout, "AWSS3Bucket aws://terraform/aws_s3_bucket/infra/iam.tf/artifacts")
+	assertContains(t, stdout, "prod-artifacts")
+	assertContains(t, stdout, "read access")
+	assertContains(t, stdout, "get_object action=s3:GetObject resource=arn:aws:s3:::prod-artifacts/*")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-XDOMAIN-003 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	assertDoesNotContainCrossDomainS3SecretValues(t, stdout, stderr)
+	if strings.Contains(stdout, dir) || strings.Contains(stderr, dir) {
+		t.Fatalf("output contains absolute temp path\nstdout:%s\nstderr:%s", stdout, stderr)
+	}
+}
+
+func TestRunScanCrossDomainS3JSONRepoMatchingAndNegatives(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:ListBucket", "arn:aws:s3:::prod-artifacts"))
+
+	stdout, stderr, code := runCommand("scan", "--format=json", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	var s3Findings []cliJSONFinding
+	for _, finding := range report.Findings {
+		if finding.RuleID == "PP-XDOMAIN-003" {
+			s3Findings = append(s3Findings, finding)
+			if finding.RiskSignal == nil || finding.RiskSignal.RuleID != "PP-GHA-003" {
+				t.Fatalf("risk_signal = %#v, want PP-GHA-003", finding.RiskSignal)
+			}
+			if finding.Remediation != nil {
+				t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+			}
+			if len(finding.Path) != 4 || len(finding.Evidence) != 3 {
+				t.Fatalf("path/evidence lengths = %d/%d, want workflow-level S3 path", len(finding.Path), len(finding.Evidence))
+			}
+			if finding.Path[2].Kind != "AWSIAMRole" || finding.Path[3].Kind != "AWSS3Bucket" {
+				t.Fatalf("path = %#v, want AWS role to S3 bucket suffix", finding.Path)
+			}
+			assertContains(t, finding.Summary, "read access")
+			assertContains(t, finding.Summary, "prod-artifacts")
+		}
+	}
+	if len(s3Findings) != 1 {
+		t.Fatalf("PP-XDOMAIN-003 count = %d, want 1: %#v", len(s3Findings), report.Findings)
+	}
+	assertDoesNotContainCrossDomainS3SecretValues(t, stdout, stderr)
+	for _, forbidden := range []string{"assume_role_policy", "Principal", "Condition", "Statement", "policy ="} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+
+	noRepoStdout, noRepoStderr, noRepoCode := runCommand("scan", "--format=json", dir)
+	assertCode(t, noRepoCode, 1)
+	assertString(t, "no repo stderr", noRepoStderr, "")
+	assertNoRuleInJSONReport(t, noRepoStdout, "PP-XDOMAIN-003")
+
+	nonmatchingStdout, nonmatchingStderr, nonmatchingCode := runCommand("scan", "--format=json", "--repo", "other/repo", dir)
+	assertCode(t, nonmatchingCode, 1)
+	assertString(t, "nonmatching stderr", nonmatchingStderr, "")
+	assertNoRuleInJSONReport(t, nonmatchingStdout, "PP-XDOMAIN-003")
+
+	nonmatchingBucketDir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, nonmatchingBucketDir, "unsafe-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, nonmatchingBucketDir, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::other-artifacts/*"))
+	nonmatchingBucketStdout, nonmatchingBucketStderr, nonmatchingBucketCode := runCommand("scan", "--format=json", "--repo", "owner/repo", nonmatchingBucketDir)
+	assertCode(t, nonmatchingBucketCode, 1)
+	assertString(t, "nonmatching bucket stderr", nonmatchingBucketStderr, "")
+	assertNoRuleInJSONReport(t, nonmatchingBucketStdout, "PP-XDOMAIN-003")
+}
+
+func TestRunScanCrossDomainS3PatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("mkdir scan root: %v", err)
+	}
+	outputDir := filepath.Join(parent, "patches")
+	writeGitHubActionsWorkflowForTest(t, root, "unsafe-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "write", "s3:PutObject", "arn:aws:s3:::prod-artifacts/*"))
+
+	stdout, stderr, code := runCommand("scan", "--repo", "owner/repo", "--preview-patches", "--write-patches", outputDir, "--validate-patches", root)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Rule: PP-XDOMAIN-003\n")
+	assertContains(t, stdout, "write access")
+	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-XDOMAIN-003 received unsupported remediation/patch/validation output: %s", stdout)
+	}
+	assertDoesNotContainCrossDomainS3SecretValues(t, stdout, stderr)
+}
+
 func TestScanDirectoryWithRepoCreatesTerraformCanAssumeRoleGraphEdge(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "deploy.yml", `on:
@@ -3643,6 +3766,19 @@ resource "aws_iam_role_policy" "` + policyName + `" {
 `
 }
 
+func terraformOIDCS3Role(roleName, subject, bucketResourceName, bucketName, policyName, action, resource string) string {
+	return terraformOIDCRole(roleName, subject) + `
+resource "aws_s3_bucket" "` + bucketResourceName + `" {
+  bucket = "` + bucketName + `"
+}
+
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + roleName + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
 func terraformOIDCSubjectsAdminRole(name string, subjects []string, policyName, action, resource string) string {
 	var patterns strings.Builder
 	for i, subject := range subjects {
@@ -3787,6 +3923,22 @@ func assertDoesNotContainCrossDomainAdminSecretValues(t *testing.T, outputs ...s
 		} {
 			if strings.Contains(output, forbidden) {
 				t.Fatalf("output contains cross-domain admin secret-like value %q: %s", forbidden, output)
+			}
+		}
+	}
+}
+
+func assertDoesNotContainCrossDomainS3SecretValues(t *testing.T, outputs ...string) {
+	t.Helper()
+	for _, output := range outputs {
+		for _, forbidden := range []string{
+			"FAKE_CLI_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN3_GHA_WITH_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN",
+		} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("output contains cross-domain S3 secret-like value %q: %s", forbidden, output)
 			}
 		}
 	}

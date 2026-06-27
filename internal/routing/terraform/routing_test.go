@@ -164,6 +164,256 @@ func TestAddRoutesAdministratorAccessPermissionMetadataIsSanitized(t *testing.T)
 	}
 }
 
+func TestAddRoutesCreatesAWSS3BucketNodeWithSanitizedMetadata(t *testing.T) {
+	resources := parserterraform.Resources{S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")}}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	bucket := graph.NewNode(graph.AWSS3Bucket, "aws://terraform/aws_s3_bucket/s3.tf/artifacts")
+	got, ok := g.Node(bucket.ID)
+	if !ok {
+		t.Fatalf("missing bucket node %q", bucket.ID)
+	}
+	if got.Metadata == nil || got.Metadata.AWSS3Bucket == nil {
+		t.Fatalf("bucket metadata = %#v, want aws s3 bucket metadata", got.Metadata)
+	}
+	want := graph.AWSS3BucketMetadata{
+		Provider:        "aws",
+		BucketName:      "prod-artifacts",
+		ResourceName:    "artifacts",
+		SourceReference: "/repo/s3.tf#resource=aws_s3_bucket.artifacts",
+	}
+	if !reflect.DeepEqual(*got.Metadata.AWSS3Bucket, want) {
+		t.Fatalf("metadata = %#v, want %#v", *got.Metadata.AWSS3Bucket, want)
+	}
+}
+
+func TestAddRoutesCreatesS3ReadEdgesForExactReadActions(t *testing.T) {
+	resources := parserterraform.Resources{
+		S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")},
+		IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+			testS3Permission("deploy", "read_list", 0, "s3:ListBucket", "arn:aws:s3:::prod-artifacts"),
+			testS3Permission("deploy", "read_get", 1, "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
+		})},
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	edges := edgesOfKind(g, graph.CanReadObject)
+	if len(edges) != 1 {
+		t.Fatalf("CanReadObject edges = %d, want 1: %#v", len(edges), edges)
+	}
+	metadata := edges[0].Metadata.AWSS3Access
+	if metadata == nil || metadata.AccessMode != "read" || metadata.BucketName != "prod-artifacts" {
+		t.Fatalf("metadata = %#v, want read access to prod-artifacts", metadata)
+	}
+	gotKinds := s3GrantKinds(metadata.Grants)
+	wantKinds := []string{"get_object", "list_bucket"}
+	if !reflect.DeepEqual(gotKinds, wantKinds) {
+		t.Fatalf("grant kinds = %#v, want %#v", gotKinds, wantKinds)
+	}
+	if countEdges(g, graph.CanWriteObject) != 0 {
+		t.Fatalf("CanWriteObject edges = %d, want none", countEdges(g, graph.CanWriteObject))
+	}
+}
+
+func TestAddRoutesCreatesS3WriteEdgesForExactWriteActions(t *testing.T) {
+	resources := parserterraform.Resources{
+		S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")},
+		IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+			testS3Permission("deploy", "write_put", 0, "s3:PutObject", "arn:aws:s3:::prod-artifacts/*"),
+			testS3Permission("deploy", "write_delete", 1, "s3:DeleteObject", "arn:aws:s3:::prod-artifacts/*"),
+		})},
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	edges := edgesOfKind(g, graph.CanWriteObject)
+	if len(edges) != 1 {
+		t.Fatalf("CanWriteObject edges = %d, want 1: %#v", len(edges), edges)
+	}
+	metadata := edges[0].Metadata.AWSS3Access
+	gotKinds := s3GrantKinds(metadata.Grants)
+	wantKinds := []string{"delete_object", "put_object"}
+	if !reflect.DeepEqual(gotKinds, wantKinds) {
+		t.Fatalf("grant kinds = %#v, want %#v", gotKinds, wantKinds)
+	}
+}
+
+func TestAddRoutesS3StarExactARNAccessSemantics(t *testing.T) {
+	tests := []struct {
+		name      string
+		resource  string
+		wantRead  int
+		wantWrite int
+		wantKinds []string
+	}{
+		{name: "bucket arn creates read only", resource: "arn:aws:s3:::prod-artifacts", wantRead: 1, wantKinds: []string{"s3_star_bucket"}},
+		{name: "object arn creates read and write", resource: "arn:aws:s3:::prod-artifacts/*", wantRead: 1, wantWrite: 1, wantKinds: []string{"s3_star_object"}},
+		{name: "resource star creates no s3 access", resource: "*"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resources := parserterraform.Resources{
+				S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")},
+				IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+					testS3Permission("deploy", "s3_star", 0, "s3:*", tt.resource),
+				})},
+			}
+			g := graph.New()
+
+			if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+				t.Fatalf("add routes: %v", err)
+			}
+			if got := countEdges(g, graph.CanReadObject); got != tt.wantRead {
+				t.Fatalf("CanReadObject edges = %d, want %d", got, tt.wantRead)
+			}
+			if got := countEdges(g, graph.CanWriteObject); got != tt.wantWrite {
+				t.Fatalf("CanWriteObject edges = %d, want %d", got, tt.wantWrite)
+			}
+			if tt.wantRead > 0 {
+				read := onlyEdgeOfKind(t, g, graph.CanReadObject)
+				if got := s3GrantKinds(read.Metadata.AWSS3Access.Grants); !reflect.DeepEqual(got, tt.wantKinds) {
+					t.Fatalf("read grant kinds = %#v, want %#v", got, tt.wantKinds)
+				}
+			}
+			if tt.wantWrite > 0 {
+				write := onlyEdgeOfKind(t, g, graph.CanWriteObject)
+				if got := s3GrantKinds(write.Metadata.AWSS3Access.Grants); !reflect.DeepEqual(got, tt.wantKinds) {
+					t.Fatalf("write grant kinds = %#v, want %#v", got, tt.wantKinds)
+				}
+			}
+		})
+	}
+}
+
+func TestAddRoutesDoesNotCreateS3AccessEdgesForUnsupportedOrAdminInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		permission parserterraform.IAMPermission
+	}{
+		{
+			name:       "action star resource star",
+			permission: testAdminPermission("deploy", "admin", "*", "*"),
+		},
+		{
+			name:       "s3 star resource star",
+			permission: testS3Permission("deploy", "s3_star", 0, "s3:*", "*"),
+		},
+		{
+			name:       "wildcard bucket",
+			permission: testS3Permission("deploy", "wildcard", 0, "s3:GetObject", "arn:aws:s3:::*"),
+		},
+		{
+			name:       "wildcard prefix",
+			permission: testS3Permission("deploy", "prefix", 0, "s3:GetObject", "arn:aws:s3:::prod-artifacts/prefix/*"),
+		},
+		{
+			name:       "nonmatching bucket",
+			permission: testS3Permission("deploy", "other", 0, "s3:GetObject", "arn:aws:s3:::other-artifacts/*"),
+		},
+		{
+			name:       "s3 star object unsupported action was not retained",
+			permission: testS3Permission("deploy", "object_star", 0, "s3:*Object", "arn:aws:s3:::prod-artifacts/*"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resources := parserterraform.Resources{
+				S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")},
+				IAMRoles:  []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{tt.permission})},
+			}
+			g := graph.New()
+
+			if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+				t.Fatalf("add routes: %v", err)
+			}
+			if got := countEdges(g, graph.CanReadObject) + countEdges(g, graph.CanWriteObject); got != 0 {
+				t.Fatalf("s3 access edges = %d, want none: %#v", got, g.Edges())
+			}
+		})
+	}
+}
+
+func TestAddRoutesS3AccessGrantsDedupedAggregatedAndDeterministic(t *testing.T) {
+	firstResources := parserterraform.Resources{
+		S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")},
+		IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+			testS3Permission("deploy", "read_b", 1, "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
+			testS3Permission("deploy", "read_a", 0, "s3:ListBucket", "arn:aws:s3:::prod-artifacts"),
+			testS3Permission("deploy", "read_a", 0, "s3:ListBucket", "arn:aws:s3:::prod-artifacts"),
+		})},
+	}
+	secondResources := parserterraform.Resources{
+		S3Buckets: []parserterraform.S3Bucket{firstResources.S3Buckets[0]},
+		IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+			firstResources.IAMRoles[0].Permissions[2],
+			firstResources.IAMRoles[0].Permissions[1],
+			firstResources.IAMRoles[0].Permissions[0],
+		})},
+	}
+	first := graph.New()
+	second := graph.New()
+
+	if err := AddRoutes(first, firstResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add first routes: %v", err)
+	}
+	if err := AddRoutes(second, secondResources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add second routes: %v", err)
+	}
+
+	firstJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+	}
+	secondJSON, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second: %v", err)
+	}
+	if string(firstJSON) != string(secondJSON) {
+		t.Fatalf("graph JSON differs:\nfirst: %s\nsecond:%s", firstJSON, secondJSON)
+	}
+	read := onlyEdgeOfKind(t, first, graph.CanReadObject)
+	if got := len(read.Metadata.AWSS3Access.Grants); got != 2 {
+		t.Fatalf("deduped grants = %d, want 2: %#v", got, read.Metadata.AWSS3Access.Grants)
+	}
+}
+
+func TestAddRoutesS3AccessMetadataIsCloned(t *testing.T) {
+	resources := parserterraform.Resources{
+		S3Buckets: []parserterraform.S3Bucket{testS3Bucket("artifacts", "prod-artifacts")},
+		IAMRoles: []parserterraform.IAMRole{testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
+			testS3Permission("deploy", "read", 0, "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
+		})},
+	}
+	g := graph.New()
+	if err := AddRoutes(g, resources, parsergithubactions.Resources{}, ""); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	edge := onlyEdgeOfKind(t, g, graph.CanReadObject)
+	edge.Metadata.AWSS3Access.Grants[0].Action = "changed"
+	stored := onlyEdgeOfKind(t, g, graph.CanReadObject)
+	if stored.Metadata.AWSS3Access.Grants[0].Action != "s3:GetObject" {
+		t.Fatalf("stored grant action = %q, want original", stored.Metadata.AWSS3Access.Grants[0].Action)
+	}
+	bucket := onlyNodeOfKind(t, g, graph.AWSS3Bucket)
+	bucket.Metadata.AWSS3Bucket.BucketName = "changed"
+	storedBucket := onlyNodeOfKind(t, g, graph.AWSS3Bucket)
+	if storedBucket.Metadata.AWSS3Bucket.BucketName != "prod-artifacts" {
+		t.Fatalf("stored bucket name = %q, want original", storedBucket.Metadata.AWSS3Bucket.BucketName)
+	}
+}
+
 func TestAddRoutesAWSIAMPermissionGraphJSONIsDeterministic(t *testing.T) {
 	firstResources := parserterraform.Resources{IAMRoles: []parserterraform.IAMRole{
 		testRoleWithPermissions("deploy", []parserterraform.IAMPermission{
@@ -692,6 +942,47 @@ func testRoleWithPermissions(name string, permissions []parserterraform.IAMPermi
 	role := testRole(name, "repo:owner/repo:pull_request")
 	role.Permissions = permissions
 	return role
+}
+
+func testS3Bucket(resourceName, bucketName string) parserterraform.S3Bucket {
+	return parserterraform.S3Bucket{
+		ResourceType: "aws_s3_bucket",
+		ResourceName: resourceName,
+		BucketName:   bucketName,
+		Source: parserterraform.Source{
+			Filename:     "/repo/s3.tf",
+			RelativePath: "s3.tf",
+			ResourceType: "aws_s3_bucket",
+			ResourceName: resourceName,
+		},
+	}
+}
+
+func testS3Permission(roleName, policyName string, statementIndex int, action, resource string) parserterraform.IAMPermission {
+	return parserterraform.IAMPermission{
+		Kind:                     "inline_policy",
+		Source:                   parserterraform.Source{Filename: "/repo/iam.tf", RelativePath: "iam.tf", ResourceType: "aws_iam_role_policy", ResourceName: policyName},
+		PolicyResourceName:       policyName,
+		AttachedRoleResourceName: roleName,
+		StatementIndex:           statementIndex,
+		Actions:                  []string{action},
+		Resources:                []string{resource},
+	}
+}
+
+func testAdminPermission(roleName, policyName, action, resource string) parserterraform.IAMPermission {
+	permission := testS3Permission(roleName, policyName, 0, action, resource)
+	permission.Administrative = true
+	permission.AdminReason = "action_star_resource_star"
+	return permission
+}
+
+func s3GrantKinds(grants []graph.AWSS3AccessGrant) []string {
+	kinds := make([]string, 0, len(grants))
+	for _, grant := range grants {
+		kinds = append(kinds, grant.AccessKind)
+	}
+	return kinds
 }
 
 func canAssumeMatchSubjects(matches []graph.AWSCanAssumeRoleMatch) []string {

@@ -23,6 +23,7 @@ const (
 	RuleAWSIAMRoleAdministrativePermissions                RuleID   = "PP-AWS-001"
 	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole      RuleID   = "PP-XDOMAIN-001"
 	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole RuleID   = "PP-XDOMAIN-002"
+	RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket  RuleID   = "PP-XDOMAIN-003"
 	SeverityHigh                                           Severity = "High"
 	SeverityMedium                                         Severity = "Medium"
 )
@@ -34,6 +35,7 @@ const githubActionsDangerousPermissionsTitle = "pull_request_target workflow gra
 const awsIAMRoleAdministrativePermissionsTitle = "AWS IAM role grants administrative permissions"
 const crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle = "Risky GitHub Actions workflow can assume AWS IAM role"
 const crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle = "Risky GitHub Actions workflow can assume administrative AWS IAM role"
+const crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle = "Risky GitHub Actions workflow can access AWS S3 bucket"
 
 type Finding struct {
 	ID               FindingID         `json:"id"`
@@ -129,6 +131,28 @@ type crossDomainAdminFindingIdentity struct {
 	AdminReason      string                        `json:"admin_reason"`
 }
 
+type crossDomainS3FindingIdentity struct {
+	RuleID      RuleID                         `json:"rule_id"`
+	NodeIDs     []graph.NodeID                 `json:"node_ids"`
+	EdgeIDs     []graph.EdgeID                 `json:"edge_ids"`
+	RiskRuleID  RuleID                         `json:"risk_rule_id"`
+	RiskSignal  crossDomainRiskSignalIdentity  `json:"risk_signal"`
+	AWSRoleID   graph.NodeID                   `json:"aws_role_node_id"`
+	S3BucketID  graph.NodeID                   `json:"aws_s3_bucket_node_id"`
+	AccessMode  string                         `json:"access_mode"`
+	S3GrantKeys []s3AccessGrantFindingIdentity `json:"s3_grant_identities"`
+}
+
+type s3AccessGrantFindingIdentity struct {
+	AccessMode               string `json:"access_mode"`
+	AccessKind               string `json:"access_kind"`
+	Action                   string `json:"action"`
+	Resource                 string `json:"resource"`
+	PolicyResourceName       string `json:"policy_resource_name"`
+	AttachedRoleResourceName string `json:"attached_role_resource_name"`
+	StatementIndex           int    `json:"statement_index"`
+}
+
 type awsAdminPermissionFindingIdentity struct {
 	RuleID           RuleID       `json:"rule_id"`
 	AWSRoleNodeID    graph.NodeID `json:"aws_role_node_id"`
@@ -173,6 +197,8 @@ func Analyze(g *graph.Graph) []Finding {
 	canRequestOIDCBySource := make(map[graph.NodeID][]graph.Edge)
 	canAssumeRoleByCapability := make(map[graph.NodeID][]graph.Edge)
 	grantsPermissionByRole := make(map[graph.NodeID][]graph.Edge)
+	canReadObjectByRole := make(map[graph.NodeID][]graph.Edge)
+	canWriteObjectByRole := make(map[graph.NodeID][]graph.Edge)
 	var grantsPermission []graph.Edge
 	for _, edge := range g.Edges() {
 		switch edge.Kind {
@@ -193,6 +219,10 @@ func Analyze(g *graph.Graph) []Finding {
 		case graph.GrantsPermission:
 			grantsPermission = append(grantsPermission, edge)
 			grantsPermissionByRole[edge.From] = append(grantsPermissionByRole[edge.From], edge)
+		case graph.CanReadObject:
+			canReadObjectByRole[edge.From] = append(canReadObjectByRole[edge.From], edge)
+		case graph.CanWriteObject:
+			canWriteObjectByRole[edge.From] = append(canWriteObjectByRole[edge.From], edge)
 		}
 	}
 
@@ -268,6 +298,7 @@ func Analyze(g *graph.Graph) []Finding {
 	}
 	findings = append(findings, newCrossDomainGitHubActionsAWSRoleFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, workflowRisks, jobRisks)...)
 	findings = append(findings, newCrossDomainGitHubActionsAWSAdminRoleFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, grantsPermissionByRole, workflowRisks, jobRisks)...)
+	findings = append(findings, newCrossDomainGitHubActionsAWSS3BucketFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, workflowRisks, jobRisks)...)
 	findings = append(findings, newAWSIAMRoleAdministrativePermissionFindings(g, grantsPermission)...)
 
 	sort.Slice(findings, func(i, j int) bool {
@@ -866,6 +897,141 @@ func administrativePermissionForGrant(g *graph.Graph, grants graph.Edge) (graph.
 	return permission, metadata, true
 }
 
+func newCrossDomainGitHubActionsAWSS3BucketFindings(g *graph.Graph, definesJob []graph.Edge, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, canReadObjectByRole, canWriteObjectByRole map[graph.NodeID][]graph.Edge, workflowRisks, jobRisks map[graph.NodeID][]githubActionsRiskSignal) []Finding {
+	findings := make([]Finding, 0)
+	seen := make(map[FindingID]struct{})
+	add := func(nodes []graph.Node, edges []graph.Edge, risk githubActionsRiskSignal, accessMetadata graph.AWSS3AccessMetadata) {
+		if len(nodes) == 0 || len(edges) == 0 {
+			return
+		}
+		role := nodes[len(nodes)-2]
+		bucket := nodes[len(nodes)-1]
+		id, err := stableCrossDomainS3FindingID(nodeIDs(nodes), edgeIDs(edges), risk, role.ID, bucket.ID, accessMetadata)
+		if err != nil {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		evidence := findingEvidenceForEdges(edges)
+		findings = append(findings, Finding{
+			ID:               id,
+			RuleID:           RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket,
+			Title:            crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle,
+			Severity:         SeverityHigh,
+			NodeIDs:          nodeIDs(nodes),
+			EdgeIDs:          edgeIDs(edges),
+			Summary:          crossDomainS3Summary(nodes, risk, accessMetadata),
+			Evidence:         evidence,
+			SourceReferences: crossDomainSourceReferences(evidence, risk),
+			RiskSignal:       riskSignal(risk),
+		})
+	}
+
+	for _, workflow := range g.Nodes() {
+		if workflow.Kind != graph.Workflow {
+			continue
+		}
+		for _, risk := range workflowRisks[workflow.ID] {
+			addWorkflowLevelCrossDomainS3Findings(g, workflow, risk, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, add)
+		}
+	}
+
+	for _, defines := range definesJob {
+		workflow, ok := nodeOfKind(g, defines.From, graph.Workflow)
+		if !ok {
+			continue
+		}
+		job, ok := nodeOfKind(g, defines.To, graph.WorkflowJob)
+		if !ok {
+			continue
+		}
+		for _, risk := range jobRisks[job.ID] {
+			if risk.ruleID == RuleGitHubActionsUnsafePullRequestTargetCheckout {
+				addWorkflowLevelCrossDomainS3Findings(g, workflow, risk, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, add)
+			}
+			addJobLevelCrossDomainS3Findings(g, workflow, job, defines, risk, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, add)
+		}
+	}
+
+	sort.Slice(findings, func(i, j int) bool {
+		return findings[i].ID < findings[j].ID
+	})
+	return findings
+}
+
+func addWorkflowLevelCrossDomainS3Findings(g *graph.Graph, workflow graph.Node, risk githubActionsRiskSignal, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, canReadObjectByRole, canWriteObjectByRole map[graph.NodeID][]graph.Edge, add func([]graph.Node, []graph.Edge, githubActionsRiskSignal, graph.AWSS3AccessMetadata)) {
+	for _, oidcRequest := range canRequestOIDCBySource[workflow.ID] {
+		capability, ok := nodeOfKind(g, oidcRequest.To, graph.OIDCTokenCapability)
+		if !ok {
+			continue
+		}
+		for _, canAssumeRole := range canAssumeRoleByCapability[capability.ID] {
+			if !riskMatchesCanAssumeRoleContext(risk, canAssumeRole) {
+				continue
+			}
+			role, ok := nodeOfKind(g, canAssumeRole.To, graph.AWSIAMRole)
+			if !ok {
+				continue
+			}
+			addS3AccessFindingsForRole(g, []graph.Node{workflow, capability, role}, []graph.Edge{oidcRequest, canAssumeRole}, risk, canReadObjectByRole, canWriteObjectByRole, add)
+		}
+	}
+}
+
+func addJobLevelCrossDomainS3Findings(g *graph.Graph, workflow, job graph.Node, defines graph.Edge, risk githubActionsRiskSignal, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, canReadObjectByRole, canWriteObjectByRole map[graph.NodeID][]graph.Edge, add func([]graph.Node, []graph.Edge, githubActionsRiskSignal, graph.AWSS3AccessMetadata)) {
+	for _, oidcRequest := range canRequestOIDCBySource[job.ID] {
+		capability, ok := nodeOfKind(g, oidcRequest.To, graph.OIDCTokenCapability)
+		if !ok {
+			continue
+		}
+		for _, canAssumeRole := range canAssumeRoleByCapability[capability.ID] {
+			if !riskMatchesCanAssumeRoleContext(risk, canAssumeRole) {
+				continue
+			}
+			role, ok := nodeOfKind(g, canAssumeRole.To, graph.AWSIAMRole)
+			if !ok {
+				continue
+			}
+			addS3AccessFindingsForRole(g, []graph.Node{workflow, job, capability, role}, []graph.Edge{defines, oidcRequest, canAssumeRole}, risk, canReadObjectByRole, canWriteObjectByRole, add)
+		}
+	}
+}
+
+func addS3AccessFindingsForRole(g *graph.Graph, prefixNodes []graph.Node, prefixEdges []graph.Edge, risk githubActionsRiskSignal, canReadObjectByRole, canWriteObjectByRole map[graph.NodeID][]graph.Edge, add func([]graph.Node, []graph.Edge, githubActionsRiskSignal, graph.AWSS3AccessMetadata)) {
+	role := prefixNodes[len(prefixNodes)-1]
+	for _, accessEdge := range append(append([]graph.Edge(nil), canReadObjectByRole[role.ID]...), canWriteObjectByRole[role.ID]...) {
+		bucket, metadata, ok := s3BucketAccessForEdge(g, accessEdge)
+		if !ok {
+			continue
+		}
+		nodes := append(append([]graph.Node(nil), prefixNodes...), bucket)
+		edges := append(append([]graph.Edge(nil), prefixEdges...), accessEdge)
+		add(nodes, edges, risk, metadata)
+	}
+}
+
+func s3BucketAccessForEdge(g *graph.Graph, accessEdge graph.Edge) (graph.Node, graph.AWSS3AccessMetadata, bool) {
+	switch accessEdge.Kind {
+	case graph.CanReadObject, graph.CanWriteObject:
+	default:
+		return graph.Node{}, graph.AWSS3AccessMetadata{}, false
+	}
+	bucket, ok := nodeOfKind(g, accessEdge.To, graph.AWSS3Bucket)
+	if !ok || accessEdge.Metadata == nil || accessEdge.Metadata.AWSS3Access == nil {
+		return graph.Node{}, graph.AWSS3AccessMetadata{}, false
+	}
+	metadata := *accessEdge.Metadata.AWSS3Access
+	if metadata.AccessMode != "read" && metadata.AccessMode != "write" {
+		return graph.Node{}, graph.AWSS3AccessMetadata{}, false
+	}
+	if len(metadata.Grants) == 0 {
+		return graph.Node{}, graph.AWSS3AccessMetadata{}, false
+	}
+	return bucket, metadata, true
+}
+
 func stableCrossDomainFindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID, risk githubActionsRiskSignal, roleID graph.NodeID) (FindingID, error) {
 	data, err := json.Marshal(crossDomainFindingIdentity{
 		RuleID:     RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole,
@@ -916,6 +1082,57 @@ func stableCrossDomainAdminFindingID(nodeIDs []graph.NodeID, edgeIDs []graph.Edg
 	return FindingID("finding:" + string(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole) + ":" + hex.EncodeToString(sum[:])), nil
 }
 
+func stableCrossDomainS3FindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID, risk githubActionsRiskSignal, roleID, bucketID graph.NodeID, access graph.AWSS3AccessMetadata) (FindingID, error) {
+	data, err := json.Marshal(crossDomainS3FindingIdentity{
+		RuleID:     RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket,
+		NodeIDs:    append([]graph.NodeID(nil), nodeIDs...),
+		EdgeIDs:    append([]graph.EdgeID(nil), edgeIDs...),
+		RiskRuleID: risk.ruleID,
+		RiskSignal: crossDomainRiskSignalIdentity{
+			WorkflowFile: risk.workflowFile,
+			JobID:        risk.jobID,
+			StepIndex:    cloneIntPointer(risk.stepIndex),
+			Selectors:    cloneSelectorIdentities(risk.selectors),
+			Scope:        risk.scope,
+			Permission:   risk.permission,
+			Access:       risk.access,
+		},
+		AWSRoleID:   roleID,
+		S3BucketID:  bucketID,
+		AccessMode:  access.AccessMode,
+		S3GrantKeys: s3AccessGrantFindingIdentities(access.Grants),
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return FindingID("finding:" + string(RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket) + ":" + hex.EncodeToString(sum[:])), nil
+}
+
+func s3AccessGrantFindingIdentities(grants []graph.AWSS3AccessGrant) []s3AccessGrantFindingIdentity {
+	out := make([]s3AccessGrantFindingIdentity, 0, len(grants))
+	for _, grant := range grants {
+		out = append(out, s3AccessGrantFindingIdentity{
+			AccessMode:               grant.AccessMode,
+			AccessKind:               grant.AccessKind,
+			Action:                   grant.Action,
+			Resource:                 grant.Resource,
+			PolicyResourceName:       grant.PolicyResourceName,
+			AttachedRoleResourceName: grant.AttachedRoleResourceName,
+			StatementIndex:           grant.StatementIndex,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, errA := json.Marshal(out[i])
+		b, errB := json.Marshal(out[j])
+		if errA != nil || errB != nil {
+			return false
+		}
+		return string(a) < string(b)
+	})
+	return out
+}
+
 func crossDomainSummary(nodes []graph.Node, risk githubActionsRiskSignal) string {
 	workflow := nodes[0]
 	role := nodes[len(nodes)-1]
@@ -942,6 +1159,21 @@ func crossDomainAdminSummary(nodes []graph.Node, risk githubActionsRiskSignal, p
 		target += " job " + risk.jobID
 	}
 	return "GitHub Actions " + target + " has " + risk.ruleIDSummary() + "; its " + scope + " OIDC token capability can assume administrative AWS IAM role " + role.Name + " (" + permission.AdminReason + ")."
+}
+
+func crossDomainS3Summary(nodes []graph.Node, risk githubActionsRiskSignal, access graph.AWSS3AccessMetadata) string {
+	workflow := nodes[0]
+	role := nodes[len(nodes)-2]
+	bucket := nodes[len(nodes)-1]
+	scope := "workflow-level"
+	if len(nodes) == 5 {
+		scope = "job-level"
+	}
+	target := workflow.Name
+	if risk.jobID != "" {
+		target += " job " + risk.jobID
+	}
+	return "GitHub Actions " + target + " has " + risk.ruleIDSummary() + "; its " + scope + " OIDC token capability can assume AWS IAM role " + role.Name + " with " + access.AccessMode + " access to S3 bucket " + bucket.Name + " (" + access.BucketName + ")."
 }
 
 func (risk githubActionsRiskSignal) ruleIDSummary() string {

@@ -24,6 +24,7 @@ const (
 	OIDCTokenCapability NodeKind = "OIDCTokenCapability"
 	AWSIAMRole          NodeKind = "AWSIAMRole"
 	AWSPermission       NodeKind = "AWSPermission"
+	AWSS3Bucket         NodeKind = "AWSS3Bucket"
 )
 
 type NodeID string
@@ -41,6 +42,8 @@ const (
 	UsesAction          EdgeKind = "UsesAction"
 	CanRequestOIDCToken EdgeKind = "CanRequestOIDCToken"
 	CanAssumeRole       EdgeKind = "CanAssumeRole"
+	CanReadObject       EdgeKind = "CanReadObject"
+	CanWriteObject      EdgeKind = "CanWriteObject"
 )
 
 var (
@@ -67,6 +70,7 @@ type NodeMetadata struct {
 	GitHubActionsOIDCTokenCapability *GitHubActionsOIDCTokenCapability `json:"github_actions_oidc_token_capability,omitempty"`
 	AWSIAMRole                       *AWSIAMRoleMetadata               `json:"aws_iam_role,omitempty"`
 	AWSPermission                    *AWSPermissionMetadata            `json:"aws_permission,omitempty"`
+	AWSS3Bucket                      *AWSS3BucketMetadata              `json:"aws_s3_bucket,omitempty"`
 }
 
 type EdgeMetadata struct {
@@ -75,6 +79,7 @@ type EdgeMetadata struct {
 	GitHubActionsWorkflowJob        *GitHubActionsWorkflowJob        `json:"github_actions_workflow_job,omitempty"`
 	GitHubActionsOIDCTokenRequest   *GitHubActionsOIDCTokenRequest   `json:"github_actions_oidc_token_request,omitempty"`
 	AWSCanAssumeRole                *AWSCanAssumeRoleMetadata        `json:"aws_can_assume_role,omitempty"`
+	AWSS3Access                     *AWSS3AccessMetadata             `json:"aws_s3_access,omitempty"`
 }
 
 type AWSIAMRoleMetadata struct {
@@ -137,6 +142,34 @@ type AWSPermissionMetadata struct {
 	ManagedPolicyARN         string   `json:"managed_policy_arn,omitempty"`
 	Administrative           bool     `json:"administrative"`
 	AdminReason              string   `json:"admin_reason,omitempty"`
+}
+
+type AWSS3BucketMetadata struct {
+	Provider        string `json:"provider"`
+	BucketName      string `json:"bucket_name"`
+	ResourceName    string `json:"resource_name"`
+	SourceReference string `json:"source_reference"`
+}
+
+type AWSS3AccessMetadata struct {
+	Provider              string             `json:"provider"`
+	RoleResourceName      string             `json:"role_resource_name"`
+	BucketName            string             `json:"bucket_name"`
+	BucketResourceName    string             `json:"bucket_resource_name"`
+	BucketSourceReference string             `json:"bucket_source_reference"`
+	AccessMode            string             `json:"access_mode"`
+	Grants                []AWSS3AccessGrant `json:"grants"`
+}
+
+type AWSS3AccessGrant struct {
+	AccessMode               string `json:"access_mode"`
+	AccessKind               string `json:"access_kind"`
+	Action                   string `json:"action"`
+	Resource                 string `json:"resource"`
+	PolicySourceReference    string `json:"policy_source_reference"`
+	PolicyResourceName       string `json:"policy_resource_name"`
+	AttachedRoleResourceName string `json:"attached_role_resource_name"`
+	StatementIndex           int    `json:"statement_index"`
 }
 
 type GitHubActionsWorkflow struct {
@@ -458,6 +491,10 @@ func cloneNode(node Node) Node {
 			permission.Resources = cloneStrings(permission.Resources)
 			metadata.AWSPermission = &permission
 		}
+		if metadata.AWSS3Bucket != nil {
+			bucket := *metadata.AWSS3Bucket
+			metadata.AWSS3Bucket = &bucket
+		}
 		node.Metadata = &metadata
 	}
 	return node
@@ -495,8 +532,20 @@ func cloneEdge(edge Edge) Edge {
 		canAssume.Matches = cloneAWSCanAssumeRoleMatches(canAssume.Matches)
 		metadata.AWSCanAssumeRole = &canAssume
 	}
+	if metadata.AWSS3Access != nil {
+		access := *metadata.AWSS3Access
+		access.Grants = cloneAWSS3AccessGrants(access.Grants)
+		metadata.AWSS3Access = &access
+	}
 	edge.Metadata = &metadata
 	return edge
+}
+
+func cloneAWSS3AccessGrants(grants []AWSS3AccessGrant) []AWSS3AccessGrant {
+	if grants == nil {
+		return nil
+	}
+	return append([]AWSS3AccessGrant(nil), grants...)
 }
 
 func cloneAWSCanAssumeRoleMatches(matches []AWSCanAssumeRoleMatch) []AWSCanAssumeRoleMatch {
