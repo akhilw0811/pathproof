@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -17,9 +18,32 @@ const (
 	providerAWS         = "aws"
 	githubActionsIssuer = "token.actions.githubusercontent.com"
 	awsAudience         = "sts.amazonaws.com"
+	accessModeRead      = "read"
+	accessModeWrite     = "write"
 )
 
 func AddRoutes(g *graph.Graph, resources parserterraform.Resources, workflows parsergithubactions.Resources, repo string) error {
+	bucketsByName := make(map[string][]graph.Node)
+	for _, bucket := range resources.S3Buckets {
+		bucketNode := graph.NewNode(graph.AWSS3Bucket, bucketNodeName(bucket))
+		bucketNode.Evidence = []graph.SourceEvidence{{
+			Source: sourceRef(bucket.Source),
+			Detail: "terraform aws_s3_bucket " + bucket.ResourceName + " with static bucket name",
+		}}
+		metadata := bucketMetadata(bucket)
+		bucketNode.Metadata = &graph.NodeMetadata{AWSS3Bucket: &metadata}
+		addedBucket, err := g.AddNode(bucketNode)
+		if err != nil {
+			return fmt.Errorf("add aws s3 bucket %s: %w", bucket.ResourceName, err)
+		}
+		bucketsByName[bucket.BucketName] = append(bucketsByName[bucket.BucketName], addedBucket)
+	}
+	for bucketName := range bucketsByName {
+		sort.SliceStable(bucketsByName[bucketName], func(i, j int) bool {
+			return bucketsByName[bucketName][i].ID < bucketsByName[bucketName][j].ID
+		})
+	}
+
 	for _, role := range resources.IAMRoles {
 		roleNode := graph.NewNode(graph.AWSIAMRole, roleNodeName(role))
 		roleNode.Evidence = []graph.SourceEvidence{{
@@ -33,6 +57,9 @@ func AddRoutes(g *graph.Graph, resources parserterraform.Resources, workflows pa
 			return fmt.Errorf("add aws iam role %s: %w", role.ResourceName, err)
 		}
 		if err := addRolePermissions(g, addedRole, role); err != nil {
+			return err
+		}
+		if err := addRoleS3Access(g, addedRole, role, bucketsByName); err != nil {
 			return err
 		}
 	}
@@ -96,6 +123,216 @@ func AddRoutes(g *graph.Graph, resources parserterraform.Resources, workflows pa
 		}
 	}
 	return nil
+}
+
+type s3AccessAggregate struct {
+	edge     graph.Edge
+	metadata graph.AWSS3AccessMetadata
+	seen     map[string]struct{}
+}
+
+func (aggregate *s3AccessAggregate) add(grant graph.AWSS3AccessGrant) {
+	key := s3AccessGrantIdentity(grant)
+	if _, ok := aggregate.seen[key]; ok {
+		return
+	}
+	aggregate.seen[key] = struct{}{}
+	aggregate.metadata.Grants = append(aggregate.metadata.Grants, grant)
+}
+
+func (aggregate *s3AccessAggregate) finalize() graph.Edge {
+	sort.SliceStable(aggregate.metadata.Grants, func(i, j int) bool {
+		return s3AccessGrantIdentity(aggregate.metadata.Grants[i]) < s3AccessGrantIdentity(aggregate.metadata.Grants[j])
+	})
+	if len(aggregate.metadata.Grants) > 0 {
+		aggregate.edge.Evidence.Source = aggregate.metadata.Grants[0].PolicySourceReference
+	}
+	aggregate.edge.Evidence.Detail = s3AccessEvidenceDetail(aggregate.metadata)
+	aggregate.edge.Metadata = &graph.EdgeMetadata{AWSS3Access: &aggregate.metadata}
+	return aggregate.edge
+}
+
+func addRoleS3Access(g *graph.Graph, roleNode graph.Node, role parserterraform.IAMRole, bucketsByName map[string][]graph.Node) error {
+	aggregates := make(map[string]*s3AccessAggregate)
+	for _, permission := range role.Permissions {
+		if permission.Administrative {
+			continue
+		}
+		for _, action := range permission.Actions {
+			for _, resource := range permission.Resources {
+				matches := s3AccessMatches(action, resource)
+				if len(matches) == 0 {
+					continue
+				}
+				bucketName, ok := s3BucketNameFromResourceARN(resource)
+				if !ok {
+					continue
+				}
+				for _, bucketNode := range bucketsByName[bucketName] {
+					if bucketNode.Metadata == nil || bucketNode.Metadata.AWSS3Bucket == nil {
+						continue
+					}
+					bucketMetadata := *bucketNode.Metadata.AWSS3Bucket
+					for _, match := range matches {
+						kind := graph.CanReadObject
+						if match.accessMode == accessModeWrite {
+							kind = graph.CanWriteObject
+						}
+						key := string(roleNode.ID) + "\x00" + string(bucketNode.ID) + "\x00" + match.accessMode
+						aggregate := aggregates[key]
+						if aggregate == nil {
+							aggregate = &s3AccessAggregate{
+								edge: graph.NewEdge(kind, roleNode.ID, bucketNode.ID, graph.SourceEvidence{
+									Source: sourceRef(permission.Source),
+								}),
+								metadata: graph.AWSS3AccessMetadata{
+									Provider:              providerAWS,
+									RoleResourceName:      role.ResourceName,
+									BucketName:            bucketMetadata.BucketName,
+									BucketResourceName:    bucketMetadata.ResourceName,
+									BucketSourceReference: bucketMetadata.SourceReference,
+									AccessMode:            match.accessMode,
+								},
+								seen: make(map[string]struct{}),
+							}
+							aggregates[key] = aggregate
+						}
+						aggregate.add(graph.AWSS3AccessGrant{
+							AccessMode:               match.accessMode,
+							AccessKind:               match.accessKind,
+							Action:                   action,
+							Resource:                 resource,
+							PolicySourceReference:    sourceRef(permission.Source),
+							PolicyResourceName:       permission.PolicyResourceName,
+							AttachedRoleResourceName: permission.AttachedRoleResourceName,
+							StatementIndex:           permission.StatementIndex,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	ordered := make([]*s3AccessAggregate, 0, len(aggregates))
+	for _, aggregate := range aggregates {
+		ordered = append(ordered, aggregate)
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].edge.ID < ordered[j].edge.ID
+	})
+	for _, aggregate := range ordered {
+		if _, err := g.AddEdge(aggregate.finalize()); err != nil {
+			return fmt.Errorf("add aws s3 access edge for role %s: %w", role.ResourceName, err)
+		}
+	}
+	return nil
+}
+
+type s3AccessMatch struct {
+	accessMode string
+	accessKind string
+}
+
+func s3AccessMatches(action, resource string) []s3AccessMatch {
+	bucketName, ok := s3BucketNameFromResourceARN(resource)
+	if !ok || bucketName == "" {
+		return nil
+	}
+	objectARN := strings.HasSuffix(resource, "/*")
+	bucketARN := !objectARN
+	switch action {
+	case "s3:ListBucket":
+		if bucketARN {
+			return []s3AccessMatch{{accessMode: accessModeRead, accessKind: "list_bucket"}}
+		}
+	case "s3:GetObject":
+		if objectARN {
+			return []s3AccessMatch{{accessMode: accessModeRead, accessKind: "get_object"}}
+		}
+	case "s3:PutObject":
+		if objectARN {
+			return []s3AccessMatch{{accessMode: accessModeWrite, accessKind: "put_object"}}
+		}
+	case "s3:DeleteObject":
+		if objectARN {
+			return []s3AccessMatch{{accessMode: accessModeWrite, accessKind: "delete_object"}}
+		}
+	case "s3:*":
+		if bucketARN {
+			return []s3AccessMatch{{accessMode: accessModeRead, accessKind: "s3_star_bucket"}}
+		}
+		if objectARN {
+			return []s3AccessMatch{
+				{accessMode: accessModeRead, accessKind: "s3_star_object"},
+				{accessMode: accessModeWrite, accessKind: "s3_star_object"},
+			}
+		}
+	}
+	return nil
+}
+
+func s3BucketNameFromResourceARN(resource string) (string, bool) {
+	const prefix = "arn:aws:s3:::"
+	if !strings.HasPrefix(resource, prefix) {
+		return "", false
+	}
+	target := strings.TrimPrefix(resource, prefix)
+	if target == "" || target == "*" || strings.Contains(target, "${") || strings.Contains(target, "%{") {
+		return "", false
+	}
+	if strings.HasSuffix(target, "/*") {
+		bucketName := strings.TrimSuffix(target, "/*")
+		if bucketName == "" || strings.ContainsAny(bucketName, "*/") {
+			return "", false
+		}
+		return bucketName, true
+	}
+	if strings.ContainsAny(target, "*/") {
+		return "", false
+	}
+	return target, true
+}
+
+func s3AccessGrantIdentity(grant graph.AWSS3AccessGrant) string {
+	data, err := json.Marshal(struct {
+		AccessMode               string `json:"access_mode"`
+		AccessKind               string `json:"access_kind"`
+		Action                   string `json:"action"`
+		Resource                 string `json:"resource"`
+		PolicySourceReference    string `json:"policy_source_reference"`
+		PolicyResourceName       string `json:"policy_resource_name"`
+		AttachedRoleResourceName string `json:"attached_role_resource_name"`
+		StatementIndex           int    `json:"statement_index"`
+	}{
+		AccessMode:               grant.AccessMode,
+		AccessKind:               grant.AccessKind,
+		Action:                   grant.Action,
+		Resource:                 grant.Resource,
+		PolicySourceReference:    stableSourceReferenceValue(grant.PolicySourceReference),
+		PolicyResourceName:       grant.PolicyResourceName,
+		AttachedRoleResourceName: grant.AttachedRoleResourceName,
+		StatementIndex:           grant.StatementIndex,
+	})
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func stableSourceReferenceValue(value string) string {
+	filename, resource, ok := strings.Cut(value, "#resource=")
+	if !ok {
+		return value
+	}
+	return filepath.ToSlash(filepath.Clean(filename)) + "#resource=" + resource
+}
+
+func s3AccessEvidenceDetail(metadata graph.AWSS3AccessMetadata) string {
+	parts := make([]string, 0, len(metadata.Grants))
+	for _, grant := range metadata.Grants {
+		parts = append(parts, fmt.Sprintf("%s action=%s resource=%s", grant.AccessKind, grant.Action, grant.Resource))
+	}
+	return fmt.Sprintf("aws iam role %s has %s access to s3 bucket %s via static policy grant(s): %s", metadata.RoleResourceName, metadata.AccessMode, metadata.BucketName, strings.Join(parts, "; "))
 }
 
 func addRolePermissions(g *graph.Graph, roleNode graph.Node, role parserterraform.IAMRole) error {
@@ -375,6 +612,15 @@ func roleMetadata(role parserterraform.IAMRole) graph.AWSIAMRoleMetadata {
 	}
 }
 
+func bucketMetadata(bucket parserterraform.S3Bucket) graph.AWSS3BucketMetadata {
+	return graph.AWSS3BucketMetadata{
+		Provider:        providerAWS,
+		BucketName:      bucket.BucketName,
+		ResourceName:    bucket.ResourceName,
+		SourceReference: sourceRef(bucket.Source),
+	}
+}
+
 func permissionMetadata(permission parserterraform.IAMPermission) graph.AWSPermissionMetadata {
 	return graph.AWSPermissionMetadata{
 		Provider:                 providerAWS,
@@ -446,6 +692,10 @@ func uniqueStrings(values []string) []string {
 
 func roleNodeName(role parserterraform.IAMRole) string {
 	return "aws://terraform/aws_iam_role/" + role.Source.RelativePath + "/" + role.ResourceName
+}
+
+func bucketNodeName(bucket parserterraform.S3Bucket) string {
+	return "aws://terraform/aws_s3_bucket/" + bucket.Source.RelativePath + "/" + bucket.ResourceName
 }
 
 func permissionNodeName(permission parserterraform.IAMPermission) string {

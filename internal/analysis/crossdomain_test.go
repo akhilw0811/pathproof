@@ -581,6 +581,202 @@ jobs:
 	}
 }
 
+func TestAnalyzeCrossDomainS3WorkflowRiskEmitsPPXDomain003Read(t *testing.T) {
+	findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"), "owner/repo"))
+
+	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	if finding.Title != crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle {
+		t.Fatalf("title = %q, want %q", finding.Title, crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle)
+	}
+	if finding.Severity != SeverityHigh {
+		t.Fatalf("severity = %q, want High", finding.Severity)
+	}
+	assertFindingNodeKinds(t, finding, []graph.NodeKind{graph.Workflow, graph.OIDCTokenCapability, graph.AWSIAMRole, graph.AWSS3Bucket})
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.CanReadObject})
+	if finding.RiskSignal == nil || finding.RiskSignal.RuleID != RuleGitHubActionsDangerousPermissions {
+		t.Fatalf("risk signal = %#v, want PP-GHA-003", finding.RiskSignal)
+	}
+	if !strings.Contains(finding.Summary, "read access") || !strings.Contains(finding.Summary, "prod-artifacts") {
+		t.Fatalf("summary = %q, want bucket read access", finding.Summary)
+	}
+}
+
+func TestAnalyzeCrossDomainS3JobRiskEmitsPPXDomain003Write(t *testing.T) {
+	findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+`, terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "write", "s3:PutObject", "arn:aws:s3:::prod-artifacts/*"), "owner/repo"))
+
+	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	assertFindingNodeKinds(t, finding, []graph.NodeKind{graph.Workflow, graph.WorkflowJob, graph.OIDCTokenCapability, graph.AWSIAMRole, graph.AWSS3Bucket})
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.DefinesJob, graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.CanWriteObject})
+	if finding.RiskSignal == nil || finding.RiskSignal.JobID != "deploy" || finding.RiskSignal.Permission != "id-token" {
+		t.Fatalf("risk signal = %#v, want job-level id-token risk", finding.RiskSignal)
+	}
+	if !strings.Contains(finding.Summary, "write access") {
+		t.Fatalf("summary = %q, want write access", finding.Summary)
+	}
+}
+
+func TestAnalyzeCrossDomainS3RequiresRiskTrustAndS3Access(t *testing.T) {
+	tests := []struct {
+		name      string
+		workflow  string
+		terraform string
+		repo      string
+	}{
+		{
+			name: "safe OIDC trust and S3 access without risk",
+			workflow: `on: pull_request
+permissions:
+  id-token: write
+`,
+			terraform: terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "risk and trust without S3 access",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRole("deploy", "repo:owner/repo:pull_request") + terraformS3Bucket("artifacts", "prod-artifacts"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "branch trust does not match pull request risk",
+			workflow: `on:
+  push:
+    branches: [main]
+  pull_request_target:
+permissions: write-all
+`,
+			terraform: terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:ref:refs/heads/main", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "environment trust does not match pull request risk",
+			workflow: `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: prod
+`,
+			terraform: terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:environment:prod", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "PP-GHA-001 alone does not trigger",
+			workflow: `on: pull_request
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - uses: owner/repo@main
+`,
+			terraform: terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "admin permission alone does not imply S3 access",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*") + terraformS3Bucket("artifacts", "prod-artifacts"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "nonmatching bucket policy",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::other-artifacts/*"),
+			repo:      "owner/repo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, tt.workflow, tt.terraform, tt.repo))
+			if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket); got != 0 {
+				t.Fatalf("PP-XDOMAIN-003 count = %d, want 0: %#v", got, findings)
+			}
+		})
+	}
+}
+
+func TestAnalyzeCrossDomainS3ReadAndWriteSameBucketProduceDistinctFindings(t *testing.T) {
+	findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "all_s3", "s3:*", "arn:aws:s3:::prod-artifacts/*"), "owner/repo"))
+
+	var s3Findings []Finding
+	for _, finding := range findings {
+		if finding.RuleID == RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket {
+			s3Findings = append(s3Findings, finding)
+		}
+	}
+	if len(s3Findings) != 2 {
+		t.Fatalf("PP-XDOMAIN-003 count = %d, want read and write findings: %#v", len(s3Findings), findings)
+	}
+	if s3Findings[0].ID == s3Findings[1].ID {
+		t.Fatalf("read/write findings have duplicate ID: %#v", s3Findings)
+	}
+	kinds := map[graph.EdgeKind]bool{}
+	for _, finding := range s3Findings {
+		kinds[finding.Evidence[len(finding.Evidence)-1].Kind] = true
+	}
+	if !kinds[graph.CanReadObject] || !kinds[graph.CanWriteObject] {
+		t.Fatalf("finding edge kinds = %#v, want read and write", kinds)
+	}
+}
+
+func TestAnalyzeCrossDomainS3FindingIDsAreStableSensitiveAndSanitized(t *testing.T) {
+	const envSecret = "FAKE_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN"
+	const withSecret = "FAKE_XDOMAIN3_GHA_WITH_SECRET_DO_NOT_RETAIN"
+	const runSecret = "FAKE_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN"
+	const terraformSecret = "FAKE_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN"
+	workflow := `on: pull_request_target
+permissions:
+  id-token: write
+env:
+  TOKEN: FAKE_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    steps:
+      - run: echo FAKE_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: owner/action@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_XDOMAIN3_GHA_WITH_SECRET_DO_NOT_RETAIN
+`
+	terraform := terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*") + "\n# " + terraformSecret + "\n"
+	g := crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraform, "owner/repo")
+
+	first := mustMarshalFindings(t, Analyze(g))
+	second := mustMarshalFindings(t, Analyze(g))
+	if string(first) != string(second) {
+		t.Fatalf("PP-XDOMAIN-003 findings differ across repeated analysis:\nfirst: %s\nsecond:%s", first, second)
+	}
+	base := onlyFindingByRule(t, Analyze(g), RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	changedBucket := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "other", "other-artifacts", "read", "s3:GetObject", "arn:aws:s3:::other-artifacts/*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	changedRole := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraformRoleWithS3BucketAndPolicy("audit", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	changedMode := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "write", "s3:PutObject", "arn:aws:s3:::prod-artifacts/*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	for name, changed := range map[string]Finding{"bucket": changedBucket, "role": changedRole, "access mode": changedMode} {
+		if base.ID == changed.ID {
+			t.Fatalf("finding ID did not change when %s changed: %q", name, base.ID)
+		}
+	}
+	data := mustMarshalFindings(t, Analyze(g))
+	for _, forbidden := range []string{envSecret, withSecret, runSecret, terraformSecret, "run:", "${{", "assume_role_policy", "Principal", "Condition", "Statement", "policy =", "FAKE_XDOMAIN3"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("finding JSON contains %q: %s", forbidden, data)
+		}
+	}
+}
+
 func TestAnalyzeRiskSignalOmittedForExistingRules(t *testing.T) {
 	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
 permissions:
@@ -700,6 +896,23 @@ func terraformRoleWithInlinePolicy(name, subject, policyName, action, resource s
 resource "aws_iam_role_policy" "` + policyName + `" {
   role = aws_iam_role.` + name + `.id
   policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
+func terraformRoleWithS3BucketAndPolicy(roleName, subject, bucketResourceName, bucketName, policyName, action, resource string) string {
+	return terraformRole(roleName, subject) + terraformS3Bucket(bucketResourceName, bucketName) + `
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + roleName + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
+func terraformS3Bucket(resourceName, bucketName string) string {
+	return `
+resource "aws_s3_bucket" "` + resourceName + `" {
+  bucket = "` + bucketName + `"
 }
 `
 }

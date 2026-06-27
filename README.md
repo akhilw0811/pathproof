@@ -17,7 +17,10 @@ locally parsed AWS IAM role trust. It also models a narrow local Terraform
 slice for static AWS IAM role permissions, reports `PP-AWS-001` when an
 `aws_iam_role` has an inline wildcard admin policy or a literal
 AdministratorAccess attachment, and reports `PP-XDOMAIN-002` when a risky
-GitHub Actions OIDC path can assume such an administrative role.
+GitHub Actions OIDC path can assume such an administrative role. It also
+models static local `aws_s3_bucket` resources and explicit exact S3 grants in
+inline role policies, and reports `PP-XDOMAIN-003` when a risky GitHub Actions
+OIDC path can assume an AWS IAM role that can access a modeled S3 bucket.
 
 PathProof is currently a defensive Go CLI focused on two small, tested local
 slices. It scans local YAML manifests and workflows, builds an in-memory graph,
@@ -39,13 +42,17 @@ forms; this is not IAM simulation.
 `PP-XDOMAIN-002` reports the current local cross-domain admin slice: a risky
 `pull_request_target` workflow or job with modeled OIDC capability can assume
 an AWS IAM role that also has a supported static administrative permission.
+`PP-XDOMAIN-003` reports one narrow local cross-domain S3 slice: the same
+risky OIDC context reaches an AWS IAM role with explicit static read or write
+access to a locally modeled `aws_s3_bucket`.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
 Terraform execution, module or variable evaluation, reusable workflow
 resolution, action source inspection, broader sensitive-resource types, live
 cluster scanning, cloud validation, IAM simulation, broad cross-domain
-analysis, pull request creation, AI/ML ranking, and dashboards are not
+analysis, S3 bucket policies, KMS modeling, public access block modeling,
+object modeling, pull request creation, AI/ML ranking, and dashboards are not
 implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
@@ -220,6 +227,20 @@ Title: Risky GitHub Actions workflow can assume administrative AWS IAM role
 Severity: High
 ```
 
+Scan the cross-domain GitHub Actions OIDC to AWS S3 bucket demo fixture:
+
+```sh
+./bin/pathproof scan --repo owner/repo ./examples/cross-domain/github-oidc-s3-access
+```
+
+Expected shape:
+
+```text
+Rule: PP-XDOMAIN-003
+Title: Risky GitHub Actions workflow can access AWS S3 bucket
+Severity: High
+```
+
 ## GitHub Actions Security
 
 PathProof currently implements three small local GitHub Actions checks:
@@ -244,6 +265,9 @@ PathProof currently implements three small local GitHub Actions checks:
 - `PP-XDOMAIN-002`: the same risky OIDC path reaches a statically modeled AWS
   IAM role that grants an obvious administrative permission in the supported
   local Terraform slice.
+- `PP-XDOMAIN-003`: the same risky OIDC path reaches a statically modeled AWS
+  IAM role with explicit exact S3 read or write access to a modeled
+  `aws_s3_bucket`.
 
 These checks are static and local. PathProof does not execute workflows, call
 GitHub APIs, evaluate expressions, inspect action source, model workflow
@@ -273,12 +297,16 @@ is administrative. Both cross-domain rules require the matched OIDC subject to
 be the pull request subject for the risky `pull_request_target` context; branch
 or environment trust matches are modeled for future rules but do not trigger
 these findings.
+`PP-XDOMAIN-003` additionally requires an explicit
+`AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket` edge from exact
+static S3 action/resource pairs. It does not expand AdministratorAccess,
+`Action "*" Resource "*"`, or `s3:* Resource "*"` into bucket access.
 
 This slice does not execute Terraform, parse modules, evaluate variables,
 locals, functions, `jsonencode`, interpolations, or
 `aws_iam_policy_document`, call AWS or GitHub APIs, verify ARNs or accounts,
-simulate IAM permissions, inspect unsupported role policies, or provide
-remediation.
+simulate IAM permissions, inspect unsupported role policies, parse S3 bucket
+policies, model S3 objects, model KMS, or provide remediation.
 
 ## Terraform AWS IAM Permissions
 
@@ -352,6 +380,9 @@ only publishes the SARIF file as an artifact.
 - `PP-XDOMAIN-002` detection for the local cross-domain GitHub Actions OIDC to
   administrative AWS IAM role path, gated by the same modeled risk signals and
   supported static AWS admin permission metadata.
+- `PP-XDOMAIN-003` detection for the local cross-domain GitHub Actions OIDC to
+  AWS S3 bucket access path, gated by the same modeled risk signals and
+  explicit exact static S3 access to modeled buckets.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -364,16 +395,19 @@ The scan loop is:
 1. Parse local Kubernetes YAML manifests.
 2. Parse local GitHub Actions workflow YAML files under `.github/workflows`.
 3. Parse local Terraform `.tf` files for static AWS IAM role OIDC trust
-   metadata and narrow static AWS IAM role permission facts.
+   metadata, narrow static AWS IAM role permission facts, and static S3 bucket
+   names.
 4. Build an in-memory evidence graph.
 5. Add deterministic Kubernetes routing and RBAC-derived Secret read edges.
 6. Add deterministic GitHub Actions workflow/job/action-use edges and
    graph-only OIDC token capability edges.
-7. Add deterministic AWS IAM role trust nodes, AWS permission nodes, permission
-   edges, and optional `CanAssumeRole` edges when `--repo OWNER/REPO` supplies
-   repository identity for static subject matching.
+7. Add deterministic AWS IAM role trust nodes, AWS permission nodes, S3 bucket
+   nodes, permission edges, exact S3 access edges, and optional
+   `CanAssumeRole` edges when `--repo OWNER/REPO` supplies repository identity
+   for static subject matching.
 8. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`,
-   `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, and `PP-XDOMAIN-002`.
+   `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and
+   `PP-XDOMAIN-003`.
 9. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
 10. Optionally generate read-only `NarrowBindingSubject` patch previews.
@@ -399,6 +433,10 @@ Implemented:
 - `PP-GHA-002` finding for unsafe `pull_request_target` checkout of pull
   request head code.
 - `PP-GHA-003` finding for dangerous `pull_request_target` token permissions.
+- Narrow local Terraform S3 bucket parsing and exact IAM role S3 access
+  modeling for modeled buckets.
+- `PP-XDOMAIN-003` finding for risky GitHub Actions OIDC access to a modeled
+  AWS S3 bucket.
 - SARIF 2.1.0 finding export.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.

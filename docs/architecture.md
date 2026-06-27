@@ -71,7 +71,8 @@ Implemented Terraform parsing lives under `internal/parser/terraform`. It
 walks local `.tf` files under the scan root and recognizes only top-level
 static `aws_iam_role`, `aws_iam_role_policy`, and
 `aws_iam_role_policy_attachment` resources needed for the current AWS IAM
-trust and permission slices. For role trust, it supports `assume_role_policy`
+trust and permission slices, plus static `aws_s3_bucket` resources for the
+current S3 access slice. For role trust, it supports `assume_role_policy`
 as a static literal heredoc JSON string or simple quoted JSON string and parses
 only the extracted trust-policy JSON using `encoding/json`. For role
 permissions, it supports inline `aws_iam_role_policy` JSON attached by
@@ -80,15 +81,22 @@ only when exactly one parsed role has an explicit static `name` matching that
 literal. It also supports `aws_iam_role_policy_attachment` only for the
 literal AWS managed policy ARN
 `arn:aws:iam::aws:policy/AdministratorAccess`.
+For S3, it supports only `aws_s3_bucket` with a safe literal `bucket` name and
+inline role-policy statements using exact action strings `s3:GetObject`,
+`s3:ListBucket`, `s3:PutObject`, `s3:DeleteObject`, or `s3:*` with exact
+bucket or object ARNs for modeled buckets.
 
 The Terraform parser ignores variables, locals, modules, data sources,
 `jsonencode`, function calls, interpolation, dynamic blocks, references to
 `aws_iam_policy_document`, nonliteral trust or permission policies, unknown
-managed policy ARNs, `NotAction`, conditions, unsupported actions/resources,
-ambiguous literal role-name matches, and non-role IAM resources. It does not
+managed policy ARNs, `NotAction`, `NotResource`, conditions, unsupported
+actions/resources,
+ambiguous literal role-name matches, wildcard S3 bucket ARNs, wildcard S3
+prefixes, and non-role IAM resources. It does not
 execute Terraform, evaluate HCL, call AWS, call GitHub, parse remote state, or
 retain raw Terraform files, raw policy JSON, provider credentials, variable
-values, access keys, secret-like strings, or unsupported condition values.
+values, access keys, tags, secret-like strings, or unsupported condition
+values.
 Malformed supported Terraform syntax and malformed extracted JSON return
 deterministic sanitized errors with file or resource context and no raw policy
 content.
@@ -151,6 +159,16 @@ role permissions. AWS permission metadata is limited to provider, source
 reference, policy or attachment resource name, attached role resource name,
 sanitized supported action/resource lists, the literal AdministratorAccess ARN
 when applicable, and precise admin reason identities.
+It also adds `AWSS3Bucket` nodes and exact
+`AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket` edges when a
+supported inline role policy grants `s3:ListBucket` to the exact bucket ARN,
+`s3:GetObject` to the exact object ARN, `s3:PutObject` or `s3:DeleteObject` to
+the exact object ARN, or `s3:*` to the exact bucket/object ARN. `s3:*` on a
+bucket ARN creates read access only; `s3:*` on an object ARN creates read and
+write access. `Resource "*"`, wildcard bucket ARNs, wildcard prefixes,
+AdministratorAccess, and administrative permission metadata do not create S3
+access edges. Multiple matching grants for the same role, bucket, and access
+mode are deduplicated and aggregated on one edge.
 
 When the optional CLI flag
 `--repo OWNER/REPO` is supplied, routing generates a limited set of GitHub
@@ -234,7 +252,9 @@ explicitly modeled workflow-level or job-level OIDC capability reaches a
 matched AWS IAM role trust and the same workflow/job has a structured
 GitHub Actions risk signal from `PP-GHA-002` or `PP-GHA-003`. `PP-XDOMAIN-002`
 adds one required graph hop from that same risky pull request OIDC context to
-an administrative AWS permission. The supported `PP-XDOMAIN-001` paths are:
+an administrative AWS permission. `PP-XDOMAIN-003` adds one required graph hop
+from that same risky pull request OIDC context to explicit modeled S3 bucket
+access. The supported `PP-XDOMAIN-001` paths are:
 
 `Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole`
 
@@ -250,6 +270,14 @@ and:
 
 `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --GrantsPermission--> AWSPermission`
 
+The supported `PP-XDOMAIN-003` paths are:
+
+`Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`
+
+and:
+
+`Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`
+
 Workflow-level dangerous permission risk pairs only with workflow-level OIDC.
 Job-level dangerous permission risk pairs only with same-job OIDC. Unsafe
 checkout risk is a job/step risk and pairs with same-job OIDC when modeled; it
@@ -262,6 +290,9 @@ or other subject matches on the same OIDC capability do not produce these
 findings. `PP-XDOMAIN-002` also requires the `AWSPermission` metadata to be
 administrative with one of the same supported admin reason identities used by
 `PP-AWS-001`.
+`PP-XDOMAIN-003` also requires S3 access edge metadata with access mode
+`read` or `write` and at least one sanitized matched grant. Admin permissions
+alone do not imply S3 access in this slice.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
@@ -274,8 +305,9 @@ authorization metadata, and emits complete advisory options. It does not parse
 human-readable evidence prose and does not modify source manifests. The
 implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
 `NarrowBindingSubject`. `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`,
-`PP-AWS-001`, `PP-XDOMAIN-001`, and `PP-XDOMAIN-002` receive no remediation
-plan, patch preview, patch output, or validation result in this slice.
+`PP-AWS-001`, `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`
+receive no remediation plan, patch preview, patch output, or validation result
+in this slice.
 
 Optional patch preview generation lives under `internal/patchpreview`. It is
 also read-only: it consumes the scan root and remediation plans, resolves
@@ -314,7 +346,8 @@ output directory, and never prints temporary paths or manifest contents.
 SARIF output is a findings-only CLI projection. `pathproof scan --format sarif`
 emits SARIF 2.1.0 with one PathProof tool driver, deterministic rule entries
 for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
-`PP-XDOMAIN-001`, and `PP-XDOMAIN-002`, and one result per finding.
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`, and one result per
+finding.
 SARIF stdout
 omits patch previews, patch output
 summaries, validation results, unified diffs, patched file contents, temporary

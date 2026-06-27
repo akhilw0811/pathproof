@@ -110,6 +110,7 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 							sarifAWSIAMRoleAdministrativePermissionsRule(),
 							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule(),
 							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleRule(),
+							sarifCrossDomainRiskyGitHubActionsCanAccessAWSS3BucketRule(),
 						},
 					},
 				},
@@ -217,6 +218,20 @@ func sarifCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleRule() sarifRule {
 	}
 }
 
+func sarifCrossDomainRiskyGitHubActionsCanAccessAWSS3BucketRule() sarifRule {
+	const title = "Risky GitHub Actions workflow can access AWS S3 bucket"
+	return sarifRule{
+		ID:               string(analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects a deterministic local cross-domain path where a risky GitHub Actions workflow or job has OIDC capability that can assume a statically modeled AWS IAM role with explicit static S3 access to a modeled bucket."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "error",
+		},
+		Help: sarifMessage{Text: "Review the risky pull_request_target workflow condition, AWS IAM role trust, and explicit S3 policy grant. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, parse S3 bucket policies, or provide remediation for this rule."},
+	}
+}
+
 func newSARIFResult(root string, finding scanFinding) sarifResult {
 	sourceReferences := sarifSourceReferences(root, finding)
 	locations := make([]sarifLocation, 0, len(sourceReferences))
@@ -249,7 +264,7 @@ func newSARIFResult(root string, finding scanFinding) sarifResult {
 }
 
 func sarifFindingMessage(finding scanFinding) string {
-	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions || finding.RuleID == analysis.RuleAWSIAMRoleAdministrativePermissions || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole) && finding.Summary != "" {
+	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions || finding.RuleID == analysis.RuleAWSIAMRoleAdministrativePermissions || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket) && finding.Summary != "" {
 		return finding.Summary
 	}
 	parts := make([]string, 0, len(finding.Path))
@@ -358,7 +373,7 @@ func supportedTerraformSARIFResource(value string) bool {
 		return false
 	}
 	switch resourceType {
-	case "aws_iam_role_policy", "aws_iam_role_policy_attachment":
+	case "aws_iam_role_policy", "aws_iam_role_policy_attachment", "aws_s3_bucket":
 	default:
 		return false
 	}
