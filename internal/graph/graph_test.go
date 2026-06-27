@@ -81,6 +81,43 @@ func TestGraphAddNodeClonesCallerEvidence(t *testing.T) {
 	}
 }
 
+func TestGraphAddNodeClonesAWSS3BucketSensitivityReasons(t *testing.T) {
+	g := New()
+	node := NewNode(AWSS3Bucket, "aws://terraform/aws_s3_bucket/s3.tf/artifacts")
+	reasons := []AWSS3BucketSensitivityReason{{
+		Source:       "bucket_name",
+		MatchedToken: "prod",
+		SourceRef:    "s3.tf#resource=aws_s3_bucket.artifacts",
+	}}
+	node.Metadata = &NodeMetadata{AWSS3Bucket: &AWSS3BucketMetadata{
+		Provider:           "aws",
+		BucketName:         "prod-artifacts",
+		ResourceName:       "artifacts",
+		SourceReference:    "s3.tf#resource=aws_s3_bucket.artifacts",
+		SensitivityLevel:   "sensitive",
+		SensitivityReasons: reasons,
+	}}
+
+	added := mustAddNode(t, g, node)
+	reasons[0].MatchedToken = "changed"
+	got, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found", added.ID)
+	}
+	if got.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken != "prod" {
+		t.Fatalf("stored sensitivity token = %q, want original", got.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken)
+	}
+
+	got.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken = "changed-again"
+	stored, ok := g.Node(added.ID)
+	if !ok {
+		t.Fatalf("node %q not found after returned mutation", added.ID)
+	}
+	if stored.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken != "prod" {
+		t.Fatalf("returned mutation changed stored sensitivity token to %q", stored.Metadata.AWSS3Bucket.SensitivityReasons[0].MatchedToken)
+	}
+}
+
 func TestGraphNodeClonesReturnedEvidence(t *testing.T) {
 	g := New()
 	node := NewNode(PublicEndpoint, "public-api")

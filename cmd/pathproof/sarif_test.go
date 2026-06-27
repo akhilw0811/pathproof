@@ -532,6 +532,41 @@ jobs:
 	}
 }
 
+func TestRunScanCrossDomainS3SARIFOmitsBucketSensitivityMetadata(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCRole("deploy", "repo:owner/repo:pull_request")+`
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "prod-data-backups"
+  tags = {
+    DataClassification = "Sensitive"
+    Owner = "FAKE_SARIF_S3_SENSITIVITY_TAG_SECRET_DO_NOT_RETAIN"
+  }
+}
+
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::prod-data-backups/*\"}}"
+}
+`)
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	if got := countSARIFResultsByRule(report, "PP-XDOMAIN-003"); got != 1 {
+		t.Fatalf("PP-XDOMAIN-003 SARIF result count = %d, want 1: %#v", got, report.Runs[0].Results)
+	}
+	for _, forbidden := range []string{"sensitivity_level", "sensitivity_reasons", "DataClassification", "Owner", "FAKE_SARIF_S3_SENSITIVITY_TAG_SECRET_DO_NOT_RETAIN"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF output contains bucket sensitivity metadata or secret-like value %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
 func TestRunScanCrossDomainAdminRoleMixedTrustSARIFEmitsFinding(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "mixed admin.yml", `on: pull_request_target
@@ -951,6 +986,16 @@ func mustSARIFRule(t *testing.T, rules []cliSARIFRule, id string) cliSARIFRule {
 	}
 	t.Fatalf("SARIF rule %q not found in %#v", id, rules)
 	return cliSARIFRule{}
+}
+
+func countSARIFResultsByRule(report cliSARIFLog, ruleID string) int {
+	count := 0
+	for _, result := range report.Runs[0].Results {
+		if result.RuleID == ruleID {
+			count++
+		}
+	}
+	return count
 }
 
 func locationURIs(locations []cliSARIFLocation) []string {

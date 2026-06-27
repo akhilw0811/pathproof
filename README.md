@@ -21,6 +21,10 @@ GitHub Actions OIDC path can assume such an administrative role. It also
 models static local `aws_s3_bucket` resources and explicit exact S3 grants in
 inline role policies, and reports `PP-XDOMAIN-003` when a risky GitHub Actions
 OIDC path can assume an AWS IAM role that can access a modeled S3 bucket.
+Terraform-modeled `AWSS3Bucket` graph nodes can also carry conservative local
+sensitivity metadata derived only from literal bucket-name tokens and
+allowlisted static tags on the same `aws_s3_bucket` resource; this metadata
+does not create findings or change `PP-XDOMAIN-003`.
 
 PathProof is currently a defensive Go CLI focused on two small, tested local
 slices. It scans local YAML manifests and workflows, builds an in-memory graph,
@@ -44,7 +48,10 @@ forms; this is not IAM simulation.
 an AWS IAM role that also has a supported static administrative permission.
 `PP-XDOMAIN-003` reports one narrow local cross-domain S3 slice: the same
 risky OIDC context reaches an AWS IAM role with explicit static read or write
-access to a locally modeled `aws_s3_bucket`.
+access to a locally modeled `aws_s3_bucket`. Modeled S3 buckets may carry
+graph-only `unknown` or `sensitive` metadata from conservative local
+Terraform literals, but PathProof does not perform S3 content discovery or
+cloud data classification.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
@@ -52,7 +59,8 @@ Terraform execution, module or variable evaluation, reusable workflow
 resolution, action source inspection, broader sensitive-resource types, live
 cluster scanning, cloud validation, IAM simulation, broad cross-domain
 analysis, S3 bucket policies, KMS modeling, public access block modeling,
-object modeling, pull request creation, AI/ML ranking, and dashboards are not
+object modeling, full data discovery, DLP-style classification, sensitivity
+based findings, pull request creation, AI/ML ranking, and dashboards are not
 implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
@@ -301,6 +309,8 @@ these findings.
 `AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket` edge from exact
 static S3 action/resource pairs. It does not expand AdministratorAccess,
 `Action "*" Resource "*"`, or `s3:* Resource "*"` into bucket access.
+`AWSS3Bucket` node sensitivity metadata is graph-only and is not required for
+this rule.
 
 This slice does not execute Terraform, parse modules, evaluate variables,
 locals, functions, `jsonencode`, interpolations, or

@@ -777,6 +777,51 @@ jobs:
 	}
 }
 
+func TestAnalyzeCrossDomainS3FindingIDDoesNotChangeForBucketSensitivityMetadata(t *testing.T) {
+	workflow := `on: pull_request_target
+permissions:
+  id-token: write
+`
+	baseTerraform := terraformRole("deploy", "repo:owner/repo:pull_request") + terraformS3Bucket("artifacts", "assets") + `
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::assets/*\"}}"
+}
+`
+	sensitiveTerraform := terraformRole("deploy", "repo:owner/repo:pull_request") + terraformS3BucketWithTags("artifacts", "assets", `
+    DataClassification = "Sensitive"
+`) + `
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::assets/*\"}}"
+}
+`
+
+	base := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, baseTerraform, "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	changed := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, sensitiveTerraform, "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	if base.ID != changed.ID {
+		t.Fatalf("finding ID changed when only bucket sensitivity metadata changed:\nbase: %s\nchanged: %s", base.ID, changed.ID)
+	}
+}
+
+func TestAnalyzeSensitiveAWSS3BucketDoesNotCreateFinding(t *testing.T) {
+	g := graph.New()
+	bucket := graph.NewNode(graph.AWSS3Bucket, "aws://terraform/aws_s3_bucket/s3.tf/artifacts")
+	bucket.Metadata = &graph.NodeMetadata{AWSS3Bucket: &graph.AWSS3BucketMetadata{
+		Provider:           "aws",
+		BucketName:         "prod-data-backups",
+		ResourceName:       "artifacts",
+		SourceReference:    "s3.tf#resource=aws_s3_bucket.artifacts",
+		SensitivityLevel:   "sensitive",
+		SensitivityReasons: []graph.AWSS3BucketSensitivityReason{{Source: "bucket_name", MatchedToken: "prod", SourceRef: "s3.tf#resource=aws_s3_bucket.artifacts"}},
+	}}
+	mustAddNode(t, g, bucket)
+
+	if findings := Analyze(g); len(findings) != 0 {
+		t.Fatalf("findings = %#v, want none for sensitive bucket alone", findings)
+	}
+}
+
 func TestAnalyzeRiskSignalOmittedForExistingRules(t *testing.T) {
 	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
 permissions:
@@ -913,6 +958,17 @@ func terraformS3Bucket(resourceName, bucketName string) string {
 	return `
 resource "aws_s3_bucket" "` + resourceName + `" {
   bucket = "` + bucketName + `"
+}
+`
+}
+
+func terraformS3BucketWithTags(resourceName, bucketName, tags string) string {
+	return `
+resource "aws_s3_bucket" "` + resourceName + `" {
+  bucket = "` + bucketName + `"
+  tags = {
+` + tags + `
+  }
 }
 `
 }

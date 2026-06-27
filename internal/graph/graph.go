@@ -145,10 +145,20 @@ type AWSPermissionMetadata struct {
 }
 
 type AWSS3BucketMetadata struct {
-	Provider        string `json:"provider"`
-	BucketName      string `json:"bucket_name"`
-	ResourceName    string `json:"resource_name"`
-	SourceReference string `json:"source_reference"`
+	Provider           string                         `json:"provider"`
+	BucketName         string                         `json:"bucket_name"`
+	ResourceName       string                         `json:"resource_name"`
+	SourceReference    string                         `json:"source_reference"`
+	SensitivityLevel   string                         `json:"sensitivity_level"`
+	SensitivityReasons []AWSS3BucketSensitivityReason `json:"sensitivity_reasons"`
+}
+
+type AWSS3BucketSensitivityReason struct {
+	Source       string `json:"source"`
+	MatchedToken string `json:"matched_token,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Value        string `json:"value,omitempty"`
+	SourceRef    string `json:"source_ref"`
 }
 
 type AWSS3AccessMetadata struct {
@@ -493,11 +503,19 @@ func cloneNode(node Node) Node {
 		}
 		if metadata.AWSS3Bucket != nil {
 			bucket := *metadata.AWSS3Bucket
+			bucket.SensitivityReasons = cloneAWSS3BucketSensitivityReasons(bucket.SensitivityReasons)
 			metadata.AWSS3Bucket = &bucket
 		}
 		node.Metadata = &metadata
 	}
 	return node
+}
+
+func cloneAWSS3BucketSensitivityReasons(reasons []AWSS3BucketSensitivityReason) []AWSS3BucketSensitivityReason {
+	if len(reasons) == 0 {
+		return []AWSS3BucketSensitivityReason{}
+	}
+	return append([]AWSS3BucketSensitivityReason(nil), reasons...)
 }
 
 func cloneEvidence(evidence []SourceEvidence) []SourceEvidence {

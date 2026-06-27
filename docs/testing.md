@@ -73,7 +73,9 @@ the risky OIDC path uses the pull request subject and reaches explicit exact
 S3 read or write access to a modeled bucket, that missing or nonmatching
 `--repo` and nonmatching bucket policies omit `PP-XDOMAIN-003`, and that
 remediation, patch preview, patch output, validation, raw policy/trust content,
-and secret-like values are not attached or printed.
+and secret-like values are not attached or printed. It also asserts that
+graph-only S3 sensitivity metadata does not create findings and is not exposed
+through the public findings-only JSON report.
 AWS IAM CLI coverage asserts that static Terraform inline admin role policies
 and literal AdministratorAccess role-policy attachments emit `PP-AWS-001` in
 human, JSON, and SARIF output, that non-admin policies exit `0`, that malformed
@@ -101,7 +103,8 @@ the same for `PP-XDOMAIN-002`, plus administrative-permission summary text and
 deterministic rule presence without relying only on total rule counts.
 Cross-domain S3 SARIF coverage asserts the same for `PP-XDOMAIN-003`, plus S3
 bucket name, access mode, sanitized matched grant evidence, and no remediation
-or raw policy text.
+or raw policy text. It also asserts that existing SARIF findings remain
+findings-only when bucket sensitivity metadata exists.
 Source-location
 tests cover URI-encoded relative artifact URIs for paths with spaces,
 display-safe relative `properties.source_references`, omission of malformed
@@ -165,11 +168,17 @@ malformed inline policy JSON with sanitized resource errors, and regression
 checks that variables, provider credentials, raw trust or permission JSON,
 unsupported managed policy ARNs, and secret-like Terraform values are absent
 from parser output and errors.
-S3 parser coverage adds static `aws_s3_bucket` literal bucket names, dynamic
-and interpolated bucket-name negatives, tag/provider value exclusion, exact S3
-read/write inline policy actions, wildcard/dynamic ARN negatives,
-`NotAction`/`NotResource`/condition negatives, malformed S3 policy JSON
-sanitization, and deterministic bucket/resource ordering.
+S3 parser coverage adds static `aws_s3_bucket` literal bucket names,
+conservative sensitivity classification from full bucket-name tokens and
+allowlisted direct static literal tags, substring false-positive negatives
+such as `myproduct-assets`, `catalogs`, `dbbackup`, and `customerdb`, dynamic
+and interpolated bucket-name negatives, unsupported/dynamic/interpolated tag
+negatives, provider/default tag exclusion, non-bucket tag exclusion,
+unrelated tag exclusion, exact S3 read/write inline policy actions,
+wildcard/dynamic ARN negatives, `NotAction`/`NotResource`/condition
+negatives, malformed S3 policy JSON sanitization, deterministic
+bucket/resource ordering, deterministic sensitivity reason deduplication and
+sorting, and raw Terraform/tag/provider value exclusion.
 
 Kubernetes routing tests cover deterministic graph construction, source
 evidence, duplicate conflict rejection before graph mutation, namespace-scoped
@@ -214,13 +223,16 @@ cloning, deterministic graph JSON, and regression checks that raw Terraform,
 raw trust or permission policy JSON, provider credentials, unsupported
 condition values, unsupported managed policy ARNs, and secret-like values are
 absent from graph JSON.
-S3 routing coverage adds deterministic `AWSS3Bucket` nodes, exact
+S3 routing coverage adds deterministic `AWSS3Bucket` nodes, graph-only
+`sensitivity_level` and sanitized `sensitivity_reasons` metadata, unknown and
+sensitive bucket cases, deterministic reason aggregation and deduplication,
+metadata cloning, graph JSON determinism, exact
 `CanReadObject`/`CanWriteObject` edges for `GetObject`, `ListBucket`,
 `PutObject`, `DeleteObject`, and `s3:*` bucket/object semantics, negatives for
 `Resource "*"`, `Action "*" Resource "*"`, `s3:*Object`, wildcard bucket or
 prefix ARNs, admin-to-S3 expansion, nonmatching buckets, duplicate grant
 deduplication, deterministic multi-grant aggregation, metadata cloning, and
-secret/raw-policy exclusion.
+secret/raw-policy/unrelated-tag/provider-value exclusion.
 
 Analysis tests cover `PP-K8S-001` positive and negative matching, exact directed
 edge semantics, exact required node and edge kind validation, unrelated graph
@@ -288,7 +300,9 @@ workflow-level read and job-level write cases; negatives for no risk, no
 branch-only trust, environment-only trust, and admin permission alone; read
 and write access to the same bucket producing distinct findings; stable and
 sensitive IDs; ordered path evidence through `CanReadObject` or
-`CanWriteObject`; and secret/raw-policy exclusion from finding JSON.
+`CanWriteObject`; finding ID stability when only S3 bucket sensitivity metadata
+changes; no finding for a sensitive bucket alone; and secret/raw-policy
+exclusion from finding JSON.
 
 Remediation tests cover the read-only `internal/remediation.Build` API for
 `PP-K8S-001`. Coverage asserts complete advisory options for

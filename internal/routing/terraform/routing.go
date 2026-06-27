@@ -15,11 +15,13 @@ import (
 )
 
 const (
-	providerAWS         = "aws"
-	githubActionsIssuer = "token.actions.githubusercontent.com"
-	awsAudience         = "sts.amazonaws.com"
-	accessModeRead      = "read"
-	accessModeWrite     = "write"
+	providerAWS          = "aws"
+	githubActionsIssuer  = "token.actions.githubusercontent.com"
+	awsAudience          = "sts.amazonaws.com"
+	accessModeRead       = "read"
+	accessModeWrite      = "write"
+	sensitivityUnknown   = "unknown"
+	sensitivitySensitive = "sensitive"
 )
 
 func AddRoutes(g *graph.Graph, resources parserterraform.Resources, workflows parsergithubactions.Resources, repo string) error {
@@ -613,12 +615,80 @@ func roleMetadata(role parserterraform.IAMRole) graph.AWSIAMRoleMetadata {
 }
 
 func bucketMetadata(bucket parserterraform.S3Bucket) graph.AWSS3BucketMetadata {
-	return graph.AWSS3BucketMetadata{
-		Provider:        providerAWS,
-		BucketName:      bucket.BucketName,
-		ResourceName:    bucket.ResourceName,
-		SourceReference: sourceRef(bucket.Source),
+	reasons := bucketSensitivityReasons(bucket.SensitivityReasons)
+	level := sensitivityUnknown
+	if len(reasons) > 0 {
+		level = sensitivitySensitive
 	}
+	return graph.AWSS3BucketMetadata{
+		Provider:           providerAWS,
+		BucketName:         bucket.BucketName,
+		ResourceName:       bucket.ResourceName,
+		SourceReference:    sourceRef(bucket.Source),
+		SensitivityLevel:   level,
+		SensitivityReasons: reasons,
+	}
+}
+
+func bucketSensitivityReasons(reasons []parserterraform.S3BucketSensitivityReason) []graph.AWSS3BucketSensitivityReason {
+	out := make([]graph.AWSS3BucketSensitivityReason, 0, len(reasons))
+	for _, reason := range reasons {
+		out = append(out, graph.AWSS3BucketSensitivityReason{
+			Source:       reason.Source,
+			MatchedToken: reason.MatchedToken,
+			Key:          reason.Key,
+			Value:        reason.Value,
+			SourceRef:    stableSourceRefFromReason(reason.SourceRef),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return bucketSensitivityReasonIdentity(out[i]) < bucketSensitivityReasonIdentity(out[j])
+	})
+	return dedupeBucketSensitivityReasons(out)
+}
+
+func dedupeBucketSensitivityReasons(reasons []graph.AWSS3BucketSensitivityReason) []graph.AWSS3BucketSensitivityReason {
+	if len(reasons) == 0 {
+		return []graph.AWSS3BucketSensitivityReason{}
+	}
+	seen := make(map[string]struct{}, len(reasons))
+	out := make([]graph.AWSS3BucketSensitivityReason, 0, len(reasons))
+	for _, reason := range reasons {
+		key := bucketSensitivityReasonIdentity(reason)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, reason)
+	}
+	return out
+}
+
+func bucketSensitivityReasonIdentity(reason graph.AWSS3BucketSensitivityReason) string {
+	data, err := json.Marshal(struct {
+		Source       string `json:"source"`
+		MatchedToken string `json:"matched_token,omitempty"`
+		Key          string `json:"key,omitempty"`
+		Value        string `json:"value,omitempty"`
+		SourceRef    string `json:"source_ref"`
+	}{
+		Source:       reason.Source,
+		MatchedToken: reason.MatchedToken,
+		Key:          reason.Key,
+		Value:        reason.Value,
+		SourceRef:    stableSourceReferenceValue(reason.SourceRef),
+	})
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func stableSourceRefFromReason(sourceRef string) string {
+	if sourceRef == "" {
+		return ""
+	}
+	return stableSourceReferenceValue(sourceRef)
 }
 
 func permissionMetadata(permission parserterraform.IAMPermission) graph.AWSPermissionMetadata {

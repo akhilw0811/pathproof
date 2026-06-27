@@ -53,10 +53,12 @@
   keys, and secret-like values are not retained.
 - Local static Terraform parsing for a narrow AWS S3 slice: supported
   `aws_s3_bucket` resources with safe literal `bucket` names and exact inline
-  IAM role-policy S3 actions/resources for modeled buckets. Tags, provider
-  credentials, wildcard bucket ARNs, wildcard prefixes, conditions,
-  `NotAction`, `NotResource`, variables, modules, and raw policy JSON are not
-  retained.
+  IAM role-policy S3 actions/resources for modeled buckets. It also extracts
+  conservative graph-only bucket sensitivity metadata from full bucket-name
+  tokens and narrowly allowlisted static literal tags directly on the same
+  `aws_s3_bucket` resource. Unrelated tags, provider credentials, wildcard
+  bucket ARNs, wildcard prefixes, conditions, `NotAction`, `NotResource`,
+  variables, modules, and raw policy JSON are not retained.
 - AWS IAM OIDC trust modeling with `AWSIAMRole` nodes and optional
   `OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edges when
   `pathproof scan --repo OWNER/REPO` supplies repository identity and a static
@@ -67,8 +69,10 @@
   local Terraform permission facts.
 - AWS S3 bucket and access modeling with `AWSS3Bucket` nodes and exact
   `AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket` edges for
-  supported static local Terraform facts. Administrative permissions do not
-  expand to S3 access in this slice.
+  supported static local Terraform facts. `AWSS3Bucket` nodes can carry
+  sanitized `unknown` or `sensitive` metadata for future prioritization, but
+  sensitivity does not create findings in this slice. Administrative
+  permissions do not expand to S3 access in this slice.
 - Read-only deterministic attack-path analysis for `PP-K8S-001`: public
   endpoint to workload to ServiceAccount to Secret read access, with fixed
   rule-based `High` severity and deterministic finding IDs.
@@ -145,8 +149,9 @@
   full managed-policy catalogs, customer-managed policy resolution, and
   resource-level IAM evaluation.
 - Broad S3/IAM simulation, S3 bucket policies, S3 public access block modeling,
-  S3 object modeling, KMS modeling, admin-to-S3 permission expansion, and S3
-  remediation.
+  S3 object/content discovery, KMS modeling, provider default tag expansion,
+  broad data classification, sensitivity-based findings, admin-to-S3
+  permission expansion, and S3 remediation.
 - Additional GitHub Actions OIDC trust findings beyond the current
   `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003` slices.
 - Broader cloud trust-policy ingestion for GitHub Actions OIDC.

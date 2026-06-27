@@ -81,8 +81,10 @@ only when exactly one parsed role has an explicit static `name` matching that
 literal. It also supports `aws_iam_role_policy_attachment` only for the
 literal AWS managed policy ARN
 `arn:aws:iam::aws:policy/AdministratorAccess`.
-For S3, it supports only `aws_s3_bucket` with a safe literal `bucket` name and
-inline role-policy statements using exact action strings `s3:GetObject`,
+For S3, it supports only `aws_s3_bucket` with a safe literal `bucket` name,
+conservative graph-only sensitivity facts from full bucket-name tokens and
+allowlisted static literal tags on the same bucket resource, and inline
+role-policy statements using exact action strings `s3:GetObject`,
 `s3:ListBucket`, `s3:PutObject`, `s3:DeleteObject`, or `s3:*` with exact
 bucket or object ARNs for modeled buckets.
 
@@ -95,8 +97,8 @@ ambiguous literal role-name matches, wildcard S3 bucket ARNs, wildcard S3
 prefixes, and non-role IAM resources. It does not
 execute Terraform, evaluate HCL, call AWS, call GitHub, parse remote state, or
 retain raw Terraform files, raw policy JSON, provider credentials, variable
-values, access keys, tags, secret-like strings, or unsupported condition
-values.
+values, access keys, unrelated tags, secret-like strings, unsupported tag
+values, or unsupported condition values.
 Malformed supported Terraform syntax and malformed extracted JSON return
 deterministic sanitized errors with file or resource context and no raw policy
 content.
@@ -159,7 +161,12 @@ role permissions. AWS permission metadata is limited to provider, source
 reference, policy or attachment resource name, attached role resource name,
 sanitized supported action/resource lists, the literal AdministratorAccess ARN
 when applicable, and precise admin reason identities.
-It also adds `AWSS3Bucket` nodes and exact
+It also adds `AWSS3Bucket` nodes with sanitized bucket identity and optional
+conservative sensitivity metadata. Sensitivity metadata is limited to
+`unknown` or `sensitive` plus deterministic sanitized reasons from local
+Terraform bucket-name tokens or allowlisted static tags; it is not a rule
+input for the current findings.
+It also adds exact
 `AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket` edges when a
 supported inline role policy grants `s3:ListBucket` to the exact bucket ARN,
 `s3:GetObject` to the exact object ARN, `s3:PutObject` or `s3:DeleteObject` to
@@ -365,6 +372,8 @@ inspection, exact GitHub workflow permission inheritance/override modeling,
 full CI/CD attack-path modeling beyond the current GitHub Actions OIDC to AWS
 IAM role trust and administrative-role findings, cloud provider integration,
 Terraform execution, broad HCL parsing, module or variable evaluation, IAM
-simulation, live validation, in-place patch application,
+simulation, S3 bucket policy analysis, KMS modeling, provider default tag
+expansion, S3 object/content discovery, broad data classification,
+sensitivity-based findings, live validation, in-place patch application,
 persistence, AI, dashboard, plugin system, external service integration, pull
 request creation, or live Kubernetes cluster integration is implemented.
