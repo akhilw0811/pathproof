@@ -16,14 +16,15 @@ type RuleID string
 type Severity string
 
 const (
-	RulePublicWorkloadCanReadSecret                   RuleID   = "PP-K8S-001"
-	RuleGitHubActionsUnpinnedAction                   RuleID   = "PP-GHA-001"
-	RuleGitHubActionsUnsafePullRequestTargetCheckout  RuleID   = "PP-GHA-002"
-	RuleGitHubActionsDangerousPermissions             RuleID   = "PP-GHA-003"
-	RuleAWSIAMRoleAdministrativePermissions           RuleID   = "PP-AWS-001"
-	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole RuleID   = "PP-XDOMAIN-001"
-	SeverityHigh                                      Severity = "High"
-	SeverityMedium                                    Severity = "Medium"
+	RulePublicWorkloadCanReadSecret                        RuleID   = "PP-K8S-001"
+	RuleGitHubActionsUnpinnedAction                        RuleID   = "PP-GHA-001"
+	RuleGitHubActionsUnsafePullRequestTargetCheckout       RuleID   = "PP-GHA-002"
+	RuleGitHubActionsDangerousPermissions                  RuleID   = "PP-GHA-003"
+	RuleAWSIAMRoleAdministrativePermissions                RuleID   = "PP-AWS-001"
+	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole      RuleID   = "PP-XDOMAIN-001"
+	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole RuleID   = "PP-XDOMAIN-002"
+	SeverityHigh                                           Severity = "High"
+	SeverityMedium                                         Severity = "Medium"
 )
 
 const publicWorkloadCanReadSecretTitle = "Public workload can read Kubernetes Secret"
@@ -32,6 +33,7 @@ const githubActionsUnsafePullRequestTargetCheckoutTitle = "pull_request_target w
 const githubActionsDangerousPermissionsTitle = "pull_request_target workflow grants dangerous token permissions"
 const awsIAMRoleAdministrativePermissionsTitle = "AWS IAM role grants administrative permissions"
 const crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle = "Risky GitHub Actions workflow can assume AWS IAM role"
+const crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle = "Risky GitHub Actions workflow can assume administrative AWS IAM role"
 
 type Finding struct {
 	ID               FindingID         `json:"id"`
@@ -116,6 +118,17 @@ type crossDomainFindingIdentity struct {
 	AWSRoleID  graph.NodeID                  `json:"aws_role_node_id"`
 }
 
+type crossDomainAdminFindingIdentity struct {
+	RuleID           RuleID                        `json:"rule_id"`
+	NodeIDs          []graph.NodeID                `json:"node_ids"`
+	EdgeIDs          []graph.EdgeID                `json:"edge_ids"`
+	RiskRuleID       RuleID                        `json:"risk_rule_id"`
+	RiskSignal       crossDomainRiskSignalIdentity `json:"risk_signal"`
+	AWSRoleID        graph.NodeID                  `json:"aws_role_node_id"`
+	PermissionNodeID graph.NodeID                  `json:"aws_permission_node_id"`
+	AdminReason      string                        `json:"admin_reason"`
+}
+
 type awsAdminPermissionFindingIdentity struct {
 	RuleID           RuleID       `json:"rule_id"`
 	AWSRoleNodeID    graph.NodeID `json:"aws_role_node_id"`
@@ -159,6 +172,7 @@ func Analyze(g *graph.Graph) []Finding {
 	usesActionByJob := make(map[graph.NodeID][]graph.Edge)
 	canRequestOIDCBySource := make(map[graph.NodeID][]graph.Edge)
 	canAssumeRoleByCapability := make(map[graph.NodeID][]graph.Edge)
+	grantsPermissionByRole := make(map[graph.NodeID][]graph.Edge)
 	var grantsPermission []graph.Edge
 	for _, edge := range g.Edges() {
 		switch edge.Kind {
@@ -178,6 +192,7 @@ func Analyze(g *graph.Graph) []Finding {
 			canAssumeRoleByCapability[edge.From] = append(canAssumeRoleByCapability[edge.From], edge)
 		case graph.GrantsPermission:
 			grantsPermission = append(grantsPermission, edge)
+			grantsPermissionByRole[edge.From] = append(grantsPermissionByRole[edge.From], edge)
 		}
 	}
 
@@ -252,6 +267,7 @@ func Analyze(g *graph.Graph) []Finding {
 		}
 	}
 	findings = append(findings, newCrossDomainGitHubActionsAWSRoleFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, workflowRisks, jobRisks)...)
+	findings = append(findings, newCrossDomainGitHubActionsAWSAdminRoleFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, grantsPermissionByRole, workflowRisks, jobRisks)...)
 	findings = append(findings, newAWSIAMRoleAdministrativePermissionFindings(g, grantsPermission)...)
 
 	sort.Slice(findings, func(i, j int) bool {
@@ -701,7 +717,153 @@ func riskMatchesCanAssumeRoleContext(risk githubActionsRiskSignal, canAssumeRole
 	if canAssumeRole.Metadata == nil || canAssumeRole.Metadata.AWSCanAssumeRole == nil {
 		return false
 	}
-	return strings.HasSuffix(canAssumeRole.Metadata.AWSCanAssumeRole.SubjectCandidate, ":pull_request")
+	metadata := canAssumeRole.Metadata.AWSCanAssumeRole
+	for _, match := range metadata.Matches {
+		if isPullRequestOIDCSubjectCandidate(match.SubjectCandidate) {
+			return true
+		}
+	}
+	return len(metadata.Matches) == 0 && isPullRequestOIDCSubjectCandidate(metadata.SubjectCandidate)
+}
+
+func isPullRequestOIDCSubjectCandidate(subject string) bool {
+	const prefix = "repo:"
+	if !strings.HasPrefix(subject, prefix) {
+		return false
+	}
+	repoAndContext := strings.TrimPrefix(subject, prefix)
+	repo, context, ok := strings.Cut(repoAndContext, ":")
+	if !ok || context != "pull_request" {
+		return false
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	return ok && owner != "" && name != "" && !strings.Contains(name, "/")
+}
+
+func newCrossDomainGitHubActionsAWSAdminRoleFindings(g *graph.Graph, definesJob []graph.Edge, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, grantsPermissionByRole map[graph.NodeID][]graph.Edge, workflowRisks, jobRisks map[graph.NodeID][]githubActionsRiskSignal) []Finding {
+	findings := make([]Finding, 0)
+	seen := make(map[FindingID]struct{})
+	add := func(nodes []graph.Node, edges []graph.Edge, risk githubActionsRiskSignal, permissionMetadata graph.AWSPermissionMetadata) {
+		if len(nodes) == 0 || len(edges) == 0 {
+			return
+		}
+		role := nodes[len(nodes)-2]
+		permission := nodes[len(nodes)-1]
+		id, err := stableCrossDomainAdminFindingID(nodeIDs(nodes), edgeIDs(edges), risk, role.ID, permission.ID, permissionMetadata.AdminReason)
+		if err != nil {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		evidence := findingEvidenceForEdges(edges)
+		findings = append(findings, Finding{
+			ID:               id,
+			RuleID:           RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole,
+			Title:            crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle,
+			Severity:         SeverityHigh,
+			NodeIDs:          nodeIDs(nodes),
+			EdgeIDs:          edgeIDs(edges),
+			Summary:          crossDomainAdminSummary(nodes, risk, permissionMetadata),
+			Evidence:         evidence,
+			SourceReferences: crossDomainSourceReferences(evidence, risk),
+			RiskSignal:       riskSignal(risk),
+		})
+	}
+
+	for _, workflow := range g.Nodes() {
+		if workflow.Kind != graph.Workflow {
+			continue
+		}
+		for _, risk := range workflowRisks[workflow.ID] {
+			addWorkflowLevelCrossDomainAdminFindings(g, workflow, risk, canRequestOIDCBySource, canAssumeRoleByCapability, grantsPermissionByRole, add)
+		}
+	}
+
+	for _, defines := range definesJob {
+		workflow, ok := nodeOfKind(g, defines.From, graph.Workflow)
+		if !ok {
+			continue
+		}
+		job, ok := nodeOfKind(g, defines.To, graph.WorkflowJob)
+		if !ok {
+			continue
+		}
+		for _, risk := range jobRisks[job.ID] {
+			if risk.ruleID == RuleGitHubActionsUnsafePullRequestTargetCheckout {
+				addWorkflowLevelCrossDomainAdminFindings(g, workflow, risk, canRequestOIDCBySource, canAssumeRoleByCapability, grantsPermissionByRole, add)
+			}
+			addJobLevelCrossDomainAdminFindings(g, workflow, job, defines, risk, canRequestOIDCBySource, canAssumeRoleByCapability, grantsPermissionByRole, add)
+		}
+	}
+
+	sort.Slice(findings, func(i, j int) bool {
+		return findings[i].ID < findings[j].ID
+	})
+	return findings
+}
+
+func addWorkflowLevelCrossDomainAdminFindings(g *graph.Graph, workflow graph.Node, risk githubActionsRiskSignal, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, grantsPermissionByRole map[graph.NodeID][]graph.Edge, add func([]graph.Node, []graph.Edge, githubActionsRiskSignal, graph.AWSPermissionMetadata)) {
+	for _, oidcRequest := range canRequestOIDCBySource[workflow.ID] {
+		capability, ok := nodeOfKind(g, oidcRequest.To, graph.OIDCTokenCapability)
+		if !ok {
+			continue
+		}
+		for _, canAssumeRole := range canAssumeRoleByCapability[capability.ID] {
+			if !riskMatchesCanAssumeRoleContext(risk, canAssumeRole) {
+				continue
+			}
+			role, ok := nodeOfKind(g, canAssumeRole.To, graph.AWSIAMRole)
+			if !ok {
+				continue
+			}
+			for _, grants := range grantsPermissionByRole[role.ID] {
+				permission, metadata, ok := administrativePermissionForGrant(g, grants)
+				if !ok {
+					continue
+				}
+				add([]graph.Node{workflow, capability, role, permission}, []graph.Edge{oidcRequest, canAssumeRole, grants}, risk, metadata)
+			}
+		}
+	}
+}
+
+func addJobLevelCrossDomainAdminFindings(g *graph.Graph, workflow, job graph.Node, defines graph.Edge, risk githubActionsRiskSignal, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, grantsPermissionByRole map[graph.NodeID][]graph.Edge, add func([]graph.Node, []graph.Edge, githubActionsRiskSignal, graph.AWSPermissionMetadata)) {
+	for _, oidcRequest := range canRequestOIDCBySource[job.ID] {
+		capability, ok := nodeOfKind(g, oidcRequest.To, graph.OIDCTokenCapability)
+		if !ok {
+			continue
+		}
+		for _, canAssumeRole := range canAssumeRoleByCapability[capability.ID] {
+			if !riskMatchesCanAssumeRoleContext(risk, canAssumeRole) {
+				continue
+			}
+			role, ok := nodeOfKind(g, canAssumeRole.To, graph.AWSIAMRole)
+			if !ok {
+				continue
+			}
+			for _, grants := range grantsPermissionByRole[role.ID] {
+				permission, metadata, ok := administrativePermissionForGrant(g, grants)
+				if !ok {
+					continue
+				}
+				add([]graph.Node{workflow, job, capability, role, permission}, []graph.Edge{defines, oidcRequest, canAssumeRole, grants}, risk, metadata)
+			}
+		}
+	}
+}
+
+func administrativePermissionForGrant(g *graph.Graph, grants graph.Edge) (graph.Node, graph.AWSPermissionMetadata, bool) {
+	permission, ok := nodeOfKind(g, grants.To, graph.AWSPermission)
+	if !ok || permission.Metadata == nil || permission.Metadata.AWSPermission == nil {
+		return graph.Node{}, graph.AWSPermissionMetadata{}, false
+	}
+	metadata := *permission.Metadata.AWSPermission
+	if !metadata.Administrative || !supportedAWSAdminReason(metadata.AdminReason) {
+		return graph.Node{}, graph.AWSPermissionMetadata{}, false
+	}
+	return permission, metadata, true
 }
 
 func stableCrossDomainFindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID, risk githubActionsRiskSignal, roleID graph.NodeID) (FindingID, error) {
@@ -728,6 +890,32 @@ func stableCrossDomainFindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID, 
 	return FindingID("finding:" + string(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole) + ":" + hex.EncodeToString(sum[:])), nil
 }
 
+func stableCrossDomainAdminFindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID, risk githubActionsRiskSignal, roleID, permissionID graph.NodeID, adminReason string) (FindingID, error) {
+	data, err := json.Marshal(crossDomainAdminFindingIdentity{
+		RuleID:     RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole,
+		NodeIDs:    append([]graph.NodeID(nil), nodeIDs...),
+		EdgeIDs:    append([]graph.EdgeID(nil), edgeIDs...),
+		RiskRuleID: risk.ruleID,
+		RiskSignal: crossDomainRiskSignalIdentity{
+			WorkflowFile: risk.workflowFile,
+			JobID:        risk.jobID,
+			StepIndex:    cloneIntPointer(risk.stepIndex),
+			Selectors:    cloneSelectorIdentities(risk.selectors),
+			Scope:        risk.scope,
+			Permission:   risk.permission,
+			Access:       risk.access,
+		},
+		AWSRoleID:        roleID,
+		PermissionNodeID: permissionID,
+		AdminReason:      adminReason,
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return FindingID("finding:" + string(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole) + ":" + hex.EncodeToString(sum[:])), nil
+}
+
 func crossDomainSummary(nodes []graph.Node, risk githubActionsRiskSignal) string {
 	workflow := nodes[0]
 	role := nodes[len(nodes)-1]
@@ -740,6 +928,20 @@ func crossDomainSummary(nodes []graph.Node, risk githubActionsRiskSignal) string
 		target += " job " + risk.jobID
 	}
 	return "GitHub Actions " + target + " has " + risk.ruleIDSummary() + "; its " + scope + " OIDC token capability can assume AWS IAM role " + role.Name + "."
+}
+
+func crossDomainAdminSummary(nodes []graph.Node, risk githubActionsRiskSignal, permission graph.AWSPermissionMetadata) string {
+	workflow := nodes[0]
+	role := nodes[len(nodes)-2]
+	scope := "workflow-level"
+	if len(nodes) == 5 {
+		scope = "job-level"
+	}
+	target := workflow.Name
+	if risk.jobID != "" {
+		target += " job " + risk.jobID
+	}
+	return "GitHub Actions " + target + " has " + risk.ruleIDSummary() + "; its " + scope + " OIDC token capability can assume administrative AWS IAM role " + role.Name + " (" + permission.AdminReason + ")."
 }
 
 func (risk githubActionsRiskSignal) ruleIDSummary() string {

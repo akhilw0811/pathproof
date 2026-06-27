@@ -53,9 +53,12 @@ stable deterministic hashes of typed identities.
 - `CanRequestOIDCToken`: a GitHub Actions workflow or job can request an OIDC
   token because it explicitly grants `id-token: write` or
   `permissions: write-all`.
-- `CanAssumeRole`: a GitHub Actions `OIDCTokenCapability` has one static OIDC
-  subject candidate that matches a parsed AWS IAM role trust statement. This
-  edge is graph-only and exists only when `--repo OWNER/REPO` is supplied.
+- `CanAssumeRole`: a GitHub Actions `OIDCTokenCapability` has one or more
+  static OIDC subject candidates that match a parsed AWS IAM role trust
+  statement for the same AWS IAM role. This edge is graph-only and exists only
+  when `--repo OWNER/REPO` is supplied. Edge identity remains kind/from/to, so
+  multiple matched subjects for the same capability and role are aggregated in
+  edge metadata.
 
 ## Evidence
 
@@ -381,7 +384,31 @@ keys, or secret-like values.
       "oidc_capability_source_reference": ".github/workflows/deploy.yml#document=1",
       "workflow_file": ".github/workflows/deploy.yml",
       "scope": "job",
-      "job_id": "deploy"
+      "job_id": "deploy",
+      "matches": [
+        {
+          "provider": "aws",
+          "role_resource_name": "deploy",
+          "role_source_reference": "main.tf#resource=aws_iam_role.deploy",
+          "trusted_issuer": "token.actions.githubusercontent.com",
+          "statement_index": 0,
+          "audience": "sts.amazonaws.com",
+          "subject_candidate": "repo:owner/repo:environment:prod",
+          "subject_pattern": "repo:owner/repo:environment:prod",
+          "subject_operator": "StringEquals"
+        },
+        {
+          "provider": "aws",
+          "role_resource_name": "deploy",
+          "role_source_reference": "main.tf#resource=aws_iam_role.deploy",
+          "trusted_issuer": "token.actions.githubusercontent.com",
+          "statement_index": 0,
+          "audience": "sts.amazonaws.com",
+          "subject_candidate": "repo:owner/repo:pull_request",
+          "subject_pattern": "repo:owner/repo:pull_request",
+          "subject_operator": "StringEquals"
+        }
+      ]
     }
   }
 }
@@ -392,6 +419,11 @@ keys, or secret-like values.
 `token.actions.githubusercontent.com`, action
 `sts:AssumeRoleWithWebIdentity`, audience `sts.amazonaws.com`, and one
 supported `sub` condition matches a deterministic subject candidate.
+If multiple subject candidates or trust patterns match the same
+`OIDCTokenCapability --CanAssumeRole--> AWSIAMRole` edge, the metadata
+`matches` list preserves the deduplicated matched subject identities in
+deterministic order. The top-level subject fields mirror the first
+deterministic match for compatibility; analysis uses `matches` when present.
 `StringEquals` requires an exact subject match. `StringLike` supports only
 simple `*` wildcard matching. PathProof does not implement a broad IAM
 condition evaluator.
@@ -467,6 +499,16 @@ Implemented rules are:
   job-level OIDC uses
   `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole`
 
+- Rule ID: `PP-XDOMAIN-002`
+- Title:
+  `Risky GitHub Actions workflow can assume administrative AWS IAM role`
+- Severity: fixed `High`
+- Required path:
+  workflow-level OIDC uses
+  `Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --GrantsPermission--> AWSPermission`;
+  job-level OIDC uses
+  `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --GrantsPermission--> AWSPermission`
+
 `PP-K8S-001` is emitted only when all four Kubernetes nodes exist with the
 expected kinds and all three directed edges exist with the expected kinds. The
 ordered finding chain stores the four node IDs followed by the three edge IDs
@@ -535,6 +577,15 @@ inheritance or override behavior. For this first cross-domain rule, the
 as `repo:OWNER/REPO:ref:refs/heads/main`, is not enough to emit
 `PP-XDOMAIN-001`.
 
+`PP-XDOMAIN-002` is emitted only when the same risky pull request OIDC context
+also reaches an administrative AWS permission through
+`AWSIAMRole --GrantsPermission--> AWSPermission`. The `AWSPermission` metadata
+must have `administrative=true` and one supported admin reason identity:
+`action_star_resource_star`, `action_service_star_resource_star`, or
+`administrator_access_managed_policy`. Branch-only or environment-only
+`CanAssumeRole` matches do not trigger this finding, even when the workflow is
+risky and the role has administrative permissions.
+
 Finding IDs are deterministic and stable. `PP-K8S-001` IDs are SHA-256 hashes of a
 canonical JSON identity containing only fixed field names for `rule_id`,
 ordered `node_ids`, and ordered `edge_ids`. Evidence, source references,
@@ -559,15 +610,20 @@ identity includes workflow file, job ID, step index, and ordered selector
 field/expression identities. Dangerous permission risk identity includes
 workflow file, scope, job ID when present, permission, and access. Evidence,
 source-reference display paths, summaries, and prose are not part of identity.
+`PP-XDOMAIN-002` IDs use the same canonical path and risk signal identity
+fields, plus the AWS role node ID, AWS permission node ID, and precise admin
+reason identity. The administrative permission is part of the finding identity,
+so two distinct admin permissions on the same reachable role produce distinct
+findings.
 
 Finding evidence preserves the complete ordered edge evidence for the matched
 path. `source_references` are derived from those edge evidence sources in
 chain order, omit empty strings, and deduplicate exact repeated references
 while preserving first appearance. They are not globally sorted.
 
-`PP-XDOMAIN-001` keeps only the actual cross-domain graph path in `node_ids`,
-`edge_ids`, and ordered evidence. Non-path risk evidence is represented in an
-optional structured `risk_signal` field:
+`PP-XDOMAIN-001` and `PP-XDOMAIN-002` keep only the actual cross-domain graph
+path in `node_ids`, `edge_ids`, and ordered evidence. Non-path risk evidence is
+represented in an optional structured `risk_signal` field:
 
 ```json
 {
@@ -622,7 +678,7 @@ SARIF scan output is also a private CLI projection, not a graph schema. It is
 selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
 with one PathProof run, deterministic rule entries for `PP-K8S-001`,
 `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and
-`PP-XDOMAIN-001`, and one result per finding.
+`PP-XDOMAIN-001`, and `PP-XDOMAIN-002`, and one result per finding.
 Result properties include finding ID, severity, ordered node IDs, ordered edge
 IDs, and clean display source references when available.
 
@@ -819,9 +875,10 @@ The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
 workflow execution, GitHub API state, expression evaluation, workflow
 permissions, reusable workflow resolution, action source inspection,
-CI/CD-to-cloud findings beyond `PP-XDOMAIN-001`, in-place patch application,
-live validation, or attack-path rules beyond `PP-K8S-001`, `PP-GHA-001`,
-`PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and `PP-XDOMAIN-001`. Terraform
+CI/CD-to-cloud findings beyond `PP-XDOMAIN-001` and `PP-XDOMAIN-002`,
+in-place patch application, live validation, or attack-path rules beyond
+`PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
+`PP-XDOMAIN-001`, and `PP-XDOMAIN-002`. Terraform
 support is limited to static `aws_iam_role` GitHub Actions OIDC trust
 metadata, optional `CanAssumeRole` edges when `--repo OWNER/REPO` is supplied,
 and narrow static AWS IAM role permission facts for `PP-AWS-001`; PathProof
@@ -831,5 +888,6 @@ scan CLI currently supports local Kubernetes YAML directories and local
 GitHub Actions workflow files under `.github/workflows` plus local `.tf`
 files for that narrow Terraform slice. Patch previews and patch output are
 limited to Kubernetes `NarrowBindingSubject` and do not cover `PP-GHA-001`,
-`PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, Terraform, RBAC
-rule edits, Secret-bearing source files, or broader YAML patch types.
+`PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`,
+`PP-XDOMAIN-002`, Terraform, RBAC rule edits, Secret-bearing source files, or
+broader YAML patch types.

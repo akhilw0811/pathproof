@@ -97,19 +97,32 @@ type AWSOIDCSubjectPattern struct {
 }
 
 type AWSCanAssumeRoleMetadata struct {
-	Provider                      string `json:"provider"`
-	RoleResourceName              string `json:"role_resource_name"`
-	RoleSourceReference           string `json:"role_source_reference"`
-	TrustedIssuer                 string `json:"trusted_issuer"`
-	StatementIndex                int    `json:"statement_index"`
-	Audience                      string `json:"audience"`
-	SubjectCandidate              string `json:"subject_candidate"`
-	SubjectPattern                string `json:"subject_pattern"`
-	SubjectOperator               string `json:"subject_operator"`
-	OIDCCapabilitySourceReference string `json:"oidc_capability_source_reference"`
-	WorkflowFile                  string `json:"workflow_file"`
-	Scope                         string `json:"scope"`
-	JobID                         string `json:"job_id,omitempty"`
+	Provider                      string                  `json:"provider"`
+	RoleResourceName              string                  `json:"role_resource_name"`
+	RoleSourceReference           string                  `json:"role_source_reference"`
+	TrustedIssuer                 string                  `json:"trusted_issuer"`
+	StatementIndex                int                     `json:"statement_index"`
+	Audience                      string                  `json:"audience"`
+	SubjectCandidate              string                  `json:"subject_candidate"`
+	SubjectPattern                string                  `json:"subject_pattern"`
+	SubjectOperator               string                  `json:"subject_operator"`
+	OIDCCapabilitySourceReference string                  `json:"oidc_capability_source_reference"`
+	WorkflowFile                  string                  `json:"workflow_file"`
+	Scope                         string                  `json:"scope"`
+	JobID                         string                  `json:"job_id,omitempty"`
+	Matches                       []AWSCanAssumeRoleMatch `json:"matches,omitempty"`
+}
+
+type AWSCanAssumeRoleMatch struct {
+	Provider            string `json:"provider"`
+	RoleResourceName    string `json:"role_resource_name"`
+	RoleSourceReference string `json:"role_source_reference"`
+	TrustedIssuer       string `json:"trusted_issuer"`
+	StatementIndex      int    `json:"statement_index"`
+	Audience            string `json:"audience"`
+	SubjectCandidate    string `json:"subject_candidate"`
+	SubjectPattern      string `json:"subject_pattern"`
+	SubjectOperator     string `json:"subject_operator"`
 }
 
 type AWSPermissionMetadata struct {
@@ -479,10 +492,18 @@ func cloneEdge(edge Edge) Edge {
 	}
 	if metadata.AWSCanAssumeRole != nil {
 		canAssume := *metadata.AWSCanAssumeRole
+		canAssume.Matches = cloneAWSCanAssumeRoleMatches(canAssume.Matches)
 		metadata.AWSCanAssumeRole = &canAssume
 	}
 	edge.Metadata = &metadata
 	return edge
+}
+
+func cloneAWSCanAssumeRoleMatches(matches []AWSCanAssumeRoleMatch) []AWSCanAssumeRoleMatch {
+	if matches == nil {
+		return nil
+	}
+	return append([]AWSCanAssumeRoleMatch(nil), matches...)
 }
 
 func cloneKubernetesCanReadAuthorizations(authorizations []KubernetesCanReadAuthorization) []KubernetesCanReadAuthorization {

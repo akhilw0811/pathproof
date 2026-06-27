@@ -61,6 +61,13 @@ omits the cross-domain finding, that safe OIDC trust alone exits `0`, that
 human and JSON output include sanitized workflow/job, OIDC capability, AWS role,
 and risk-signal data, and that patch/write/validation flags do not attach
 remediation, patch previews, or validation results to `PP-XDOMAIN-001`.
+Additional cross-domain admin-role CLI coverage asserts that `PP-XDOMAIN-002`
+appears only when the risky OIDC path uses the pull request subject and reaches
+an administrative AWS permission, that missing or nonmatching `--repo`,
+non-admin permissions, push-only workflows, branch-only trust, and
+environment-only trust omit `PP-XDOMAIN-002`, and that remediation, patch
+preview, patch output, validation, raw policy/trust content, and secret-like
+values are not attached or printed.
 AWS IAM CLI coverage asserts that static Terraform inline admin role policies
 and literal AdministratorAccess role-policy attachments emit `PP-AWS-001` in
 human, JSON, and SARIF output, that non-admin policies exit `0`, that malformed
@@ -70,10 +77,10 @@ attached to `PP-AWS-001`.
 
 SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
 PathProof driver run, deterministic rule entries for `PP-K8S-001`,
-`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and
-`PP-XDOMAIN-001`, one result for vulnerable fixtures, zero results for safe
-fixtures, deterministic rule/result fields, byte-identical repeated scans, and
-unchanged exit codes. GitHub Actions SARIF
+`PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
+`PP-XDOMAIN-001`, and `PP-XDOMAIN-002`, one result for vulnerable fixtures,
+zero results for safe fixtures, deterministic rule/result fields,
+byte-identical repeated scans, and unchanged exit codes. GitHub Actions SARIF
 coverage asserts `PP-GHA-001` severity maps to `warning`, `PP-GHA-002` and
 `PP-GHA-003` severities map to `error`, workflow artifact URIs are relative
 and URI-safe, line numbers are not guessed, rule text avoids the old inaccurate
@@ -82,7 +89,9 @@ secret-like workflow values are absent. Cross-domain SARIF coverage asserts
 `PP-XDOMAIN-001` rule metadata, `error` level, finding-summary messages,
 workflow source as the primary URI-safe location, stable
 `pathproofFindingId` fingerprints, and absence of raw Terraform trust policy
-content and secret-like values.
+content and secret-like values. Cross-domain admin-role SARIF coverage asserts
+the same for `PP-XDOMAIN-002`, plus administrative-permission summary text and
+deterministic rule presence without relying only on total rule counts.
 Source-location
 tests cover URI-encoded relative artifact URIs for paths with spaces,
 display-safe relative `properties.source_references`, omission of malformed
@@ -244,6 +253,13 @@ sanitized optional `risk_signal` data that is omitted from existing rule JSON.
 Regression coverage asserts that a `pull_request_target` risk does not produce
 `PP-XDOMAIN-001` when the only role trust match is for a different OIDC subject,
 such as a push branch ref.
+`PP-XDOMAIN-002` analysis coverage adds the administrative permission hop:
+positive workflow-level, job-level, and unsafe-checkout risk cases; negatives
+for no risk, no `CanAssumeRole`, non-admin permission, PP-GHA-001 alone,
+branch-only trust, and environment-only trust; multiple admin permissions
+producing distinct deterministic findings; ID changes when admin reason
+changes; distinct IDs from `PP-XDOMAIN-001`; ordered path evidence through
+`GrantsPermission`; and secret exclusion from finding JSON.
 
 Remediation tests cover the read-only `internal/remediation.Build` API for
 `PP-K8S-001`. Coverage asserts complete advisory options for

@@ -272,6 +272,315 @@ jobs:
 	}
 }
 
+func TestAnalyzeCrossDomainAdminRoleWorkflowRiskEmitsPPXDomain002(t *testing.T) {
+	findings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"), "owner/repo"))
+
+	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
+	if finding.Title != crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle {
+		t.Fatalf("title = %q, want %q", finding.Title, crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle)
+	}
+	if finding.Severity != SeverityHigh {
+		t.Fatalf("severity = %q, want High", finding.Severity)
+	}
+	assertFindingNodeKinds(t, finding, []graph.NodeKind{graph.Workflow, graph.OIDCTokenCapability, graph.AWSIAMRole, graph.AWSPermission})
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.GrantsPermission})
+	if finding.RiskSignal == nil || finding.RiskSignal.RuleID != RuleGitHubActionsDangerousPermissions {
+		t.Fatalf("risk signal = %#v, want PP-GHA-003", finding.RiskSignal)
+	}
+	if !strings.Contains(finding.Summary, "workflow-level OIDC token capability") || !strings.Contains(finding.Summary, "action_star_resource_star") {
+		t.Fatalf("summary = %q, want OIDC scope and admin reason", finding.Summary)
+	}
+	if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole); got != 1 {
+		t.Fatalf("PP-XDOMAIN-001 count = %d, want existing role-assumption finding", got)
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleJobRiskEmitsPPXDomain002(t *testing.T) {
+	findings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+`, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"), "owner/repo"))
+
+	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
+	assertFindingNodeKinds(t, finding, []graph.NodeKind{graph.Workflow, graph.WorkflowJob, graph.OIDCTokenCapability, graph.AWSIAMRole, graph.AWSPermission})
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.DefinesJob, graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.GrantsPermission})
+	if finding.RiskSignal == nil || finding.RiskSignal.JobID != "deploy" || finding.RiskSignal.Permission != "id-token" {
+		t.Fatalf("risk signal = %#v, want job-level id-token risk", finding.RiskSignal)
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleUnsafeCheckoutRiskEmitsPPXDomain002(t *testing.T) {
+	findings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"), "owner/repo"))
+
+	var matches []Finding
+	for _, finding := range findings {
+		if finding.RuleID == RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole && finding.RiskSignal != nil && finding.RiskSignal.RuleID == RuleGitHubActionsUnsafePullRequestTargetCheckout {
+			matches = append(matches, finding)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("PP-XDOMAIN-002 unsafe checkout count = %d, want workflow-level OIDC path: %#v", len(matches), findings)
+	}
+	finding := matches[0]
+	assertFindingNodeKinds(t, finding, []graph.NodeKind{graph.Workflow, graph.OIDCTokenCapability, graph.AWSIAMRole, graph.AWSPermission})
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.GrantsPermission})
+	if finding.RiskSignal.StepIndex == nil || len(finding.RiskSignal.Selectors) != 1 {
+		t.Fatalf("risk signal = %#v, want sanitized checkout selector", finding.RiskSignal)
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleRequiresRiskTrustAndAdminPermission(t *testing.T) {
+	tests := []struct {
+		name      string
+		workflow  string
+		terraform string
+		repo      string
+	}{
+		{
+			name: "OIDC trust admin with no risky signal",
+			workflow: `on: pull_request
+permissions:
+  id-token: write
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "risk and admin without CanAssumeRole",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"),
+			repo:      "",
+		},
+		{
+			name: "risk and trust without admin permission",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRoleWithInlinePolicy("deploy", "repo:owner/repo:pull_request", "read", "s3:GetObject", "*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "PP-GHA-001 alone does not trigger",
+			workflow: `on: pull_request
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - uses: owner/repo@main
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"),
+			repo:      "owner/repo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, tt.workflow, tt.terraform, tt.repo))
+			if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole); got != 0 {
+				t.Fatalf("PP-XDOMAIN-002 count = %d, want 0: %#v", got, findings)
+			}
+		})
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleRequiresPullRequestSubjectContext(t *testing.T) {
+	tests := []struct {
+		name      string
+		workflow  string
+		terraform string
+	}{
+		{
+			name: "branch trust",
+			workflow: `on:
+  push:
+    branches: [main]
+  pull_request_target:
+permissions: write-all
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:ref:refs/heads/main", "admin", "*", "*"),
+		},
+		{
+			name: "environment trust",
+			workflow: `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: prod
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:environment:prod", "admin", "*", "*"),
+		},
+		{
+			name: "environment trust named pull_request",
+			workflow: `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: pull_request
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:environment:pull_request", "admin", "*", "*"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, tt.workflow, tt.terraform, "owner/repo"))
+			if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole); got != 0 {
+				t.Fatalf("PP-XDOMAIN-001 count = %d, want 0 for %s-only trust: %#v", got, tt.name, findings)
+			}
+			if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole); got != 0 {
+				t.Fatalf("PP-XDOMAIN-002 count = %d, want 0 for %s-only trust: %#v", got, tt.name, findings)
+			}
+			if got := countFindingsByRule(findings, RuleAWSIAMRoleAdministrativePermissions); got != 1 {
+				t.Fatalf("PP-AWS-001 count = %d, want admin permission still modeled", got)
+			}
+		})
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleMixedEnvironmentAndPullRequestTrustEmits(t *testing.T) {
+	firstTerraform := terraformRoleWithSubjectsAndInlineAdminPolicy("deploy", []string{
+		"repo:owner/repo:environment:prod",
+		"repo:owner/repo:pull_request",
+	}, "admin", "*", "*")
+	secondTerraform := terraformRoleWithSubjectsAndInlineAdminPolicy("deploy", []string{
+		"repo:owner/repo:pull_request",
+		"repo:owner/repo:environment:prod",
+	}, "admin", "*", "*")
+	workflow := `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: prod
+`
+
+	firstFindings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, workflow, firstTerraform, "owner/repo"))
+	secondFindings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, workflow, secondTerraform, "owner/repo"))
+	first := onlyFindingByRule(t, firstFindings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
+	second := onlyFindingByRule(t, secondFindings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
+	if first.ID != second.ID {
+		t.Fatalf("PP-XDOMAIN-002 ID changed with trust subject order:\nfirst: %s\nsecond:%s", first.ID, second.ID)
+	}
+	assertFindingEdgeKinds(t, first, []graph.EdgeKind{graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.GrantsPermission})
+	if got := countFindingsByRule(firstFindings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole); got != 1 {
+		t.Fatalf("PP-XDOMAIN-001 count = %d, want existing role-assumption finding", got)
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleFindingIDIncludesAdminPermission(t *testing.T) {
+	terraform := terraformRole("deploy", "repo:owner/repo:pull_request") + `
+resource "aws_iam_role_policy" "admin_star" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}"
+}
+
+resource "aws_iam_role_policy" "admin_service_star" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*:*\",\"Resource\":\"*\"}}"
+}
+`
+	findings := Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraform, "owner/repo"))
+
+	var adminFindings []Finding
+	for _, finding := range findings {
+		if finding.RuleID == RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole {
+			adminFindings = append(adminFindings, finding)
+		}
+	}
+	if len(adminFindings) != 2 {
+		t.Fatalf("PP-XDOMAIN-002 count = %d, want one per admin permission: %#v", len(adminFindings), findings)
+	}
+	if adminFindings[0].ID == adminFindings[1].ID {
+		t.Fatalf("admin permissions produced duplicate PP-XDOMAIN-002 IDs: %#v", adminFindings)
+	}
+	if !strings.Contains(adminFindings[0].Summary+adminFindings[1].Summary, "action_star_resource_star") || !strings.Contains(adminFindings[0].Summary+adminFindings[1].Summary, "action_service_star_resource_star") {
+		t.Fatalf("summaries missing distinct admin reasons: %#v", adminFindings)
+	}
+
+	base := onlyFindingByRule(t, Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
+	changedReason := onlyFindingByRule(t, Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*:*", "*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
+	if base.ID == changedReason.ID {
+		t.Fatalf("PP-XDOMAIN-002 ID did not change when admin reason changed: %q", base.ID)
+	}
+	roleOnly := onlyFindingByRule(t, Analyze(crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole)
+	if base.ID == roleOnly.ID {
+		t.Fatalf("PP-XDOMAIN-001 and PP-XDOMAIN-002 IDs match unexpectedly: %q", base.ID)
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleReversedPermissionOrderIsDeterministic(t *testing.T) {
+	first := mustMarshalFindings(t, Analyze(manualCrossDomainAdminGraph(t, false)))
+	second := mustMarshalFindings(t, Analyze(manualCrossDomainAdminGraph(t, true)))
+	if string(first) != string(second) {
+		t.Fatalf("findings differ when admin permission insertion order reverses:\nfirst: %s\nsecond:%s", first, second)
+	}
+}
+
+func TestAnalyzeCrossDomainAdminRoleDeterministicAndSanitized(t *testing.T) {
+	const envSecret = "FAKE_XDOMAIN2_GHA_ENV_SECRET_DO_NOT_RETAIN"
+	const withSecret = "FAKE_XDOMAIN2_GHA_WITH_SECRET_DO_NOT_RETAIN"
+	const runSecret = "FAKE_XDOMAIN2_GHA_RUN_SECRET_DO_NOT_RETAIN"
+	const terraformSecret = "FAKE_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN"
+	g := crossDomainAdminGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions:
+  id-token: write
+env:
+  TOKEN: FAKE_XDOMAIN2_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    steps:
+      - run: echo FAKE_XDOMAIN2_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          token: FAKE_XDOMAIN2_GHA_WITH_SECRET_DO_NOT_RETAIN
+          ref: ${{ github.event.pull_request.head.sha }}
+`, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*")+"\n# "+terraformSecret+"\n", "owner/repo")
+
+	first := mustMarshalFindings(t, Analyze(g))
+	second := mustMarshalFindings(t, Analyze(g))
+	if string(first) != string(second) {
+		t.Fatalf("PP-XDOMAIN-002 findings differ across repeated analysis:\nfirst: %s\nsecond:%s", first, second)
+	}
+	var finding Finding
+	for _, candidate := range Analyze(g) {
+		if candidate.RuleID == RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole && candidate.RiskSignal != nil && candidate.RiskSignal.RuleID == RuleGitHubActionsUnsafePullRequestTargetCheckout {
+			finding = candidate
+			break
+		}
+	}
+	if finding.ID == "" {
+		t.Fatalf("PP-XDOMAIN-002 with PP-GHA-002 risk not found: %#v", Analyze(g))
+	}
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.GrantsPermission})
+	data := mustMarshalFindings(t, Analyze(g))
+	for _, forbidden := range []string{envSecret, withSecret, runSecret, terraformSecret, "run:", "${{", "assume_role_policy", "Principal", "Condition", "Statement", "policy =", "arn:aws:iam"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("finding JSON contains %q: %s", forbidden, data)
+		}
+	}
+}
+
 func TestAnalyzeRiskSignalOmittedForExistingRules(t *testing.T) {
 	findings := Analyze(githubActionsGraphFromWorkflow(t, `on: pull_request_target
 permissions:
@@ -343,6 +652,11 @@ func crossDomainGraphFromWorkflowAndTerraform(t *testing.T, workflow, terraform,
 	return g
 }
 
+func crossDomainAdminGraphFromWorkflowAndTerraform(t *testing.T, workflow, terraform, repo string) *graph.Graph {
+	t.Helper()
+	return crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraform, repo)
+}
+
 func writeTerraformForAnalysisTest(t *testing.T, root, name, content string) {
 	t.Helper()
 	path := filepath.Join(root, name)
@@ -375,6 +689,158 @@ func terraformRole(name, subject string) string {
 EOF
 }
 `
+}
+
+func terraformRoleWithInlineAdminPolicy(name, subject, policyName, action, resource string) string {
+	return terraformRoleWithInlinePolicy(name, subject, policyName, action, resource)
+}
+
+func terraformRoleWithInlinePolicy(name, subject, policyName, action, resource string) string {
+	return terraformRole(name, subject) + `
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + name + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
+func terraformRoleWithSubjectsAndInlineAdminPolicy(name string, subjects []string, policyName, action, resource string) string {
+	var patterns strings.Builder
+	for i, subject := range subjects {
+		if i > 0 {
+			patterns.WriteString(", ")
+		}
+		patterns.WriteString(`"`)
+		patterns.WriteString(subject)
+		patterns.WriteString(`"`)
+	}
+	return `resource "aws_iam_role" "` + name + `" {
+  assume_role_policy = <<EOF
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": [` + patterns.String() + `]
+      }
+    }
+  }
+}
+EOF
+}
+
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + name + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
+func manualCrossDomainAdminGraph(t *testing.T, reversed bool) *graph.Graph {
+	t.Helper()
+	g := graph.New()
+	workflow := graph.NewNode(graph.Workflow, "githubactions://.github/workflows/deploy.yml")
+	workflow.Evidence = []graph.SourceEvidence{{Source: ".github/workflows/deploy.yml#document=1", Detail: "github actions workflow with permissions: write-all"}}
+	workflow.Metadata = &graph.NodeMetadata{GitHubActionsWorkflow: &graph.GitHubActionsWorkflow{
+		WorkflowSourceReference:   ".github/workflows/deploy.yml#document=1",
+		WorkflowFile:              ".github/workflows/deploy.yml",
+		WorkflowName:              "Deploy",
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []graph.GitHubActionsPermissionGrant{{
+			Scope:      "workflow",
+			Permission: "all",
+			Access:     "write-all",
+		}},
+	}}
+	capability := graph.NewNode(graph.OIDCTokenCapability, "githubactions://.github/workflows/deploy.yml/oidc-token/workflow")
+	capability.Metadata = &graph.NodeMetadata{GitHubActionsOIDCTokenCapability: &graph.GitHubActionsOIDCTokenCapability{
+		Provider:                "github-actions",
+		WorkflowSourceReference: ".github/workflows/deploy.yml#document=1",
+		WorkflowFile:            ".github/workflows/deploy.yml",
+		WorkflowName:            "Deploy",
+		Scope:                   "workflow",
+	}}
+	role := graph.NewNode(graph.AWSIAMRole, "aws://terraform/aws_iam_role/infra/iam.tf/deploy")
+	role.Metadata = &graph.NodeMetadata{AWSIAMRole: &graph.AWSIAMRoleMetadata{
+		Provider:        "aws",
+		ResourceName:    "deploy",
+		SourceReference: "infra/iam.tf#resource=aws_iam_role.deploy",
+	}}
+	permissionStar := graph.NewNode(graph.AWSPermission, "aws://terraform/aws_permission/admin-star")
+	permissionStar.Metadata = &graph.NodeMetadata{AWSPermission: &graph.AWSPermissionMetadata{
+		Provider:                 "aws",
+		SourceReference:          "infra/iam.tf#resource=aws_iam_role_policy.admin_star",
+		PolicyResourceName:       "admin_star",
+		AttachedRoleResourceName: "deploy",
+		Actions:                  []string{"*"},
+		Resources:                []string{"*"},
+		Administrative:           true,
+		AdminReason:              "action_star_resource_star",
+	}}
+	permissionServiceStar := graph.NewNode(graph.AWSPermission, "aws://terraform/aws_permission/admin-service-star")
+	permissionServiceStar.Metadata = &graph.NodeMetadata{AWSPermission: &graph.AWSPermissionMetadata{
+		Provider:                 "aws",
+		SourceReference:          "infra/iam.tf#resource=aws_iam_role_policy.admin_service_star",
+		PolicyResourceName:       "admin_service_star",
+		AttachedRoleResourceName: "deploy",
+		Actions:                  []string{"*:*"},
+		Resources:                []string{"*"},
+		Administrative:           true,
+		AdminReason:              "action_service_star_resource_star",
+	}}
+
+	nodes := []graph.Node{workflow, capability, role, permissionStar, permissionServiceStar}
+	if reversed {
+		nodes = []graph.Node{permissionServiceStar, permissionStar, role, capability, workflow}
+	}
+	var added []graph.Node
+	for _, node := range nodes {
+		added = append(added, mustAddNode(t, g, node))
+	}
+	byName := make(map[string]graph.Node, len(added))
+	for _, node := range added {
+		byName[node.Name] = node
+	}
+	workflow = byName["githubactions://.github/workflows/deploy.yml"]
+	capability = byName["githubactions://.github/workflows/deploy.yml/oidc-token/workflow"]
+	role = byName["aws://terraform/aws_iam_role/infra/iam.tf/deploy"]
+	permissionStar = byName["aws://terraform/aws_permission/admin-star"]
+	permissionServiceStar = byName["aws://terraform/aws_permission/admin-service-star"]
+
+	oidc := graph.NewEdge(graph.CanRequestOIDCToken, workflow.ID, capability.ID, graph.SourceEvidence{
+		Source: ".github/workflows/deploy.yml#document=1",
+		Detail: "github actions workflow can request OIDC token because permissions: write-all includes id-token: write",
+	})
+	assumeRole := graph.NewEdge(graph.CanAssumeRole, capability.ID, role.ID, graph.SourceEvidence{
+		Source: "infra/iam.tf#resource=aws_iam_role.deploy",
+		Detail: "github actions oidc subject repo:owner/repo:pull_request matches aws iam role deploy trust statement 0",
+	})
+	assumeRole.Metadata = &graph.EdgeMetadata{AWSCanAssumeRole: &graph.AWSCanAssumeRoleMetadata{
+		Provider:         "aws",
+		RoleResourceName: "deploy",
+		SubjectCandidate: "repo:owner/repo:pull_request",
+	}}
+	star := graph.NewEdge(graph.GrantsPermission, role.ID, permissionStar.ID, graph.SourceEvidence{
+		Source: "infra/iam.tf#resource=aws_iam_role_policy.admin_star",
+		Detail: "aws iam role deploy grants administrative permission via inline_policy admin_star (action_star_resource_star action=* resource=*)",
+	})
+	serviceStar := graph.NewEdge(graph.GrantsPermission, role.ID, permissionServiceStar.ID, graph.SourceEvidence{
+		Source: "infra/iam.tf#resource=aws_iam_role_policy.admin_service_star",
+		Detail: "aws iam role deploy grants administrative permission via inline_policy admin_service_star (action_service_star_resource_star action=*:* resource=*)",
+	})
+	edges := []graph.Edge{oidc, assumeRole, star, serviceStar}
+	if reversed {
+		edges = []graph.Edge{serviceStar, star, assumeRole, oidc}
+	}
+	for _, edge := range edges {
+		mustAddEdge(t, g, edge)
+	}
+	return g
 }
 
 func assertFindingNodeKinds(t *testing.T, finding Finding, want []graph.NodeKind) {

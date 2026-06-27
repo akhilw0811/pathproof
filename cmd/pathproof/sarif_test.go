@@ -111,9 +111,7 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	}
 	run := report.Runs[0]
 	assertString(t, "driver name", run.Tool.Driver.Name, "PathProof")
-	if len(run.Tool.Driver.Rules) != 6 {
-		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
-	}
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-K8S-001")
 	assertString(t, "rule id", rule.ID, "PP-K8S-001")
 	assertString(t, "rule name", rule.Name, "Public workload can read Kubernetes Secret")
@@ -181,9 +179,7 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 6 {
-		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
-	}
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-001")
 	assertString(t, "rule id", rule.ID, "PP-GHA-001")
 	assertString(t, "rule name", rule.Name, "GitHub Actions workflow uses an action that is not pinned to a full commit SHA")
@@ -246,9 +242,7 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 6 {
-		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
-	}
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-002")
 	assertString(t, "rule id", rule.ID, "PP-GHA-002")
 	assertString(t, "rule name", rule.Name, "pull_request_target workflow checks out untrusted pull request head code")
@@ -305,9 +299,7 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 6 {
-		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
-	}
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-GHA-003")
 	assertString(t, "rule id", rule.ID, "PP-GHA-003")
 	assertString(t, "rule name", rule.Name, "pull_request_target workflow grants dangerous token permissions")
@@ -365,9 +357,7 @@ jobs:
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 6 {
-		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
-	}
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-XDOMAIN-001")
 	assertString(t, "rule id", rule.ID, "PP-XDOMAIN-001")
 	assertString(t, "rule name", rule.Name, "Risky GitHub Actions workflow can assume AWS IAM role")
@@ -407,6 +397,114 @@ jobs:
 	}
 }
 
+func TestRunScanCrossDomainAdminRoleSARIFOutputShapeAndFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "cross domain admin.yml", `name: Cross domain admin
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN2_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN2_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCAdminRole("deploy", "repo:owner/repo:pull_request", "admin", "*:*", "*")+"\n# FAKE_CLI_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN\n")
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+	repeatedStdout, repeatedStderr, repeatedCode := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertCode(t, repeatedCode, 1)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "repeated stderr", repeatedStderr, "")
+	if stdout != repeatedStdout {
+		t.Fatalf("PP-XDOMAIN-002 SARIF output changed across repeated runs:\nfirst:%s\nsecond:%s", stdout, repeatedStdout)
+	}
+	report := assertValidSARIFReport(t, stdout)
+	run := report.Runs[0]
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
+	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-XDOMAIN-002")
+	assertString(t, "rule id", rule.ID, "PP-XDOMAIN-002")
+	assertString(t, "rule name", rule.Name, "Risky GitHub Actions workflow can assume administrative AWS IAM role")
+	assertContains(t, rule.FullDescription.Text, "administrative permissions")
+	assertString(t, "rule default level", rule.DefaultConfiguration.Level, "error")
+	assertContains(t, rule.Help.Text, "does not execute workflows")
+	assertContains(t, rule.Help.Text, "simulate IAM permissions")
+
+	var result cliSARIFResult
+	for _, candidate := range run.Results {
+		if candidate.RuleID == "PP-XDOMAIN-002" {
+			result = candidate
+			break
+		}
+	}
+	if result.RuleID == "" {
+		t.Fatalf("PP-XDOMAIN-002 SARIF result not found: %#v", run.Results)
+	}
+	assertString(t, "level", result.Level, "error")
+	assertContains(t, result.Message.Text, "workflow-level OIDC token capability")
+	assertContains(t, result.Message.Text, "administrative AWS IAM role")
+	assertContains(t, result.Message.Text, "action_service_star_resource_star")
+	if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+		t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+	}
+	assertString(t, "severity", result.Properties.Severity, "High")
+	if len(result.Properties.NodeIDs) != 4 || len(result.Properties.EdgeIDs) != 3 {
+		t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want admin cross-domain path", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+	}
+	gotURIs := locationURIs(result.Locations)
+	if len(gotURIs) == 0 || gotURIs[0] != ".github/workflows/cross%20domain%20admin.yml#document=1" {
+		t.Fatalf("SARIF location URIs = %#v, want workflow source first", gotURIs)
+	}
+	for _, forbidden := range []string{"FAKE_CLI_XDOMAIN2_GHA_ENV_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN2_GHA_RUN_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN", "assume_role_policy", "Principal", "Condition", "Statement", "policy =", "arn:aws:iam"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanCrossDomainAdminRoleMixedTrustSARIFEmitsFinding(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "mixed admin.yml", `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: prod
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCSubjectsAdminRole("deploy", []string{
+		"repo:owner/repo:environment:prod",
+		"repo:owner/repo:pull_request",
+	}, "admin", "*", "*")+"\n# FAKE_CLI_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN\n")
+
+	stdout, stderr, code := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	var result cliSARIFResult
+	for _, candidate := range report.Runs[0].Results {
+		if candidate.RuleID == "PP-XDOMAIN-002" {
+			result = candidate
+			break
+		}
+	}
+	if result.RuleID == "" {
+		t.Fatalf("PP-XDOMAIN-002 SARIF result not found: %#v", report.Runs[0].Results)
+	}
+	assertString(t, "level", result.Level, "error")
+	assertContains(t, result.Message.Text, "administrative AWS IAM role")
+	gotURIs := locationURIs(result.Locations)
+	if len(gotURIs) == 0 || gotURIs[0] != ".github/workflows/mixed%20admin.yml#document=1" {
+		t.Fatalf("SARIF location URIs = %#v, want workflow source first", gotURIs)
+	}
+	for _, forbidden := range []string{"FAKE_CLI_XDOMAIN2_TF_SECRET_DO_NOT_RETAIN", "assume_role_policy", "Principal", "Condition", "Statement", "policy =", "arn:aws:iam"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
 func TestRunScanAWSIAMRoleAdminSARIFOutputShapeAndFinding(t *testing.T) {
 	dir := t.TempDir()
 	writeTerraformForTest(t, dir, "infra/admin policy.tf", `resource "aws_iam_role" "deploy" {
@@ -432,9 +530,7 @@ EOF
 	assertString(t, "stderr", stderr, "")
 	report := assertValidSARIFReport(t, stdout)
 	run := report.Runs[0]
-	if len(run.Tool.Driver.Rules) != 6 {
-		t.Fatalf("rules len = %d, want 6", len(run.Tool.Driver.Rules))
-	}
+	assertSARIFRuleSet(t, run.Tool.Driver.Rules)
 	rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-AWS-001")
 	assertString(t, "rule id", rule.ID, "PP-AWS-001")
 	assertString(t, "rule name", rule.Name, "AWS IAM role grants administrative permissions")
@@ -750,6 +846,31 @@ func assertValidSARIFReport(t *testing.T, output string) cliSARIFLog {
 		t.Fatalf("SARIF version = %q, want 2.1.0", report.Version)
 	}
 	return report
+}
+
+func assertSARIFRuleSet(t *testing.T, rules []cliSARIFRule) {
+	t.Helper()
+	want := []string{
+		"PP-K8S-001",
+		"PP-GHA-001",
+		"PP-GHA-002",
+		"PP-GHA-003",
+		"PP-AWS-001",
+		"PP-XDOMAIN-001",
+		"PP-XDOMAIN-002",
+	}
+	counts := make(map[string]int, len(rules))
+	for _, rule := range rules {
+		counts[rule.ID]++
+	}
+	for _, id := range want {
+		if counts[id] != 1 {
+			t.Fatalf("SARIF rule %s count = %d, want exactly 1 in %#v", id, counts[id], rules)
+		}
+	}
+	if len(rules) != len(want) {
+		t.Fatalf("SARIF rules len = %d, want %d expected rules exactly: %#v", len(rules), len(want), rules)
+	}
 }
 
 func mustSARIFRule(t *testing.T, rules []cliSARIFRule, id string) cliSARIFRule {

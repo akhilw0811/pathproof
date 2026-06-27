@@ -44,38 +44,55 @@ func AddRoutes(g *graph.Graph, resources parserterraform.Resources, workflows pa
 	if len(candidates) == 0 {
 		return nil
 	}
+	assumptions := make(map[string]*canAssumeRoleAggregate)
 	for _, role := range resources.IAMRoles {
 		if len(role.Trusts) == 0 {
 			continue
 		}
 		roleNode := graph.NewNode(graph.AWSIAMRole, roleNodeName(role))
 		for _, candidate := range candidates {
-			match, ok := matchingTrust(role.Trusts, candidate.subject)
-			if !ok {
+			matches := matchingTrusts(role.Trusts, candidate.subject)
+			if len(matches) == 0 {
 				continue
 			}
-			edge := graph.NewEdge(graph.CanAssumeRole, candidate.capability.ID, roleNode.ID, graph.SourceEvidence{
-				Source: sourceRef(role.Source),
-				Detail: fmt.Sprintf("github actions oidc subject %s matches aws iam role %s trust statement %d", candidate.subject, role.ResourceName, match.statementIndex),
-			})
-			edge.Metadata = &graph.EdgeMetadata{AWSCanAssumeRole: &graph.AWSCanAssumeRoleMetadata{
-				Provider:                      providerAWS,
-				RoleResourceName:              role.ResourceName,
-				RoleSourceReference:           sourceRef(role.Source),
-				TrustedIssuer:                 githubActionsIssuer,
-				StatementIndex:                match.statementIndex,
-				Audience:                      awsAudience,
-				SubjectCandidate:              candidate.subject,
-				SubjectPattern:                match.pattern.Pattern,
-				SubjectOperator:               match.pattern.Operator,
-				OIDCCapabilitySourceReference: candidate.metadata.WorkflowSourceReference,
-				WorkflowFile:                  candidate.metadata.WorkflowFile,
-				Scope:                         candidate.metadata.Scope,
-				JobID:                         candidate.metadata.JobID,
-			}}
-			if _, err := g.AddEdge(edge); err != nil {
-				return fmt.Errorf("add can assume role edge %s: %w", role.ResourceName, err)
+			key := string(candidate.capability.ID) + "\x00" + string(roleNode.ID)
+			aggregate := assumptions[key]
+			if aggregate == nil {
+				aggregate = &canAssumeRoleAggregate{
+					edge: graph.NewEdge(graph.CanAssumeRole, candidate.capability.ID, roleNode.ID, graph.SourceEvidence{
+						Source: sourceRef(role.Source),
+					}),
+					metadata: graph.AWSCanAssumeRoleMetadata{
+						Provider:                      providerAWS,
+						RoleResourceName:              role.ResourceName,
+						RoleSourceReference:           sourceRef(role.Source),
+						TrustedIssuer:                 githubActionsIssuer,
+						Audience:                      awsAudience,
+						OIDCCapabilitySourceReference: candidate.metadata.WorkflowSourceReference,
+						WorkflowFile:                  candidate.metadata.WorkflowFile,
+						Scope:                         candidate.metadata.Scope,
+						JobID:                         candidate.metadata.JobID,
+					},
+					seen: make(map[string]struct{}),
+				}
+				assumptions[key] = aggregate
 			}
+			for _, match := range matches {
+				aggregate.add(matchMetadata(role, candidate, match))
+			}
+		}
+	}
+	ordered := make([]*canAssumeRoleAggregate, 0, len(assumptions))
+	for _, aggregate := range assumptions {
+		ordered = append(ordered, aggregate)
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].edge.ID < ordered[j].edge.ID
+	})
+	for _, aggregate := range ordered {
+		edge := aggregate.finalize()
+		if _, err := g.AddEdge(edge); err != nil {
+			return fmt.Errorf("add can assume role edge %s: %w", aggregate.metadata.RoleResourceName, err)
 		}
 	}
 	return nil
@@ -114,6 +131,89 @@ type subjectCandidate struct {
 type trustMatch struct {
 	statementIndex int
 	pattern        graph.AWSOIDCSubjectPattern
+}
+
+type canAssumeRoleAggregate struct {
+	edge     graph.Edge
+	metadata graph.AWSCanAssumeRoleMetadata
+	matches  []graph.AWSCanAssumeRoleMatch
+	seen     map[string]struct{}
+}
+
+func (aggregate *canAssumeRoleAggregate) add(match graph.AWSCanAssumeRoleMatch) {
+	key := canAssumeRoleMatchIdentity(match)
+	if _, ok := aggregate.seen[key]; ok {
+		return
+	}
+	aggregate.seen[key] = struct{}{}
+	aggregate.matches = append(aggregate.matches, match)
+}
+
+func (aggregate *canAssumeRoleAggregate) finalize() graph.Edge {
+	sort.SliceStable(aggregate.matches, func(i, j int) bool {
+		return canAssumeRoleMatchIdentity(aggregate.matches[i]) < canAssumeRoleMatchIdentity(aggregate.matches[j])
+	})
+	if len(aggregate.matches) > 0 {
+		first := aggregate.matches[0]
+		aggregate.metadata.StatementIndex = first.StatementIndex
+		aggregate.metadata.SubjectCandidate = first.SubjectCandidate
+		aggregate.metadata.SubjectPattern = first.SubjectPattern
+		aggregate.metadata.SubjectOperator = first.SubjectOperator
+		aggregate.metadata.Matches = append([]graph.AWSCanAssumeRoleMatch(nil), aggregate.matches...)
+	}
+	aggregate.edge.Evidence.Detail = canAssumeRoleEvidenceDetail(aggregate.metadata.RoleResourceName, aggregate.matches)
+	aggregate.edge.Metadata = &graph.EdgeMetadata{AWSCanAssumeRole: &aggregate.metadata}
+	return aggregate.edge
+}
+
+func matchMetadata(role parserterraform.IAMRole, candidate subjectCandidate, match trustMatch) graph.AWSCanAssumeRoleMatch {
+	return graph.AWSCanAssumeRoleMatch{
+		Provider:            providerAWS,
+		RoleResourceName:    role.ResourceName,
+		RoleSourceReference: sourceRef(role.Source),
+		TrustedIssuer:       githubActionsIssuer,
+		StatementIndex:      match.statementIndex,
+		Audience:            awsAudience,
+		SubjectCandidate:    candidate.subject,
+		SubjectPattern:      match.pattern.Pattern,
+		SubjectOperator:     match.pattern.Operator,
+	}
+}
+
+func canAssumeRoleMatchIdentity(match graph.AWSCanAssumeRoleMatch) string {
+	data, err := json.Marshal(struct {
+		Provider            string `json:"provider"`
+		RoleResourceName    string `json:"role_resource_name"`
+		RoleSourceReference string `json:"role_source_reference"`
+		TrustedIssuer       string `json:"trusted_issuer"`
+		StatementIndex      int    `json:"statement_index"`
+		Audience            string `json:"audience"`
+		SubjectCandidate    string `json:"subject_candidate"`
+		SubjectPattern      string `json:"subject_pattern"`
+		SubjectOperator     string `json:"subject_operator"`
+	}{
+		Provider:            match.Provider,
+		RoleResourceName:    match.RoleResourceName,
+		RoleSourceReference: match.RoleSourceReference,
+		TrustedIssuer:       match.TrustedIssuer,
+		StatementIndex:      match.StatementIndex,
+		Audience:            match.Audience,
+		SubjectCandidate:    match.SubjectCandidate,
+		SubjectPattern:      match.SubjectPattern,
+		SubjectOperator:     match.SubjectOperator,
+	})
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func canAssumeRoleEvidenceDetail(roleName string, matches []graph.AWSCanAssumeRoleMatch) string {
+	subjects := make([]string, 0, len(matches))
+	for _, match := range matches {
+		subjects = append(subjects, match.SubjectCandidate)
+	}
+	return fmt.Sprintf("github actions oidc subjects %s match aws iam role %s trust", strings.Join(subjects, ","), roleName)
 }
 
 func oidcSubjectCandidates(g *graph.Graph, workflows parsergithubactions.Resources, repo string) []subjectCandidate {
@@ -186,7 +286,8 @@ func jobEnvironment(workflow parsergithubactions.Workflow, jobID string) string 
 	return ""
 }
 
-func matchingTrust(trusts []parserterraform.OIDCTrust, subject string) (trustMatch, bool) {
+func matchingTrusts(trusts []parserterraform.OIDCTrust, subject string) []trustMatch {
+	var matches []trustMatch
 	for _, trust := range trusts {
 		if trust.Issuer != githubActionsIssuer || !stringListContains(trust.Audiences, awsAudience) {
 			continue
@@ -194,11 +295,20 @@ func matchingTrust(trusts []parserterraform.OIDCTrust, subject string) (trustMat
 		patterns := trustPatterns(trust.SubjectPatterns)
 		for _, pattern := range patterns {
 			if subjectPatternMatches(pattern, subject) {
-				return trustMatch{statementIndex: trust.StatementIndex, pattern: pattern}, true
+				matches = append(matches, trustMatch{statementIndex: trust.StatementIndex, pattern: pattern})
 			}
 		}
 	}
-	return trustMatch{}, false
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].statementIndex != matches[j].statementIndex {
+			return matches[i].statementIndex < matches[j].statementIndex
+		}
+		if matches[i].pattern.Operator != matches[j].pattern.Operator {
+			return matches[i].pattern.Operator < matches[j].pattern.Operator
+		}
+		return matches[i].pattern.Pattern < matches[j].pattern.Pattern
+	})
+	return matches
 }
 
 func trustPatterns(patterns []parserterraform.SubjectPattern) []graph.AWSOIDCSubjectPattern {
