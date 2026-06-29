@@ -70,6 +70,23 @@ and suppressions are applied before baseline generation, stale suppressions
 are not copied, malformed configs and write errors exit `2` with empty stdout,
 and secret-like source or config values do not leak to stdout, stderr, JSON,
 SARIF, or baseline files.
+Baseline comparison coverage asserts that `--baseline <file>` loads a local
+config-shaped baseline, uses only suppression finding IDs, deduplicates
+baseline IDs, classifies active-scope current findings as `new` or
+`existing`, reports stale baseline IDs as sorted resolved IDs, and never
+prints suppression reasons. Parser and CLI tests reject missing files,
+directories, malformed JSON, non-object JSON, remote or URL-like paths, and
+unknown fields with sanitized stderr and empty stdout. They also reject
+unsupported baseline finding-ID formats before resolved IDs are reported, so
+absolute-path-like and token-like stale baseline values are not leaked. CLI
+comparison tests cover JSON `baseline_comparison`, per-finding
+`baseline_status`, deterministic human summaries, SARIF result
+`baseline_status` without resolved SARIF results, `--baseline` not suppressing
+by itself, `--config` suppressions still hiding findings after comparison,
+disabled rules and path exclusions limiting the active comparison scope,
+rejection of `--baseline` with `--write-baseline`, and no change to
+remediation, patch output, or validation for unsuppressed `PP-K8S-001` and
+`PP-GHA-001` findings.
 GitHub Actions CLI coverage
 asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
 unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
