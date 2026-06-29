@@ -781,6 +781,33 @@ func TestRunScanSARIFWithPatchFlagsKeepsStdoutFindingsOnly(t *testing.T) {
 	assertSARIFOmitsPatchAndValidationText(t, stdout)
 }
 
+func TestRunScanSARIFWithGitHubActionPinsRemainsFindingsOnly(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("d", 40)
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=sarif", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	if got := countSARIFResultsByRule(report, "PP-GHA-001"); got != 1 {
+		t.Fatalf("PP-GHA-001 SARIF result count = %d, want 1", got)
+	}
+	assertSARIFOmitsPatchAndValidationText(t, stdout)
+	for _, forbidden := range []string{"PinGitHubActionToSHA", "replacement_sha", "patch_supported", sha, "pins.json"} {
+		if strings.Contains(stdout, forbidden) {
+			t.Fatalf("SARIF output contains GitHub action pin metadata %q: %s", forbidden, stdout)
+		}
+	}
+}
+
 func TestSARIFSourceReferencesUseOnlyCleanStructuredFields(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "scan")

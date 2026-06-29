@@ -9,6 +9,7 @@ and local directory scans with:
 - `pathproof scan --format=json <directory>`
 - `pathproof scan --format sarif <directory>`
 - `pathproof scan --repo OWNER/REPO <directory>`
+- `pathproof scan --github-action-pins <file> <directory>`
 - `pathproof scan --preview-patches <directory>`
 - `pathproof scan --write-patches <output-directory> <directory>`
 - `pathproof scan --write-patches <output-directory> --validate-patches <directory>`
@@ -17,17 +18,21 @@ The scan command is intentionally only an orchestration layer. It validates the
 local directory input, parses Kubernetes manifests and local GitHub Actions
 workflows under `.github/workflows`, parses local Terraform `.tf` files for a
 narrow static AWS IAM role OIDC trust-policy slice, constructs the in-memory
-graph, runs deterministic analysis, builds advisory remediation plans for supported
-Kubernetes findings, optionally builds read-only patch previews for supported
-remediation changes, optionally writes patched copies for supported generated
-previews to a separate output directory, optionally validates written patches
-by rescanning a temporary complete patched manifest overlay, projects findings,
+graph, runs deterministic analysis, builds advisory remediation plans for
+supported Kubernetes findings and `PP-GHA-001` unpinned action findings,
+optionally builds read-only patch previews for supported remediation changes,
+optionally writes patched copies for supported generated previews to a
+separate output directory, optionally validates written Kubernetes patches by
+rescanning a temporary complete patched manifest overlay, projects findings,
 plans, previews, patch output summaries, and validation results into a private
-CLI report shape, and writes human-readable output, JSON, or SARIF. It does
-not persist the graph or expose graph internals beyond the ordered finding
-path, evidence, remediation plan fields, optional preview fields, optional
-patch output summaries, optional validation results, and SARIF finding
-projection.
+CLI report shape, and writes human-readable output, JSON, or SARIF. GitHub
+Actions pinning patches are local-only: PathProof reads only an optional local
+JSON pin mapping supplied with `--github-action-pins`, never calls GitHub,
+never resolves tags or branches, never guesses SHAs, and does not validate
+`PP-GHA-001` patches in this slice. It does not persist the graph or expose
+graph internals beyond the ordered finding path, evidence, remediation plan
+fields, optional preview fields, optional patch output summaries, optional
+validation results, and SARIF finding projection.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -54,7 +59,8 @@ workflow name, workflow source, `pull_request` and `pull_request_target`
 trigger presence, static push branch literals for OIDC subject matching,
 sanitized workflow-level and job-level permission grants, job IDs, static job
 environment names for OIDC subject matching, step indexes, optional step
-names, and sanitized static action identity components.
+names, sanitized static action identity components, and precise `uses:` scalar
+line/column positions for safe local patch planning.
 For `actions/checkout` steps only, it also records sanitized matches for the
 PR-head selector expressions used by `PP-GHA-002`. It does not require a Git
 repository, call GitHub APIs, execute workflows, evaluate expressions, resolve
@@ -62,10 +68,14 @@ reusable workflows, inspect action source code, model exact workflow
 permission inheritance or overrides, infer branch names, expand matrices, or
 retain `env`, arbitrary `with` values, `secrets`, token values, run scripts,
 expression-only `uses:` values, unknown permission values, or raw workflow
-documents. A `uses:` value that is entirely an expression is ignored because it
-is not a statically recognizable action reference. If a `uses:` value has a
-static `owner/repo` shape but an expression in the ref, the ref is stored as a
-sanitized expression marker and treated as unpinned.
+documents. It records only a coarse unsupported-patch reason when secret-like
+workflow context makes GitHub Actions patch output unsafe. Ordinary non-secret
+`env`, `with`, and `run` keys do not by themselves disable action pin patches.
+A `uses:` value that is
+entirely an expression is ignored because it is not a statically recognizable
+action reference. If a `uses:` value has a static `owner/repo` shape but an
+expression in the ref, the ref is stored as a sanitized expression marker and
+treated as unpinned.
 
 Implemented Terraform parsing lives under `internal/parser/terraform`. It
 walks local `.tf` files under the scan root and recognizes only top-level
@@ -308,47 +318,64 @@ redaction.
 Implemented remediation planning lives under `internal/remediation`. It is
 read-only: it consumes the graph and analysis findings, validates supported
 `PP-K8S-001` finding shape and edge continuity, inspects structured `CanRead`
-authorization metadata, and emits complete advisory options. It does not parse
-human-readable evidence prose and does not modify source manifests. The
+authorization metadata, emits complete advisory Kubernetes options, and emits
+advisory `PP-GHA-001` action-pinning options from structured GitHub Actions
+action metadata. It does not parse human-readable evidence prose and does not
+modify source manifests or workflows. The
 implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
-`NarrowBindingSubject`. `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`,
-`PP-AWS-001`, `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`
-receive no remediation plan, patch preview, patch output, or validation result
-in this slice.
+`NarrowBindingSubject` for Kubernetes and `PinGitHubActionToSHA` for
+`PP-GHA-001`. GitHub Actions action pinning is advisory unless a local
+`--github-action-pins` JSON mapping provides the exact original action ref and
+an exact 40-character commit SHA. `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003` receive no
+remediation plan, patch preview, patch output, or validation result in this
+slice.
 
 Optional patch preview generation lives under `internal/patchpreview`. It is
 also read-only: it consumes the scan root and remediation plans, resolves
-existing `filename#document=N` source references, reads source YAML, and emits
-deterministic unified diffs only for `NarrowBindingSubject` changes that remove
-one exact ServiceAccount subject from a multi-subject `RoleBinding` or
-`ClusterRoleBinding`. It edits only the referenced YAML document in memory and
-never writes source files. Unsupported actions, mismatched source references,
-namespace-less subjects, single-subject bindings, and source files containing
-core `v1` Secret payload fields produce `unsupported` preview entries.
+existing `filename#document=N` source references, reads source YAML or
+workflow files, and emits deterministic unified diffs only for supported
+`NarrowBindingSubject` and safe `PinGitHubActionToSHA` changes. Kubernetes
+previews edit only the referenced YAML document in memory. GitHub Actions
+previews are text-only replacements at parsed `uses:` scalar coordinates and
+replace only the ref after `@`, with no surrounding workflow context in the
+diff. Preview generation never writes source files. Unsupported actions,
+mismatched source references, namespace-less subjects, single-subject
+bindings, source files containing core `v1` Secret payload fields, GitHub
+Actions expression refs, imprecise `uses:` source locations, same-line
+comments on the patched `uses:` scalar, `uses:` scalars sharing a physical line
+with unsafe workflow fields, and workflow files with unsupported or secret-like
+context produce `unsupported` preview entries. Harmless workflow `env`, `with`,
+and `run` content on other lines does not block no-context `uses:` diffs.
 
 Optional patch output generation also lives under `internal/patchpreview`. It
-uses the same in-memory YAML edit logic as preview generation, groups
-compatible generated `NarrowBindingSubject` changes by source-relative path,
-and writes one patched copy per changed source file under a separate output
-directory. It validates input/output directory relationships before preparing
-patches, resolving symlinks and nearest existing parents so output paths cannot
-write into or under the scan root. It prepares all patched file contents before
-creating output files and does not create the output directory when no
-generated patch files exist. Source references may be absolute internally, but
-scan-root-local source references are projected as stable relative paths across
-the CLI report, including findings, evidence, remediation changes, previews,
-and patch output summaries. Unsupported previews are reported but not written.
-Source files containing core `v1` Secret payload fields are not copied or
+uses the same in-memory edit logic as preview generation, groups compatible
+generated changes by source-relative path, and writes one patched copy per
+changed source file under a separate output directory. Kubernetes output uses
+the existing YAML document edit path; GitHub Actions output uses the text-only
+`uses:` scalar replacement path. It validates input/output directory
+relationships before preparing patches, resolving symlinks and nearest
+existing parents so output paths cannot write into or under the scan root. It
+prepares all patched file contents before creating output files and does not
+create the output directory when no generated patch files exist. Source
+references may be absolute internally, but scan-root-local source references
+are projected as stable relative paths across the CLI report, including
+findings, evidence, remediation changes, previews, and patch output summaries.
+Unsupported previews are reported but not written. Source files containing
+core `v1` Secret payload fields and unsafe workflow files are not copied or
 written.
 
 Optional patch validation is private to the CLI orchestration layer. It runs
-only after patch output succeeds, creates a temporary directory containing the
-same top-level YAML/YML files that the parser scans, substitutes generated
-patched files by source-relative path, rescans that complete logical manifest
-set with the existing parse, route, and analyze pipeline, and removes the
-temporary directory before returning. Validation never scans only the partial
-patch output directory, never writes copied input files to the user-visible
-output directory, and never prints temporary paths or manifest contents.
+only after patch output succeeds and remains scoped to `PP-K8S-001`
+`NarrowBindingSubject` output. It creates a temporary directory containing the
+same top-level YAML/YML files that the Kubernetes parser scans, substitutes
+generated Kubernetes patched files by source-relative path, rescans that
+complete logical manifest set with the existing parse, route, and analyze
+pipeline, and removes the temporary directory before returning. `PP-GHA-001`
+patch outputs are not validated in this slice. Validation never scans only the
+partial patch output directory, never writes copied input files to the
+user-visible output directory, and never prints temporary paths or manifest
+contents.
 
 SARIF output is a findings-only CLI projection. `pathproof scan --format sarif`
 emits SARIF 2.1.0 with one PathProof tool driver, deterministic rule entries

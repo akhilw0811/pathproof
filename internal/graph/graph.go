@@ -235,11 +235,14 @@ type GitHubActionUse struct {
 	StepIndex                 int                                 `json:"step_index"`
 	StepName                  string                              `json:"step_name,omitempty"`
 	Uses                      string                              `json:"uses"`
+	UsesLine                  int                                 `json:"uses_line,omitempty"`
+	UsesColumn                int                                 `json:"uses_column,omitempty"`
 	Owner                     string                              `json:"owner,omitempty"`
 	Repo                      string                              `json:"repo,omitempty"`
 	Path                      string                              `json:"path,omitempty"`
 	Ref                       string                              `json:"ref,omitempty"`
 	CheckoutHeadSelectors     []GitHubActionsCheckoutHeadSelector `json:"checkout_head_selectors,omitempty"`
+	PatchUnsupportedReason    string                              `json:"patch_unsupported_reason,omitempty"`
 }
 
 type GitHubActionsCheckoutHeadSelector struct {

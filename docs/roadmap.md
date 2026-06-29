@@ -114,14 +114,30 @@
   `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
   Plans contain only complete options; multi-chain Secret read access requires
   coordinated changes in one option.
+- Read-only deterministic remediation planning for `PP-GHA-001`, using
+  sanitized structured `UsesAction` metadata. Implemented action
+  `PinGitHubActionToSHA` is advisory for every unpinned remote action finding.
+  It never resolves refs, calls GitHub, guesses SHAs, clones repositories, or
+  trusts mutable refs.
 - Opt-in read-only patch previews for `NarrowBindingSubject`, limited to exact
   ServiceAccount subject removal from the referenced RoleBinding or
   ClusterRoleBinding source document. Secret-bearing source files are
   intentionally unsupported for previews.
+- Opt-in read-only patch previews for `PinGitHubActionToSHA`, limited to safe
+  static GitHub Actions `uses:` scalar replacements when a local
+  `--github-action-pins` JSON mapping provides an exact 40-character commit
+  SHA for the exact original action ref. Single-quoted, double-quoted, and
+  unquoted static refs are supported when source coordinates are safe.
+  Secret-like workflow context, expression refs, missing refs, local actions,
+  Docker actions, same-line unsafe fields, and same-line comments are
+  advisory-only.
 - Opt-in patch output for generated `NarrowBindingSubject` previews. Patched
   copies are written only to a separate new or empty output directory, input
   files are never modified, unsupported actions are reported but not written,
   and Secret-bearing source files are not copied or written.
+- Opt-in patch output for generated `PinGitHubActionToSHA` previews. Patched
+  workflow copies are written only to the separate patch output directory, and
+  `PP-GHA-001` patches receive no validation result in this slice.
 - Opt-in validation rescan for written `NarrowBindingSubject` patch output.
   Validation builds a temporary complete patched manifest set from the input
   directory plus generated patch files, rescans it locally, and reports
@@ -158,7 +174,8 @@
 - Reusable workflow resolution.
 - CI/CD-to-cloud path analysis.
 - Action source inspection.
-- Automatic GitHub Actions action pinning patches.
+- Live GitHub Actions tag or branch resolution, marketplace lookups,
+  repository cloning, and dependency update automation.
 - Automatic GitHub Actions remediation for unsafe `pull_request_target`
   checkout patterns.
 - Automatic GitHub Actions remediation for dangerous workflow permissions.

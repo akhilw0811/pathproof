@@ -893,6 +893,157 @@ func TestWriteRepeatedAndReversedInputsAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestBuildGitHubActionPinPreviewGenerated(t *testing.T) {
+	root := t.TempDir()
+	sha := strings.Repeat("a", 40)
+	original := `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`
+	writeFile(t, root, ".github/workflows/build.yml", original)
+	plan := planWithChanges("plan:gha", remediation.PinGitHubActionToSHA, []remediation.Change{
+		pinChange(".github/workflows/build.yml#document=1", "actions/checkout@v4", "actions/checkout@"+sha, sha, 4, 15, true, ""),
+	})
+
+	previews := mustBuild(t, root, []remediation.Plan{plan})
+	repeated := mustBuild(t, root, []remediation.Plan{plan})
+
+	if !reflect.DeepEqual(previews, repeated) {
+		t.Fatalf("previews differ:\nfirst=%#v\nsecond=%#v", previews, repeated)
+	}
+	if len(previews) != 1 || previews[0].Status != StatusGenerated {
+		t.Fatalf("previews = %#v, want generated", previews)
+	}
+	assertDiffShape(t, previews[0].Diff, ".github/workflows/build.yml")
+	assertContains(t, previews[0].Diff, "-      - uses: actions/checkout@v4\n")
+	assertContains(t, previews[0].Diff, "+      - uses: actions/checkout@"+sha+"\n")
+	if strings.Contains(previews[0].Diff, " jobs:") || strings.Contains(previews[0].Diff, " test:") {
+		t.Fatalf("GitHub Actions diff includes unsafe context:\n%s", previews[0].Diff)
+	}
+	assertFileUnchanged(t, root, ".github/workflows/build.yml", original)
+}
+
+func TestWriteGitHubActionPinPatchWritesCopyAndLeavesInputUnchanged(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	outputRoot := filepath.Join(parent, "patched")
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	original := `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+      - uses: owner/repo/path@v1
+`
+	writeFile(t, root, ".github/workflows/build.yml", original)
+	plan := planWithChanges("plan:gha", remediation.PinGitHubActionToSHA, []remediation.Change{
+		pinChange(".github/workflows/build.yml#document=1", "owner/repo/path@v1", "owner/repo/path@"+shaB, shaB, 5, 15, true, ""),
+		pinChange(".github/workflows/build.yml#document=1", "actions/checkout@v4", "actions/checkout@"+shaA, shaA, 4, 15, true, ""),
+	})
+
+	written, previews, err := Write(root, outputRoot, []remediation.Plan{plan})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if len(previews) != 2 {
+		t.Fatalf("previews = %#v, want two", previews)
+	}
+	if len(written) != 1 || written[0].PreviewStatus != StatusGenerated || written[0].Source != ".github/workflows/build.yml" {
+		t.Fatalf("written = %#v, want one generated workflow output", written)
+	}
+	patched := readFile(t, outputRoot, ".github/workflows/build.yml")
+	assertContains(t, patched, "actions/checkout@"+shaA)
+	assertContains(t, patched, "owner/repo/path@"+shaB)
+	assertFileUnchanged(t, root, ".github/workflows/build.yml", original)
+}
+
+func TestWriteGitHubActionPinPatchAppliesSameLineReplacementsRightToLeft(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	outputRoot := filepath.Join(parent, "patched")
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	stepsLine := "    steps: [{uses: actions/checkout@v4}, {uses: owner/repo@v1}]\n"
+	original := "jobs:\n  test:\n" + stepsLine
+	writeFile(t, root, ".github/workflows/build.yml", original)
+	checkoutColumn := strings.Index(stepsLine, "actions/checkout@v4") + 1
+	ownerColumn := strings.Index(stepsLine, "owner/repo@v1") + 1
+	if checkoutColumn <= 0 || ownerColumn <= 0 {
+		t.Fatalf("test fixture columns were not found")
+	}
+	plan := planWithChanges("plan:gha", remediation.PinGitHubActionToSHA, []remediation.Change{
+		pinChange(".github/workflows/build.yml#document=1", "actions/checkout@v4", "actions/checkout@"+shaA, shaA, 3, checkoutColumn, true, ""),
+		pinChange(".github/workflows/build.yml#document=1", "owner/repo@v1", "owner/repo@"+shaB, shaB, 3, ownerColumn, true, ""),
+	})
+
+	written, previews, err := Write(root, outputRoot, []remediation.Plan{plan})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if len(previews) != 2 {
+		t.Fatalf("previews = %#v, want two", previews)
+	}
+	combinedDiff := previews[0].Diff + previews[1].Diff
+	assertContains(t, combinedDiff, "+    steps: [{uses: actions/checkout@"+shaA+"}, {uses: owner/repo@v1}]\n")
+	assertContains(t, combinedDiff, "+    steps: [{uses: actions/checkout@v4}, {uses: owner/repo@"+shaB+"}]\n")
+	if len(written) != 1 || written[0].PreviewStatus != StatusGenerated || written[0].Source != ".github/workflows/build.yml" {
+		t.Fatalf("written = %#v, want one generated workflow output", written)
+	}
+	patched := readFile(t, outputRoot, ".github/workflows/build.yml")
+	assertContains(t, patched, "actions/checkout@"+shaA)
+	assertContains(t, patched, "owner/repo@"+shaB)
+	assertFileUnchanged(t, root, ".github/workflows/build.yml", original)
+}
+
+func TestBuildGitHubActionPinUnsupportedCases(t *testing.T) {
+	root := t.TempDir()
+	sha := strings.Repeat("a", 40)
+	writeFile(t, root, ".github/workflows/build.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4 # keep comment
+`)
+	tests := []struct {
+		name   string
+		change remediation.Change
+		want   string
+	}{
+		{
+			name:   "advisory only",
+			change: pinChange(".github/workflows/build.yml#document=1", "actions/checkout@v4", "", "", 4, 15, false, "no local SHA mapping was provided for this exact action ref"),
+			want:   "no local SHA mapping",
+		},
+		{
+			name:   "same-line comment",
+			change: pinChange(".github/workflows/build.yml#document=1", "actions/checkout@v4", "actions/checkout@"+sha, sha, 4, 15, true, ""),
+			want:   "same-line comment",
+		},
+		{
+			name:   "imprecise source",
+			change: pinChange(".github/workflows/build.yml#document=1", "actions/checkout@v4", "actions/checkout@"+sha, sha, 0, 0, true, ""),
+			want:   "source location",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := planWithChanges("plan:gha", remediation.PinGitHubActionToSHA, []remediation.Change{tt.change})
+
+			previews := mustBuild(t, root, []remediation.Plan{plan})
+
+			if len(previews) != 1 || previews[0].Status != StatusUnsupported {
+				t.Fatalf("previews = %#v, want unsupported", previews)
+			}
+			assertContains(t, previews[0].Reason, tt.want)
+			if previews[0].Diff != "" {
+				t.Fatalf("diff = %q, want empty", previews[0].Diff)
+			}
+		})
+	}
+}
+
 func mustBuild(t *testing.T, root string, plans []remediation.Plan) []Preview {
 	t.Helper()
 	previews, err := Build(root, plans)
@@ -900,6 +1051,27 @@ func mustBuild(t *testing.T, root string, plans []remediation.Plan) []Preview {
 		t.Fatalf("Build: %v", err)
 	}
 	return previews
+}
+
+func pinChange(sourceReference, actionRef, replacementRef, sha string, line, column int, patchSupported bool, reason string) remediation.Change {
+	target := actionRef
+	if before, _, ok := strings.Cut(actionRef, "@"); ok {
+		target = before
+	}
+	return remediation.Change{
+		Action:          remediation.PinGitHubActionToSHA,
+		Target:          remediation.Target{Kind: "GitHubAction", Name: target},
+		SourceReference: sourceReference,
+		Summary:         "Pin " + actionRef + ".",
+		ActionRef:       actionRef,
+		ReplacementRef:  replacementRef,
+		ReplacementSHA:  sha,
+		PatchSupported:  patchSupported,
+		Advisory:        true,
+		Reason:          reason,
+		SourceLine:      line,
+		SourceColumn:    column,
+	}
 }
 
 func planWithChanges(id remediation.PlanID, action remediation.Action, changes []remediation.Change) remediation.Plan {

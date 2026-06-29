@@ -180,6 +180,8 @@ arbitrary metadata maps.
       "step_index": 0,
       "step_name": "Checkout",
       "uses": "actions/checkout@v4",
+      "uses_line": 12,
+      "uses_column": 15,
       "owner": "actions",
       "repo": "checkout",
       "path": "",
@@ -197,7 +199,8 @@ arbitrary metadata maps.
 
 This metadata is the input for `PP-GHA-001` and `PP-GHA-002`. It contains only
 deterministic workflow source identity, sanitized static action identity, the
-`pull_request_target` trigger boolean, and sanitized checkout selector matches.
+`pull_request_target` trigger boolean, precise `uses:` scalar coordinates for
+safe local patch planning, and sanitized checkout selector matches.
 GitHub Actions parsing does not retain or serialize `env` values, arbitrary
 `with` values, `secrets`, token values, run scripts, expression-only `uses:`
 values, or raw workflow documents. PathProof does not evaluate GitHub
@@ -858,7 +861,15 @@ When a complete remediation plan exists, the CLI finding also includes:
             },
             "summary": "...",
             "source_reference": "resources.yaml#document=5",
-            "permission_sha256": "..."
+            "permission_sha256": "...",
+            "action_ref": "actions/checkout@v4",
+            "replacement_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "replacement_ref": "actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "patch_supported": true,
+            "advisory": true,
+            "reason": "",
+            "source_line": 4,
+            "source_column": 15
           }
         ],
         "patch_previews": [
@@ -937,12 +948,15 @@ rescanning the complete temporary patched manifest set. `failed` means the
 same finding ID remained. `skipped` means no generated patch output was
 written for that finding. Validation uses the same local parse, route, and
 analyze pipeline as the original scan and does not use live-cluster state.
+Validation remains scoped to `PP-K8S-001`; `PP-GHA-001` action-pinning patch
+outputs receive no validation result in this slice.
 
 Implemented remediation actions are:
 
 - `RemoveSecretsResource`
 - `RemoveSecretReadVerb`
 - `NarrowBindingSubject`
+- `PinGitHubActionToSHA`
 
 `RemoveSecretsResource` is emitted only for core-only `apiGroups: [""]`
 permissions where removing or splitting the non-wildcard `secrets` resource
@@ -965,15 +979,43 @@ marks that all listed changes must be applied together. If no complete option
 can be generated from structured metadata, no plan is reported for that
 finding.
 
+`PinGitHubActionToSHA` is emitted for every `PP-GHA-001` finding. It is always
+advisory and tells the user to pin the action to a full 40-character commit
+SHA. PathProof does not call GitHub, resolve tags or branches, clone
+repositories, inspect marketplace metadata, execute workflows, or guess SHAs.
+When the optional CLI flag `--github-action-pins <file>` supplies a local JSON
+object mapping an exact static action ref such as `actions/checkout@v4` to an
+exact 40-character hex SHA, the remediation change can include
+`replacement_sha`, `replacement_ref`, and `patch_supported: true`. Without a
+matching valid local mapping, or when source coordinates or workflow context
+are unsafe, the plan remains advisory-only with a deterministic `reason`.
+GitHub Actions remediation metadata contains only sanitized action refs,
+replacement SHAs from the local mapping, relative source references, source
+line/column numbers, and deterministic reason strings. It does not include raw
+workflow YAML, env values, run scripts, arbitrary `with` values, tokens,
+secrets, credentials, raw mapping content, or absolute paths.
+
 Patch previews are a separate opt-in CLI projection step, not part of the graph
-schema. The initial implementation supports only `NarrowBindingSubject` for
+schema. The implementation supports `NarrowBindingSubject` for
 `rbac.authorization.k8s.io/v1` `RoleBinding` and `ClusterRoleBinding`
-documents. It resolves the existing source reference exactly, edits only that
-referenced document in memory, and emits one preview per remediation change.
-Preview generation is intentionally unsupported for source files containing a
-core `v1` Secret with payload fields, unsupported remediation actions, missing
-or malformed source references, mismatched target documents, namespace-less
-subjects, and changes that would leave `subjects` empty.
+documents, and `PinGitHubActionToSHA` only for safe static GitHub Actions
+`uses:` scalar replacements. Kubernetes previews resolve the existing source
+reference exactly, edit only that referenced document in memory, and emit one
+preview per remediation change. GitHub Actions previews are text-only
+replacements at the parsed `uses:` scalar line/column and replace only the ref
+after `@`, preserving the original owner/repo/path. They use timestamp-free
+unified diffs without surrounding workflow context. Preview generation is
+intentionally unsupported for source files containing a core `v1` Secret with
+payload fields, unsupported remediation actions, missing or malformed source
+references, mismatched target documents, namespace-less subjects, changes that
+would leave `subjects` empty, GitHub Actions expression refs, missing refs,
+local actions, Docker actions, imprecise `uses:` source locations, same-line
+comments on the patched `uses:` scalar, `uses:` scalars sharing a physical line
+with unsafe workflow fields, or workflow files with unsupported or secret-like
+context such as `secrets`, tokens, passwords, credentials, access keys, or
+private keys. Ordinary non-secret `env`, `with`, and `run` keys on other lines
+do not by themselves disable GitHub Actions pinning previews because GitHub
+Actions diffs include no surrounding workflow context.
 
 Plan IDs are stable SHA-256 hashes over canonical JSON containing the finding
 ID and ordered canonical option identities. Option identities contain priority,
@@ -1015,7 +1057,9 @@ objects, or simulate IAM. The
 scan CLI currently supports local Kubernetes YAML directories and local
 GitHub Actions workflow files under `.github/workflows` plus local `.tf`
 files for that narrow Terraform slice. Patch previews and patch output are
-limited to Kubernetes `NarrowBindingSubject` and do not cover `PP-GHA-001`,
+limited to Kubernetes `NarrowBindingSubject` and local-mapping-backed safe
+`PP-GHA-001` `PinGitHubActionToSHA` replacements. They do not cover
 `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`,
-`PP-XDOMAIN-002`, `PP-XDOMAIN-003`, Terraform, RBAC rule edits,
-Secret-bearing source files, or broader YAML patch types.
+`PP-XDOMAIN-002`, `PP-XDOMAIN-003`, Terraform, GitHub API ref resolution,
+workflow validation, RBAC rule edits, Secret-bearing source files, unsafe
+workflow files, or broader YAML patch types.

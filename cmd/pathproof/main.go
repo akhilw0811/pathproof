@@ -26,7 +26,7 @@ import (
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--repo OWNER/REPO] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--repo OWNER/REPO] [--github-action-pins <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
@@ -37,12 +37,13 @@ const (
 )
 
 type scanOptions struct {
-	format          scanFormat
-	previewPatches  bool
-	writePatches    string
-	validatePatches bool
-	repo            string
-	directory       string
+	format           scanFormat
+	previewPatches   bool
+	writePatches     string
+	validatePatches  bool
+	repo             string
+	githubActionPins string
+	directory        string
 }
 
 var scanValidationDirectory = scanDirectory
@@ -86,11 +87,17 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, stdout, stderr)
+	pins, err := remediation.LoadGitHubActionPins(options.githubActionPins)
+	if err != nil {
+		printError(stderr, err.Error())
+		return 2
+	}
+
+	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, stdout, stderr)
 }
 
-func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, stdout, stderr io.Writer) int {
-	plans, err := remediation.Build(g, findings)
+func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, stdout, stderr io.Writer) int {
+	plans, err := remediation.BuildWithGitHubActionPins(g, findings, pins)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
 		return 2
@@ -161,6 +168,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	flags.SetOutput(io.Discard)
 	formatValue := flags.String("format", string(scanFormatHuman), "output format")
 	repoValue := flags.String("repo", "", "repository identity for GitHub Actions OIDC trust matching, in OWNER/REPO form")
+	githubActionPins := flags.String("github-action-pins", "", "local JSON mapping of GitHub Action refs to full commit SHAs")
 	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
 	writePatches := flags.String("write-patches", "", "write patched copies to an output directory")
 	validatePatches := flags.Bool("validate-patches", false, "rescan a temporary patched manifest set after writing patches")
@@ -210,7 +218,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			return scanOptions{}, err
 		}
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, directory: dir}, nil
+	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, directory: dir}, nil
 }
 
 func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
@@ -263,8 +271,9 @@ func validatePatchOutput(root, outputRoot string, findings []analysis.Finding, p
 	if len(patchedFindingIDs) == 0 {
 		return validation.ValidatePatchedOutput(findings, nil, patchedFindingIDs), nil
 	}
+	validationPatchOutputs := patchOutputsForKubernetesValidation(plans, previews, patchOutputs)
 
-	overlay, cleanup, err := createValidationOverlay(root, outputRoot, patchOutputs)
+	overlay, cleanup, err := createValidationOverlay(root, outputRoot, validationPatchOutputs)
 	if err != nil {
 		return nil, err
 	}
@@ -290,8 +299,10 @@ func patchedFindingIDsByGeneratedOutput(plans []remediation.Plan, previews []pat
 	}
 
 	findingByPlanID := make(map[remediation.PlanID]analysis.FindingID, len(plans))
+	ruleByPlanID := make(map[remediation.PlanID]analysis.RuleID, len(plans))
 	for _, plan := range plans {
 		findingByPlanID[plan.ID] = plan.FindingID
+		ruleByPlanID[plan.ID] = plan.RuleID
 	}
 
 	patched := make(map[analysis.FindingID]bool)
@@ -302,6 +313,9 @@ func patchedFindingIDsByGeneratedOutput(plans []remediation.Plan, previews []pat
 		if _, ok := generatedSources[preview.File]; !ok {
 			continue
 		}
+		if ruleByPlanID[preview.PlanID] != analysis.RulePublicWorkloadCanReadSecret {
+			continue
+		}
 		findingID, ok := findingByPlanID[preview.PlanID]
 		if !ok {
 			continue
@@ -309,6 +323,36 @@ func patchedFindingIDsByGeneratedOutput(plans []remediation.Plan, previews []pat
 		patched[findingID] = true
 	}
 	return patched
+}
+
+func patchOutputsForKubernetesValidation(plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile) []patchpreview.WrittenFile {
+	kubernetesGeneratedSources := make(map[string]struct{})
+	ruleByPlanID := make(map[remediation.PlanID]analysis.RuleID, len(plans))
+	for _, plan := range plans {
+		ruleByPlanID[plan.ID] = plan.RuleID
+	}
+	for _, preview := range previews {
+		if preview.Status != patchpreview.StatusGenerated || preview.File == "" {
+			continue
+		}
+		if ruleByPlanID[preview.PlanID] != analysis.RulePublicWorkloadCanReadSecret {
+			continue
+		}
+		kubernetesGeneratedSources[preview.File] = struct{}{}
+	}
+	if len(kubernetesGeneratedSources) == 0 {
+		return nil
+	}
+	filtered := make([]patchpreview.WrittenFile, 0, len(patchOutputs))
+	for _, output := range patchOutputs {
+		if output.PreviewStatus != patchpreview.StatusGenerated || output.Source == "" {
+			continue
+		}
+		if _, ok := kubernetesGeneratedSources[output.Source]; ok {
+			filtered = append(filtered, output)
+		}
+	}
+	return filtered
 }
 
 func createValidationOverlay(root, outputRoot string, patchOutputs []patchpreview.WrittenFile) (string, func(), error) {
@@ -470,6 +514,14 @@ type scanRemediationChange struct {
 	PermissionSHA256 string                `json:"permission_sha256,omitempty"`
 	MatchedVerb      string                `json:"matched_verb,omitempty"`
 	Subject          string                `json:"subject,omitempty"`
+	ActionRef        string                `json:"action_ref,omitempty"`
+	ReplacementSHA   string                `json:"replacement_sha,omitempty"`
+	ReplacementRef   string                `json:"replacement_ref,omitempty"`
+	PatchSupported   bool                  `json:"patch_supported,omitempty"`
+	Advisory         bool                  `json:"advisory,omitempty"`
+	Reason           string                `json:"reason,omitempty"`
+	SourceLine       int                   `json:"source_line,omitempty"`
+	SourceColumn     int                   `json:"source_column,omitempty"`
 }
 
 type scanRemediationTarget struct {
@@ -727,6 +779,14 @@ func projectRemediation(root string, plan remediation.Plan, previews []patchprev
 				PermissionSHA256: change.PermissionSHA256,
 				MatchedVerb:      change.MatchedVerb,
 				Subject:          change.Subject,
+				ActionRef:        change.ActionRef,
+				ReplacementSHA:   change.ReplacementSHA,
+				ReplacementRef:   change.ReplacementRef,
+				PatchSupported:   change.PatchSupported,
+				Advisory:         change.Advisory,
+				Reason:           change.Reason,
+				SourceLine:       change.SourceLine,
+				SourceColumn:     change.SourceColumn,
 			})
 		}
 		projected.Options = append(projected.Options, projectedOption)
@@ -959,10 +1019,8 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 					if _, err := fmt.Fprintf(w, "      - %s %s: %s [%s]\n", change.Action, remediationTargetName(change.Target), change.Summary, change.SourceReference); err != nil {
 						return err
 					}
-					if change.PermissionSHA256 != "" || change.MatchedVerb != "" || change.Subject != "" {
-						if _, err := fmt.Fprintf(w, "        Parameters: permission_sha256=%s matched_verb=%s subject=%s\n", change.PermissionSHA256, change.MatchedVerb, change.Subject); err != nil {
-							return err
-						}
+					if err := writeHumanChangeParameters(w, change); err != nil {
+						return err
 					}
 					for _, preview := range option.PatchPreviews {
 						if preview.ChangeIndex != changeIndex {
@@ -1001,6 +1059,41 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 		return err
 	}
 	return writeHumanValidation(w, report)
+}
+
+func writeHumanChangeParameters(w io.Writer, change scanRemediationChange) error {
+	if change.PermissionSHA256 != "" || change.MatchedVerb != "" || change.Subject != "" {
+		_, err := fmt.Fprintf(w, "        Parameters: permission_sha256=%s matched_verb=%s subject=%s\n", change.PermissionSHA256, change.MatchedVerb, change.Subject)
+		return err
+	}
+	if change.ActionRef == "" && change.ReplacementSHA == "" && change.ReplacementRef == "" && change.Reason == "" && !change.PatchSupported && !change.Advisory {
+		return nil
+	}
+
+	fields := make([]string, 0, 6)
+	if change.ActionRef != "" {
+		fields = append(fields, "action_ref="+change.ActionRef)
+	}
+	if change.ReplacementSHA != "" {
+		fields = append(fields, "replacement_sha="+change.ReplacementSHA)
+	}
+	if change.ReplacementRef != "" {
+		fields = append(fields, "replacement_ref="+change.ReplacementRef)
+	}
+	if change.Action == remediation.PinGitHubActionToSHA || change.ActionRef != "" {
+		fields = append(fields, fmt.Sprintf("patch_supported=%t", change.PatchSupported))
+	}
+	if change.Advisory {
+		fields = append(fields, "advisory=true")
+	}
+	if change.Reason != "" {
+		fields = append(fields, "reason="+change.Reason)
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "        Parameters: %s\n", strings.Join(fields, " "))
+	return err
 }
 
 func writeHumanPatchOutputs(w io.Writer, report scanReport) error {

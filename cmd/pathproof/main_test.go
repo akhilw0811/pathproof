@@ -1204,7 +1204,15 @@ jobs:
 	assertContains(t, stdout, "GitHubAction githubactions://.github/workflows/unpinned.yml/job/test/step/1/action/actions/checkout@v4")
 	assertContains(t, stdout, "UsesAction")
 	assertContains(t, stdout, "actions/checkout@v4")
-	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) || strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+	assertContains(t, stdout, "Remediation:")
+	assertContains(t, stdout, "PinGitHubActionToSHA")
+	assertContains(t, stdout, "no local SHA mapping")
+	for _, forbidden := range []string{"permission_sha256=", "matched_verb=", "subject="} {
+		if strings.Contains(stdout, forbidden) {
+			t.Fatalf("GitHub Actions human output contains K8S-only field %q: %s", forbidden, stdout)
+		}
+	}
+	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
 		t.Fatalf("GitHub Actions finding output contains unsupported text: %s", stdout)
 	}
 	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
@@ -1235,8 +1243,15 @@ func TestRunScanGitHubActionsJSONOutputIncludesFindingWithoutRemediation(t *test
 	if finding.RuleID != "PP-GHA-001" || finding.Severity != "Medium" {
 		t.Fatalf("finding = %#v, want PP-GHA-001 Medium", finding)
 	}
-	if finding.Remediation != nil {
-		t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+	if finding.Remediation == nil {
+		t.Fatal("remediation = nil, want advisory PP-GHA-001 remediation")
+	}
+	if len(finding.Remediation.Options) != 1 || finding.Remediation.Options[0].Action != "PinGitHubActionToSHA" {
+		t.Fatalf("remediation = %#v, want PinGitHubActionToSHA option", finding.Remediation)
+	}
+	change := finding.Remediation.Options[0].Changes[0]
+	if !change.Advisory || change.PatchSupported || change.ActionRef != "owner/repo/path@v1.2.3" || change.ReplacementSHA != "" {
+		t.Fatalf("remediation change = %#v, want advisory-only action pinning", change)
 	}
 	if len(finding.Path) != 3 || len(finding.Evidence) != 2 {
 		t.Fatalf("path/evidence lengths = %d/%d, want 3/2", len(finding.Path), len(finding.Evidence))
@@ -1478,7 +1493,11 @@ jobs:
 	seen := map[string]bool{}
 	for i, finding := range report.Findings {
 		seen[finding.RuleID] = true
-		if finding.Remediation != nil {
+		if finding.RuleID == "PP-GHA-001" {
+			if finding.Remediation == nil {
+				t.Fatalf("PP-GHA-001 remediation = nil, want advisory plan")
+			}
+		} else if finding.Remediation != nil {
 			t.Fatalf("finding %s remediation = %#v, want nil", finding.RuleID, finding.Remediation)
 		}
 		if i > 0 && report.Findings[i-1].ID > finding.ID {
@@ -1694,13 +1713,399 @@ func TestRunScanGitHubActionsPatchFlagsDoNotPatchOrValidateFinding(t *testing.T)
 	assertCode(t, code, 1)
 	assertString(t, "stderr", stderr, "")
 	assertContains(t, stdout, "Rule: PP-GHA-001\n")
+	assertContains(t, stdout, "Remediation:")
 	assertContains(t, stdout, "Patch Output:")
 	assertContains(t, stdout, "Written files: 0")
-	if strings.Contains(stdout, "Remediation:") || strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
-		t.Fatalf("PP-GHA-001 received unsupported remediation/patch/validation output: %s", stdout)
+	if strings.Contains(stdout, "Patch Preview:") || strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-GHA-001 received unsupported preview or validation output: %s", stdout)
 	}
 	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
 		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestRunScanGitHubActionsPreviewPatchesWithLocalPinMapping(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("a", 40)
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	firstOut, firstErr, firstCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+	secondOut, secondErr, secondCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+
+	assertCode(t, firstCode, 1)
+	assertCode(t, secondCode, 1)
+	assertString(t, "first stderr", firstErr, "")
+	assertString(t, "second stderr", secondErr, "")
+	assertString(t, "stdout", secondOut, firstOut)
+	assertContains(t, firstOut, "PinGitHubActionToSHA")
+	assertContains(t, firstOut, "Patch Preview:")
+	assertContains(t, firstOut, "-      - uses: actions/checkout@v4\n")
+	assertContains(t, firstOut, "+      - uses: actions/checkout@"+sha+"\n")
+	if strings.Contains(firstOut, " jobs:") || strings.Contains(firstOut, " test:") {
+		t.Fatalf("GitHub Actions patch preview leaked surrounding workflow context: %s", firstOut)
+	}
+}
+
+func TestRunScanGitHubActionsPatchesQuotedActionRefsWithLocalPinMapping(t *testing.T) {
+	tests := []struct {
+		name      string
+		quote     string
+		padding   string
+		outputDir string
+	}{
+		{name: "double quoted", quote: `"`, outputDir: "patched-double"},
+		{name: "single quoted", quote: `'`, outputDir: "patched-single"},
+		{name: "double quoted with whitespace", quote: `"`, padding: " ", outputDir: "patched-double-spaced"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			root := filepath.Join(parent, "scan")
+			sha := strings.Repeat("d", 40)
+			originalRef := tt.padding + "actions/checkout@v4" + tt.padding
+			replacementRef := tt.padding + "actions/checkout@" + sha + tt.padding
+			original := "jobs:\n  test:\n    steps:\n      - uses: " + tt.quote + originalRef + tt.quote + "\n"
+			writeGitHubActionsWorkflowForTest(t, root, "quoted.yml", original)
+			writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+			previewOut, previewErr, previewCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+			writeOut, writeErr, writeCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--write-patches", tt.outputDir, "scan")
+
+			assertCode(t, previewCode, 1)
+			assertString(t, "preview stderr", previewErr, "")
+			assertContains(t, previewOut, "-      - uses: "+tt.quote+originalRef+tt.quote+"\n")
+			assertContains(t, previewOut, "+      - uses: "+tt.quote+replacementRef+tt.quote+"\n")
+			assertCode(t, writeCode, 1)
+			assertString(t, "write stderr", writeErr, "")
+			assertContains(t, writeOut, "Written files: 1")
+			patched := readFileForTest(t, filepath.Join(parent, tt.outputDir), ".github/workflows/quoted.yml")
+			assertContains(t, patched, "uses: "+tt.quote+replacementRef+tt.quote)
+			assertString(t, "input workflow", readFileForTest(t, root, ".github/workflows/quoted.yml"), original)
+		})
+	}
+}
+
+func TestRunScanGitHubActionsIDTokenPermissionDoesNotBlockPinPatch(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("f", 40)
+	original := `permissions:
+  id-token: write
+  contents: read
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`
+	writeGitHubActionsWorkflowForTest(t, root, "oidc.yml", original)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	previewOut, previewErr, previewCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+	writeOut, writeErr, writeCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--write-patches", "patched", "scan")
+
+	assertCode(t, previewCode, 1)
+	assertString(t, "preview stderr", previewErr, "")
+	assertContains(t, previewOut, "-      - uses: actions/checkout@v4\n")
+	assertContains(t, previewOut, "+      - uses: actions/checkout@"+sha+"\n")
+	assertCode(t, writeCode, 1)
+	assertString(t, "write stderr", writeErr, "")
+	assertContains(t, writeOut, "Written files: 1")
+	patched := readFileForTest(t, filepath.Join(parent, "patched"), ".github/workflows/oidc.yml")
+	assertContains(t, patched, "actions/checkout@"+sha)
+	assertString(t, "input workflow", readFileForTest(t, root, ".github/workflows/oidc.yml"), original)
+}
+
+func TestRunScanGitHubActionsHarmlessWorkflowContextDoesNotBlockPinPatch(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("e", 40)
+	original := `jobs:
+  test:
+    env:
+      SAFE_ENV: local
+    steps:
+      - run: go test ./...
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+        env:
+          CACHE_NAME: gomod
+`
+	writeGitHubActionsWorkflowForTest(t, root, "context.yml", original)
+	writeFileForTest(t, parent, "pins.json", `{"actions/setup-go@v5":"`+sha+`"}`)
+
+	previewOut, previewErr, previewCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+	writeOut, writeErr, writeCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--write-patches", "patched", "scan")
+
+	assertCode(t, previewCode, 1)
+	assertString(t, "preview stderr", previewErr, "")
+	assertContains(t, previewOut, "-      - uses: actions/setup-go@v5\n")
+	assertContains(t, previewOut, "+      - uses: actions/setup-go@"+sha+"\n")
+	if strings.Contains(previewOut, "go-version") || strings.Contains(previewOut, "go test") || strings.Contains(previewOut, "SAFE_ENV") || strings.Contains(previewOut, "CACHE_NAME") {
+		t.Fatalf("GitHub Actions patch preview leaked harmless workflow context: %s", previewOut)
+	}
+	assertCode(t, writeCode, 1)
+	assertString(t, "write stderr", writeErr, "")
+	assertContains(t, writeOut, "Written files: 1")
+	patched := readFileForTest(t, filepath.Join(parent, "patched"), ".github/workflows/context.yml")
+	assertContains(t, patched, "actions/setup-go@"+sha)
+	assertString(t, "input workflow", readFileForTest(t, root, ".github/workflows/context.yml"), original)
+}
+
+func TestRunScanGitHubActionsSameLineRunContextDoesNotLeakOrPatch(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("a", 40)
+	const runScript = "FAKE_CLI_GHA_SAME_LINE_RUN_SECRET_DO_NOT_RETAIN"
+	original := `jobs:
+  test:
+    steps: [{run: echo FAKE_CLI_GHA_SAME_LINE_RUN_SECRET_DO_NOT_RETAIN, uses: actions/checkout@v4}]
+`
+	writeGitHubActionsWorkflowForTest(t, root, "flow.yml", original)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	previewOut, previewErr, previewCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+	writeOut, writeErr, writeCode := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--write-patches", "patched", "scan")
+	jsonOut, jsonErr, jsonCode := runCommandInDir(t, parent, "scan", "--format=json", "--github-action-pins", "pins.json", "scan")
+
+	assertCode(t, previewCode, 1)
+	assertString(t, "preview stderr", previewErr, "")
+	assertContains(t, previewOut, "Remediation:")
+	assertContains(t, previewOut, "Status: unsupported")
+	assertContains(t, previewOut, "source line")
+	assertCode(t, writeCode, 1)
+	assertString(t, "write stderr", writeErr, "")
+	assertContains(t, writeOut, "Written files: 0")
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonErr, "")
+	report := assertValidJSONReport(t, jsonOut)
+	change := report.Findings[0].Remediation.Options[0].Changes[0]
+	if !change.Advisory || change.PatchSupported {
+		t.Fatalf("change = %#v, want advisory unsupported remediation", change)
+	}
+	for _, output := range []string{previewOut, previewErr, writeOut, writeErr, jsonOut, jsonErr} {
+		if strings.Contains(output, runScript) || strings.Contains(output, "echo "+runScript) {
+			t.Fatalf("output leaks same-line run script: %s", output)
+		}
+	}
+	assertString(t, "input workflow", readFileForTest(t, root, ".github/workflows/flow.yml"), original)
+}
+
+func TestRunScanGitHubActionsHyphenatedSecretKeysDoNotWritePatchedCopy(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("a", 40)
+	const accessKey = "AKIAIOSFODNN7EXAMPLE"
+	const privateKey = "opaque-key-material"
+	original := `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          access-key: AKIAIOSFODNN7EXAMPLE
+          private-key: opaque-key-material
+`
+	writeGitHubActionsWorkflowForTest(t, root, "secret-keys.yml", original)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--write-patches", "patched", "scan")
+	jsonOut, jsonErr, jsonCode := runCommandInDir(t, parent, "scan", "--format=json", "--github-action-pins", "pins.json", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Written files: 0")
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonErr, "")
+	report := assertValidJSONReport(t, jsonOut)
+	change := report.Findings[0].Remediation.Options[0].Changes[0]
+	if !change.Advisory || change.PatchSupported {
+		t.Fatalf("change = %#v, want advisory unsupported remediation", change)
+	}
+	for _, output := range []string{stdout, stderr, jsonOut, jsonErr} {
+		for _, forbidden := range []string{accessKey, privateKey, "access-key", "private-key"} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("output leaks %q: %s", forbidden, output)
+			}
+		}
+	}
+	assertString(t, "input workflow", readFileForTest(t, root, ".github/workflows/secret-keys.yml"), original)
+}
+
+func TestRunScanGitHubActionsBlockStyleUsesReportsAdvisoryOnly(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("a", 40)
+	writeGitHubActionsWorkflowForTest(t, root, "block.yml", `jobs:
+  test:
+    steps:
+      - uses: >
+          actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	change := report.Findings[0].Remediation.Options[0].Changes[0]
+	if !change.Advisory || change.PatchSupported {
+		t.Fatalf("change = %#v, want advisory unsupported remediation", change)
+	}
+	if len(report.Findings[0].Remediation.Options[0].PatchPreviews) != 1 || report.Findings[0].Remediation.Options[0].PatchPreviews[0].Status != "unsupported" {
+		t.Fatalf("patch previews = %#v, want one unsupported preview", report.Findings[0].Remediation.Options[0].PatchPreviews)
+	}
+}
+
+func TestRunScanGitHubActionsPinMappingSkipsUnsafeWorkflowPatch(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("a", 40)
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - run: echo FAKE_CLI_GHA_RUN_SECRET_DO_NOT_RETAIN
+      - uses: actions/checkout@v4
+        with:
+          token: FAKE_CLI_GHA_WITH_SECRET_DO_NOT_RETAIN
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--preview-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Remediation:")
+	assertContains(t, stdout, "Status: unsupported")
+	assertContains(t, stdout, "workflow contains unsupported or secret-like context")
+	if strings.Contains(stdout, "Diff:") {
+		t.Fatalf("unsafe workflow produced patch diff: %s", stdout)
+	}
+	assertDoesNotContainGitHubActionsSecretValues(t, stdout, stderr)
+}
+
+func TestRunScanGitHubActionsWritePatchesWithLocalPinMapping(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("b", 40)
+	original := `jobs:
+  test:
+    steps:
+      - uses: owner/repo/path@v1
+`
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", original)
+	writeFileForTest(t, parent, "pins.json", `{"owner/repo/path@v1":"`+sha+`"}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Patch Output:")
+	assertContains(t, stdout, "Written files: 1")
+	assertContains(t, stdout, "Source: .github/workflows/unpinned.yml")
+	if strings.Contains(stdout, "Validation:") {
+		t.Fatalf("PP-GHA-001 write-patches produced validation output: %s", stdout)
+	}
+	patched := readFileForTest(t, filepath.Join(parent, "patched"), ".github/workflows/unpinned.yml")
+	assertContains(t, patched, "owner/repo/path@"+sha)
+	assertString(t, "input workflow", readFileForTest(t, root, ".github/workflows/unpinned.yml"), original)
+}
+
+func TestRunScanGitHubActionsJSONIncludesPinRemediationMetadata(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("c", 40)
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--github-action-pins", "pins.json", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if len(report.Findings) != 1 || report.Findings[0].Remediation == nil {
+		t.Fatalf("report = %#v, want PP-GHA-001 remediation", report)
+	}
+	change := report.Findings[0].Remediation.Options[0].Changes[0]
+	if !change.Advisory || !change.PatchSupported || change.ActionRef != "actions/checkout@v4" || change.ReplacementSHA != sha || change.ReplacementRef != "actions/checkout@"+sha {
+		t.Fatalf("change = %#v, want patch-supported pin metadata", change)
+	}
+	if strings.Contains(stdout, parent) || strings.Contains(stdout, "pins.json") {
+		t.Fatalf("JSON output leaks local path or mapping filename: %s", stdout)
+	}
+}
+
+func TestRunScanGitHubActionsMalformedPinMappingIsSanitized(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"FAKE_MAPPING_SECRET_DO_NOT_RETAIN"`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "scan")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "github action pins file is not valid JSON")
+	for _, forbidden := range []string{"FAKE_MAPPING_SECRET_DO_NOT_RETAIN", "actions/checkout@v4", "pins.json", parent} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("pin mapping error leaks %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanGitHubActionsNonObjectPinMappingIsSanitized(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "null", content: `null`},
+		{name: "array", content: `[]`},
+		{name: "string", content: `"bad"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			root := filepath.Join(parent, "scan")
+			writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+			writeFileForTest(t, parent, "pins.json", tt.content)
+
+			stdout, stderr, code := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "scan")
+
+			assertCode(t, code, 2)
+			assertString(t, "stdout", stdout, "")
+			assertOneLineStderr(t, stderr)
+			assertContains(t, stderr, "github action pins file must be a JSON object")
+			for _, forbidden := range []string{tt.content, "actions/checkout@v4", "pins.json", parent} {
+				if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+					t.Fatalf("pin mapping error leaks %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+				}
+			}
+		})
 	}
 }
 
@@ -1803,6 +2208,14 @@ func TestRunScanPublicDemoFixtureEndToEnd(t *testing.T) {
 	assertCode(t, code, 1)
 	assertString(t, "stderr", stderr, "")
 	assertContains(t, stdout, "Option 1: NarrowBindingSubject")
+	assertContains(t, stdout, "Parameters: permission_sha256=")
+	assertContains(t, stdout, "matched_verb=")
+	assertContains(t, stdout, "subject=")
+	for _, forbidden := range []string{"action_ref=", "replacement_sha=", "replacement_ref=", "patch_supported=", "advisory="} {
+		if strings.Contains(stdout, forbidden) {
+			t.Fatalf("K8S human output contains GHA-only field %q: %s", forbidden, stdout)
+		}
+	}
 	assertContains(t, stdout, "Patch Preview:")
 	assertContains(t, stdout, "Status: generated")
 	assertContains(t, stdout, "File: rbac.yaml")
@@ -1871,7 +2284,8 @@ func TestRunScanGitHubActionsDemoFixture(t *testing.T) {
 	assertContains(t, stdout, "Finding count: 1\n")
 	assertContains(t, stdout, "Rule: PP-GHA-001\n")
 	assertContains(t, stdout, "actions/checkout@v4")
-	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) || strings.Contains(stdout, "Remediation:") {
+	assertContains(t, stdout, "Remediation:")
+	if strings.Contains(stdout, legacyGitHubActionsRuleWording()) {
 		t.Fatalf("GitHub Actions demo output contains unsupported text: %s", stdout)
 	}
 }
@@ -2099,7 +2513,7 @@ func TestWriteScanResultPreviewBuilderDoesNotRunWithoutFlag(t *testing.T) {
 	fixture := projectionFixtureWithValidFinding(t)
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, false, "", false, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, false, "", false, nil, &stdout, &stderr)
 
 	assertCode(t, code, 1)
 	assertString(t, "stderr", stderr.String(), "")
@@ -2113,7 +2527,7 @@ func TestWriteScanResultPreviewInternalErrorLeavesStdoutEmpty(t *testing.T) {
 	fixture := projectionFixtureWithValidFinding(t)
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, true, "", false, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, "", scanFormatHuman, true, "", false, nil, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -3096,7 +3510,7 @@ func TestWriteScanResultRejectsLateInconsistencyWithoutPartialOutput(t *testing.
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, ".", scanFormatHuman, false, "", false, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{fixture.finding}, fixture.graph, ".", scanFormatHuman, false, "", false, nil, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -3119,7 +3533,7 @@ func TestWriteScanResultMissingNodeReturnsTwoWithEmptyStdout(t *testing.T) {
 	}
 	var stdout, stderr bytes.Buffer
 
-	code := writeScanResult([]analysis.Finding{finding}, g, ".", scanFormatHuman, false, "", false, &stdout, &stderr)
+	code := writeScanResult([]analysis.Finding{finding}, g, ".", scanFormatHuman, false, "", false, nil, &stdout, &stderr)
 
 	assertCode(t, code, 2)
 	assertString(t, "stdout", stdout.String(), "")
@@ -3163,7 +3577,7 @@ func runCommandInDir(t *testing.T, dir string, args ...string) (string, string, 
 
 func writeScanResultForTest(findings []analysis.Finding, g *graph.Graph, format scanFormat) (string, string, int) {
 	var stdout, stderr bytes.Buffer
-	code := writeScanResult(findings, g, ".", format, false, "", false, &stdout, &stderr)
+	code := writeScanResult(findings, g, ".", format, false, "", false, nil, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code
 }
 
@@ -3290,6 +3704,14 @@ type cliJSONRemediationChange struct {
 	PermissionSHA256 string                   `json:"permission_sha256,omitempty"`
 	MatchedVerb      string                   `json:"matched_verb,omitempty"`
 	Subject          string                   `json:"subject,omitempty"`
+	ActionRef        string                   `json:"action_ref,omitempty"`
+	ReplacementSHA   string                   `json:"replacement_sha,omitempty"`
+	ReplacementRef   string                   `json:"replacement_ref,omitempty"`
+	PatchSupported   bool                     `json:"patch_supported,omitempty"`
+	Advisory         bool                     `json:"advisory,omitempty"`
+	Reason           string                   `json:"reason,omitempty"`
+	SourceLine       int                      `json:"source_line,omitempty"`
+	SourceColumn     int                      `json:"source_column,omitempty"`
 }
 
 type cliJSONRemediationTarget struct {
@@ -3751,6 +4173,15 @@ func writeFileForTest(t *testing.T, dir, name, content string) {
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 		t.Fatalf("write %s: %v", name, err)
 	}
+}
+
+func readFileForTest(t *testing.T, dir, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(data)
 }
 
 func writeGitHubActionsWorkflowForTest(t *testing.T, root, name, content string) {

@@ -39,9 +39,25 @@ GitHub Actions CLI coverage
 asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
 unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
 GitHub Actions findings are deterministic, `PP-GHA-001`, `PP-GHA-002`, and
-`PP-GHA-003` appear in human and JSON output without remediation, patch
-previews, patch outputs, or validation results, and a push workflow with only
-`id-token: write` exits `0` with no findings in human, JSON, and SARIF output.
+`PP-GHA-003` appear in human and JSON output, `PP-GHA-001` includes advisory
+`PinGitHubActionToSHA` remediation, `PP-GHA-002` and `PP-GHA-003` still have
+no remediation, and a push workflow with only `id-token: write` exits `0`
+with no findings in human, JSON, and SARIF output.
+GitHub Actions pinning CLI coverage asserts that `--github-action-pins`
+accepts a local JSON object mapping exact static action refs to exact
+40-character lowercase or uppercase hex SHAs, rejects malformed JSON, short
+SHAs, non-hex SHAs, and invalid action refs with sanitized errors, does not
+print raw mapping content, and exits `2` with empty stdout for malformed
+mapping files. It also asserts that no mapping remains advisory-only, a valid
+mapping produces deterministic patch-supported JSON metadata for safe static
+uses values, `--preview-patches` emits a deterministic no-context unified diff,
+`--write-patches` writes patched workflow copies only under the output
+directory while leaving input workflows unchanged, quoted static action refs
+preserve their quotes, harmless `env`, `run`, and `with` context does not block
+safe pin patches, secret-like workflow context such as tokens, passwords, or
+credentials, same-line unsafe fields, and same-line comments stay unsupported,
+and `permissions: id-token` is not treated as a secret-bearing key.
+`--validate-patches` produces no `PP-GHA-001` validation result.
 Graph-only OIDC capability text is not emitted in scan output. Terraform AWS
 OIDC trust graph-only coverage asserts that a matching trust policy plus
 `--repo` can create a graph edge while human no-finding output remains
@@ -115,7 +131,8 @@ refusal to parse source references embedded in arbitrary prose. SARIF patch flag
 that write-patch and validation side effects still occur under the existing
 flag contract while SARIF stdout remains findings-only and omits patch
 previews, patch outputs, validation arrays, diffs, patched contents, temporary
-paths, raw manifests, and Secret values.
+paths, raw manifests, GitHub action pin metadata, local mapping data,
+replacement SHAs, and Secret or workflow secret-like values.
 
 The public demo fixture under `examples/kubernetes/public-secret-path` is
 covered by a CLI smoke test. It asserts the documented loop: vulnerable scan
@@ -146,7 +163,9 @@ workflow-level and job-level `permissions` parsing,
 `permissions: write-all`, `permissions: read-all`, `permissions: {}`,
 deterministic permission grant ordering, malformed workflow errors with
 filenames, paths with spaces, missing workflow directories, and regression
-checks that env values, arbitrary with values, secret-like tokens, run scripts,
+checks that static `uses:` values have precise source coordinates for patch
+planning, unsupported patch context is represented only by coarse reason
+strings, and env values, arbitrary with values, secret-like tokens, run scripts,
 unknown or expression-based permission values, expression-only `uses:` values,
 and raw workflow documents are absent from serialized parser output and errors.
 

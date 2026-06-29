@@ -30,6 +30,7 @@ type Workflow struct {
 	PushBranches              []string          `json:"push_branches,omitempty"`
 	PermissionGrants          []PermissionGrant `json:"permission_grants,omitempty"`
 	Jobs                      []Job             `json:"jobs,omitempty"`
+	PatchUnsupportedReason    string            `json:"patch_unsupported_reason,omitempty"`
 }
 
 type Job struct {
@@ -40,14 +41,17 @@ type Job struct {
 }
 
 type Step struct {
-	Index                 int                    `json:"index"`
-	Name                  string                 `json:"name,omitempty"`
-	Uses                  string                 `json:"uses"`
-	Owner                 string                 `json:"owner"`
-	Repo                  string                 `json:"repo"`
-	Path                  string                 `json:"path,omitempty"`
-	Ref                   string                 `json:"ref,omitempty"`
-	CheckoutHeadSelectors []CheckoutHeadSelector `json:"checkout_head_selectors,omitempty"`
+	Index                  int                    `json:"index"`
+	Name                   string                 `json:"name,omitempty"`
+	Uses                   string                 `json:"uses"`
+	UsesLine               int                    `json:"uses_line,omitempty"`
+	UsesColumn             int                    `json:"uses_column,omitempty"`
+	Owner                  string                 `json:"owner"`
+	Repo                   string                 `json:"repo"`
+	Path                   string                 `json:"path,omitempty"`
+	Ref                    string                 `json:"ref,omitempty"`
+	CheckoutHeadSelectors  []CheckoutHeadSelector `json:"checkout_head_selectors,omitempty"`
+	PatchUnsupportedReason string                 `json:"patch_unsupported_reason,omitempty"`
 }
 
 type CheckoutHeadSelector struct {
@@ -157,6 +161,7 @@ func parseWorkflow(r io.Reader, root, filename string) (Workflow, error) {
 	if jobs := mappingValue(&document, "jobs"); jobs != nil && jobs.Kind == yaml.MappingNode {
 		workflow.Jobs = parseJobs(jobs)
 	}
+	workflow.PatchUnsupportedReason = workflowPatchUnsupportedReason(&document)
 	sortJobs(workflow.Jobs)
 	return workflow, nil
 }
@@ -212,12 +217,23 @@ func parseSteps(steps *yaml.Node) []Step {
 			continue
 		}
 		step := Step{
-			Index: i,
-			Uses:  ref.canonicalUses(),
-			Owner: ref.owner,
-			Repo:  ref.repo,
-			Path:  ref.path,
-			Ref:   ref.ref,
+			Index:      i,
+			Uses:       ref.canonicalUses(),
+			UsesLine:   uses.Line,
+			UsesColumn: actionRefValueColumn(uses),
+			Owner:      ref.owner,
+			Repo:       ref.repo,
+			Path:       ref.path,
+			Ref:        ref.ref,
+		}
+		if uses.LineComment != "" {
+			step.PatchUnsupportedReason = "uses value has a same-line comment"
+		}
+		if step.PatchUnsupportedReason == "" && !isPatchableUsesScalarStyle(uses) {
+			step.PatchUnsupportedReason = "uses scalar style is not supported for patching"
+		}
+		if step.PatchUnsupportedReason == "" && stepHasUnsafeSameLineContext(stepNode, uses) {
+			step.PatchUnsupportedReason = "uses value shares a source line with unsupported or secret-like context"
 		}
 		if name := scalarMappingValue(stepNode, "name"); name != nil {
 			step.Name = name.Value
@@ -228,6 +244,142 @@ func parseSteps(steps *yaml.Node) []Step {
 		out = append(out, step)
 	}
 	return out
+}
+
+func workflowPatchUnsupportedReason(document *yaml.Node) string {
+	if document == nil {
+		return ""
+	}
+	if containsUnsupportedWorkflowPatchContext(document, "") {
+		return "workflow contains unsupported or secret-like context"
+	}
+	return ""
+}
+
+func containsUnsupportedWorkflowPatchContext(node *yaml.Node, context string) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			value := node.Content[i+1]
+			nextContext := context
+			if key.Kind == yaml.ScalarNode {
+				keyName := strings.ToLower(strings.TrimSpace(key.Value))
+				switch keyName {
+				case "secrets":
+					return true
+				case "permissions":
+					nextContext = "permissions"
+				}
+				if context != "permissions" && isSecretLikeWorkflowScalar(key.Value) {
+					return true
+				}
+			}
+			if containsUnsupportedWorkflowPatchContext(value, nextContext) {
+				return true
+			}
+		}
+		return false
+	}
+	if node.Kind == yaml.SequenceNode || node.Kind == yaml.DocumentNode {
+		for _, child := range node.Content {
+			if containsUnsupportedWorkflowPatchContext(child, context) {
+				return true
+			}
+		}
+		return false
+	}
+	if node.Kind == yaml.ScalarNode && isSecretLikeWorkflowScalar(node.Value) {
+		return true
+	}
+	return false
+}
+
+func actionRefValueColumn(uses *yaml.Node) int {
+	if uses == nil {
+		return 0
+	}
+	switch uses.Style {
+	case yaml.DoubleQuotedStyle, yaml.SingleQuotedStyle:
+		return uses.Column + 1 + leadingWhitespaceCount(uses.Value)
+	default:
+		return uses.Column
+	}
+}
+
+func isPatchableUsesScalarStyle(uses *yaml.Node) bool {
+	if uses == nil {
+		return false
+	}
+	return uses.Style != yaml.FoldedStyle && uses.Style != yaml.LiteralStyle
+}
+
+func stepHasUnsafeSameLineContext(stepNode, uses *yaml.Node) bool {
+	if stepNode == nil || uses == nil || uses.Line <= 0 {
+		return false
+	}
+	return nodeHasUnsafeSameLineContext(stepNode, uses.Line, uses)
+}
+
+func nodeHasUnsafeSameLineContext(node *yaml.Node, line int, uses *yaml.Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			value := node.Content[i+1]
+			if key.Kind == yaml.ScalarNode && key.Line == line && isUnsafeSameLineWorkflowKey(key.Value) {
+				return true
+			}
+			if value != uses && nodeHasUnsafeSameLineContext(value, line, uses) {
+				return true
+			}
+		}
+		return false
+	}
+	if node.Kind == yaml.SequenceNode || node.Kind == yaml.DocumentNode {
+		for _, child := range node.Content {
+			if nodeHasUnsafeSameLineContext(child, line, uses) {
+				return true
+			}
+		}
+		return false
+	}
+	return node.Kind == yaml.ScalarNode && node.Line == line && node != uses && isSecretLikeWorkflowScalar(node.Value)
+}
+
+func isUnsafeSameLineWorkflowKey(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "run", "env", "with", "secrets":
+		return true
+	default:
+		return isSecretLikeWorkflowScalar(value)
+	}
+}
+
+func leadingWhitespaceCount(value string) int {
+	count := 0
+	for _, r := range value {
+		if r != ' ' && r != '\t' {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func isSecretLikeWorkflowScalar(value string) bool {
+	lower := strings.ToLower(value)
+	normalized := strings.NewReplacer("-", "_", " ", "_").Replace(lower)
+	for _, marker := range []string{"secret", "token", "password", "credential", "access_key", "private_key"} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePermissionGrants(node *yaml.Node, scope, jobID string) []PermissionGrant {
