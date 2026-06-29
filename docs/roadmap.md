@@ -150,7 +150,14 @@
   and before remediation, patch preview, patch writing, validation, JSON,
   human output, and SARIF. There is no config discovery, environment
   expansion, remote config, includes, globstar or regex exclusion syntax, or
-  baseline generation in this slice.
+  automatic config discovery in this slice.
+- Local baseline generation through `pathproof scan --write-baseline <file>`.
+  It writes a local JSON config containing only finding-ID suppressions with a
+  deterministic reason for current unsuppressed findings after configured path
+  exclusions, rule controls, and existing suppressions are applied. It does
+  not overwrite existing files, create parent directories, build remediation
+  or patch output, call APIs, execute Terraform, or change graph or rule
+  semantics.
 - Local Kubernetes YAML, GitHub Actions workflow, and narrow Terraform scan CLI for
   `pathproof scan <directory>` with human-readable finding, supported
   Kubernetes remediation and optional patch preview output, optional
@@ -167,8 +174,8 @@
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Globstar, glob, regex, or policy-driven path exclusions.
-- Baseline generation, baseline diffing, newly introduced findings mode,
-  suppression expiration, owner/team metadata, and severity thresholds.
+- Baseline diffing, newly introduced findings mode, suppression expiration,
+  owner/team metadata, and severity thresholds.
 - Enterprise policy packs, remote configs, config discovery, inheritance, and
   includes.
 - Full CI/CD attack-path modeling.

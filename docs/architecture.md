@@ -11,6 +11,7 @@ and local directory scans with:
 - `pathproof scan --config <file> <directory>`
 - `pathproof scan --repo OWNER/REPO <directory>`
 - `pathproof scan --github-action-pins <file> <directory>`
+- `pathproof scan --write-baseline <file> <directory>`
 - `pathproof scan --preview-patches <directory>`
 - `pathproof scan --write-patches <output-directory> <directory>`
 - `pathproof scan --write-patches <output-directory> --validate-patches <directory>`
@@ -22,15 +23,17 @@ selection before parsing, parses non-excluded Kubernetes manifests and local
 GitHub Actions workflows under `.github/workflows`, parses non-excluded local
 Terraform `.tf` files for a narrow static AWS IAM role OIDC trust-policy
 slice, constructs the in-memory graph, runs deterministic analysis, applies
-configured rule filtering and exact finding-ID suppressions, builds advisory
-remediation plans for supported unsuppressed Kubernetes findings and
-`PP-GHA-001` unpinned action findings, optionally builds read-only patch
-previews for supported remediation changes, optionally writes patched copies
-for supported generated previews to a separate output directory, optionally
-validates written Kubernetes patches by rescanning a temporary complete
-patched manifest overlay with the same effective scan exclusions, projects
-findings, plans, previews, patch output summaries, and validation results into
-a private CLI report shape, and writes human-readable output, JSON, or SARIF.
+configured rule filtering and exact finding-ID suppressions, optionally writes
+a local baseline config for the remaining unsuppressed findings, builds
+advisory remediation plans for supported unsuppressed Kubernetes findings and
+`PP-GHA-001` unpinned action findings when baseline mode is not active,
+optionally builds read-only patch previews for supported remediation changes,
+optionally writes patched copies for supported generated previews to a
+separate output directory, optionally validates written Kubernetes patches by
+rescanning a temporary complete patched manifest overlay with the same
+effective scan exclusions, projects findings, plans, previews, patch output
+summaries, and validation results into a private CLI report shape, and writes
+human-readable output, JSON, or SARIF.
 GitHub Actions pinning patches are local-only: PathProof reads only an
 optional local JSON pin mapping supplied with `--github-action-pins`, never
 calls GitHub, never resolves tags or branches, never guesses SHAs, and does
@@ -39,12 +42,12 @@ or expose graph internals beyond the ordered finding path, evidence,
 remediation plan fields, optional preview fields, optional patch output
 summaries, optional validation results, and SARIF finding projection.
 
-Config loading lives under `internal/config` and uses only Go standard library
-JSON parsing. Config is explicit-flag-only: there is no per-directory
-discovery, environment expansion, remote URL loading, includes, inheritance,
-YAML, TOML, glob patterns, regex patterns, or baseline generation in this
-slice. Config supports literal relative path exclusions and trailing-slash
-directory-prefix exclusions. Exclusions are normalized to slash-separated
+Config loading and baseline writing live under `internal/config` and use only
+Go standard library JSON parsing. Config is explicit-flag-only: there is no
+per-directory discovery, environment expansion, remote URL loading, includes,
+inheritance, YAML, TOML, glob patterns, or regex patterns. Config supports
+literal relative path exclusions and trailing-slash directory-prefix
+exclusions. Exclusions are normalized to slash-separated
 clean relative paths, rejected if they can escape the scan root or use
 unsupported pattern syntax, and matched against lexical paths under the scan
 root before parser file opening. Rule controls are applied after analysis and
@@ -53,6 +56,19 @@ output, and SARIF. Suppressions are exact finding-ID matches applied after
 rule filtering; suppressed findings are omitted from output and downstream
 remediation/patch/validation behavior. Suppression reasons are required and
 validated but are not printed.
+
+Baseline generation is local-only and writes a JSON config containing only
+`suppressions` entries with stable finding IDs and the deterministic reason
+`Baseline accepted at generation time`. It consumes the findings that remain
+after path exclusions, rule filtering, and existing suppressions, so disabled,
+excluded, stale, and already-suppressed findings are not written. Baseline
+writing does not change graph construction, analysis, rule semantics, finding
+IDs, or suppression matching. It does not build remediation plans, patch
+previews, patch outputs, validation results, or GitHub Action pinning metadata.
+The writer refuses to overwrite existing files, does not create parent
+directories, uses a local non-executable file mode, and may write inside the
+scan root because the scan has already completed before the baseline file is
+created.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported
@@ -406,7 +422,10 @@ SARIF stdout
 omits patch previews, patch output
 summaries, validation results, unified diffs, patched file contents, temporary
 paths, and raw manifests even when patch flags are supplied. Patch
-write/validation side effects still follow the same scan flag contract. SARIF
+write/validation side effects still follow the same scan flag contract. When
+`--write-baseline` is supplied with SARIF output, the baseline file is still
+written as a local side effect and SARIF stdout remains findings-only with no
+baseline metadata. SARIF
 locations use only clean structured `filename#document=N` source-reference
 fields; embedded references in prose are ignored. Artifact URIs are relative
 to the scan root and URI-encoded, while display source references in result
