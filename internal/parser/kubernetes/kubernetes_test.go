@@ -1596,6 +1596,69 @@ roleRef:
 	}
 }
 
+func TestParseDirWithOptionsExcludesKubernetesYAMLBeforeParsing(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "ignored.yaml", `apiVersion: v1
+kind: Service
+metadata:
+  name: ignored
+`)
+	path := writeManifest(t, dir, "kept.yaml", `apiVersion: v1
+kind: Service
+metadata:
+  name: kept
+`)
+
+	resources, err := ParseDirWithOptions(dir, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "ignored.yaml" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	want := []Service{{Namespace: "default", Name: "kept", Source: Source{Filename: path, Document: 1}}}
+	if !reflect.DeepEqual(resources.Services, want) {
+		t.Fatalf("services = %#v, want %#v", resources.Services, want)
+	}
+}
+
+func TestParseDirWithOptionsExcludedMalformedKubernetesYAMLDoesNotError(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "bad.yaml", `apiVersion: v1
+kind: Service
+metadata: [
+`)
+
+	resources, err := ParseDirWithOptions(dir, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "bad.yaml" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want empty", resources)
+	}
+}
+
+func TestParseDirWithOptionsExcludesKubernetesPathWithSpaces(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "ignored service.yaml", `apiVersion: v1
+kind: Service
+metadata:
+  name: ignored
+`)
+
+	resources, err := ParseDirWithOptions(dir, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "ignored service.yaml" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.Services) != 0 {
+		t.Fatalf("services = %#v, want none", resources.Services)
+	}
+}
+
 func writeManifest(t *testing.T, dir, name, content string) string {
 	t.Helper()
 

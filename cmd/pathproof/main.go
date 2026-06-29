@@ -104,7 +104,13 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	findings, g, err := scanDirectoryWithRepo(options.directory, options.repo)
+	var findings []analysis.Finding
+	var g *graph.Graph
+	if metadata != nil {
+		findings, g, err = scanDirectoryWithRepoAndExclusions(options.directory, options.repo, cfg.PathExclusions)
+	} else {
+		findings, g, err = scanDirectoryWithRepo(options.directory, options.repo)
+	}
 	if err != nil {
 		printError(stderr, err.Error())
 		return 2
@@ -121,7 +127,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return writeScanResultWithMetadata(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, metadata, stdout, stderr)
+	return writeScanResultWithMetadataAndExclusions(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, cfg.PathExclusions, metadata, stdout, stderr)
 }
 
 func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, stdout, stderr io.Writer) int {
@@ -129,6 +135,10 @@ func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, f
 }
 
 func writeScanResultWithMetadata(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, metadata *scanConfigMetadata, stdout, stderr io.Writer) int {
+	return writeScanResultWithMetadataAndExclusions(findings, g, root, format, previewPatches, writePatches, validatePatches, pins, nil, metadata, stdout, stderr)
+}
+
+func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, pathExclusions config.PathExclusions, metadata *scanConfigMetadata, stdout, stderr io.Writer) int {
 	plans, err := remediation.BuildWithGitHubActionPins(g, findings, pins)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
@@ -149,7 +159,7 @@ func writeScanResultWithMetadata(findings []analysis.Finding, g *graph.Graph, ro
 			reportPreviews = writePreviews
 		}
 		if validatePatches {
-			validationResults, err = validatePatchOutput(root, writePatches, findings, plans, writePreviews, patchOutputs)
+			validationResults, err = validatePatchOutput(root, writePatches, findings, plans, writePreviews, patchOutputs, pathExclusions)
 			if err != nil {
 				printError(stderr, "validate patch output: "+err.Error())
 				return 2
@@ -287,6 +297,26 @@ func scanDirectoryWithRepo(dir, repo string) ([]analysis.Finding, *graph.Graph, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
 	}
+	return analyzeParsedResources(resources, workflows, terraformResources, repo)
+}
+
+func scanDirectoryWithRepoAndExclusions(dir, repo string, pathExclusions config.PathExclusions) ([]analysis.Finding, *graph.Graph, error) {
+	resources, err := parserkubernetes.ParseDirWithOptions(dir, parserkubernetes.ParseOptions{ExcludePath: pathExclusions.Excludes})
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
+	}
+	workflows, err := parsergithubactions.ParseDirWithOptions(dir, parsergithubactions.ParseOptions{ExcludePath: pathExclusions.Excludes})
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
+	}
+	terraformResources, err := parserterraform.ParseDirWithOptions(dir, parserterraform.ParseOptions{ExcludePath: pathExclusions.Excludes})
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse scan directory: %w", err)
+	}
+	return analyzeParsedResources(resources, workflows, terraformResources, repo)
+}
+
+func analyzeParsedResources(resources parserkubernetes.Resources, workflows parsergithubactions.Resources, terraformResources parserterraform.Resources, repo string) ([]analysis.Finding, *graph.Graph, error) {
 	g := graph.New()
 	if err := routingkubernetes.AddRoutes(g, resources); err != nil {
 		return nil, nil, fmt.Errorf("build scan graph: %w", err)
@@ -315,20 +345,25 @@ func validateRepoIdentity(repo string) error {
 	return nil
 }
 
-func validatePatchOutput(root, outputRoot string, findings []analysis.Finding, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile) ([]validation.Result, error) {
+func validatePatchOutput(root, outputRoot string, findings []analysis.Finding, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, pathExclusions config.PathExclusions) ([]validation.Result, error) {
 	patchedFindingIDs := patchedFindingIDsByGeneratedOutput(plans, previews, patchOutputs)
 	if len(patchedFindingIDs) == 0 {
 		return validation.ValidatePatchedOutput(findings, nil, patchedFindingIDs), nil
 	}
 	validationPatchOutputs := patchOutputsForKubernetesValidation(plans, previews, patchOutputs)
 
-	overlay, cleanup, err := createValidationOverlay(root, outputRoot, validationPatchOutputs)
+	overlay, cleanup, err := createValidationOverlay(root, outputRoot, validationPatchOutputs, pathExclusions)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
 
-	patchedFindings, _, err := scanValidationDirectory(overlay)
+	var patchedFindings []analysis.Finding
+	if len(pathExclusions) > 0 {
+		patchedFindings, _, err = scanDirectoryWithRepoAndExclusions(overlay, "", pathExclusions)
+	} else {
+		patchedFindings, _, err = scanValidationDirectory(overlay)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("scan patched manifest set: %s", sanitizeValidationError(err, overlay))
 	}
@@ -404,7 +439,7 @@ func patchOutputsForKubernetesValidation(plans []remediation.Plan, previews []pa
 	return filtered
 }
 
-func createValidationOverlay(root, outputRoot string, patchOutputs []patchpreview.WrittenFile) (string, func(), error) {
+func createValidationOverlay(root, outputRoot string, patchOutputs []patchpreview.WrittenFile, pathExclusions config.PathExclusions) (string, func(), error) {
 	overlay, err := os.MkdirTemp("", "pathproof-validation-*")
 	if err != nil {
 		return "", nil, fmt.Errorf("create temporary validation directory")
@@ -436,6 +471,9 @@ func createValidationOverlay(root, outputRoot string, patchOutputs []patchprevie
 			continue
 		}
 		rel := filepath.ToSlash(entry.Name())
+		if pathExclusions.Excludes(rel) {
+			continue
+		}
 		sourcePath := filepath.Join(root, entry.Name())
 		if patchedPath, ok := generatedOutputBySource[rel]; ok {
 			sourcePath = patchedPath

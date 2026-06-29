@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -18,6 +20,7 @@ type Config struct {
 	DisabledRules    []analysis.RuleID
 	Suppressions     map[analysis.FindingID]Suppression
 	SuppressionCount int
+	PathExclusions   PathExclusions
 }
 
 type Suppression struct {
@@ -25,9 +28,17 @@ type Suppression struct {
 	Reason    string
 }
 
+type PathExclusion struct {
+	Path      string
+	Directory bool
+}
+
+type PathExclusions []PathExclusion
+
 type rawConfig struct {
-	Rules        *rawRules        `json:"rules,omitempty"`
-	Suppressions []rawSuppression `json:"suppressions,omitempty"`
+	Rules          *rawRules        `json:"rules,omitempty"`
+	Suppressions   []rawSuppression `json:"suppressions,omitempty"`
+	PathExclusions json.RawMessage  `json:"path_exclusions,omitempty"`
 }
 
 type rawRules struct {
@@ -143,11 +154,17 @@ func normalize(raw rawConfig) (Config, error) {
 		}
 	}
 
+	pathExclusions, err := parsePathExclusions(raw.PathExclusions)
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		EnabledRules:     enabled,
 		DisabledRules:    disabledRules,
 		Suppressions:     suppressions,
 		SuppressionCount: len(suppressions),
+		PathExclusions:   pathExclusions,
 	}, nil
 }
 
@@ -176,6 +193,134 @@ func validateSuppression(raw rawSuppression, index int) (analysis.FindingID, str
 		return "", "", fmt.Errorf("pathproof config suppressions[%d].reason contains a control character", index)
 	}
 	return analysis.FindingID(raw.FindingID), raw.Reason, nil
+}
+
+func parsePathExclusions(raw json.RawMessage) (PathExclusions, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, fmt.Errorf("pathproof config path_exclusions must be an array of strings")
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, fmt.Errorf("pathproof config path_exclusions must be an array of strings")
+	}
+
+	seen := make(map[string]PathExclusion, len(entries))
+	for i, entry := range entries {
+		if bytes.Equal(bytes.TrimSpace(entry), []byte("null")) {
+			return nil, fmt.Errorf("pathproof config path_exclusions[%d] must be a string", i)
+		}
+		var value string
+		if err := json.Unmarshal(entry, &value); err != nil {
+			return nil, fmt.Errorf("pathproof config path_exclusions[%d] must be a string", i)
+		}
+		exclusion, err := normalizePathExclusion(value, i)
+		if err != nil {
+			return nil, err
+		}
+		seen[pathExclusionKey(exclusion)] = exclusion
+	}
+
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	out := make(PathExclusions, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, seen[key])
+	}
+	return out, nil
+}
+
+func normalizePathExclusion(value string, index int) (PathExclusion, error) {
+	field := fmt.Sprintf("path_exclusions[%d]", index)
+	if value == "" {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s is empty", field)
+	}
+	if containsControl(value) {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s contains a control character", field)
+	}
+	if filepath.IsAbs(value) {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s must be relative to the scan root", field)
+	}
+	if hasWindowsDrivePrefix(value) {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s must be relative to the scan root", field)
+	}
+	if strings.Contains(value, "\\") {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s contains an unsupported path separator", field)
+	}
+	if hasURLLikeScheme(value) {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s must be a local relative path", field)
+	}
+	if strings.ContainsAny(value, "*?[]") {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s contains unsupported pattern syntax", field)
+	}
+
+	directory := strings.HasSuffix(value, "/")
+	clean := filepath.ToSlash(filepath.Clean(value))
+	if clean == "." {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s must not target the scan root", field)
+	}
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return PathExclusion{}, fmt.Errorf("pathproof config %s must stay within the scan root", field)
+	}
+	return PathExclusion{Path: clean, Directory: directory}, nil
+}
+
+func hasWindowsDrivePrefix(value string) bool {
+	if len(value) < 2 || value[1] != ':' {
+		return false
+	}
+	r := rune(value[0])
+	return (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')
+}
+
+func hasURLLikeScheme(value string) bool {
+	colon := strings.IndexByte(value, ':')
+	if colon <= 0 {
+		return false
+	}
+	for i, r := range value[:colon] {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+			continue
+		}
+		if i > 0 && ((r >= '0' && r <= '9') || r == '+' || r == '-' || r == '.') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func pathExclusionKey(exclusion PathExclusion) string {
+	if exclusion.Directory {
+		return exclusion.Path + "/"
+	}
+	return exclusion.Path
+}
+
+func (exclusions PathExclusions) Excludes(rel string) bool {
+	directoryCandidate := strings.HasSuffix(rel, "/")
+	clean := filepath.ToSlash(filepath.Clean(rel))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return false
+	}
+	for _, exclusion := range exclusions {
+		if exclusion.Directory {
+			if (directoryCandidate && clean == exclusion.Path) || strings.HasPrefix(clean, exclusion.Path+"/") {
+				return true
+			}
+			continue
+		}
+		if !directoryCandidate && clean == exclusion.Path {
+			return true
+		}
+	}
+	return false
 }
 
 func containsControl(value string) bool {

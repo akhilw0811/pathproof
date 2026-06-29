@@ -208,6 +208,30 @@ func TestRunScanSARIFOmitDisabledAndSuppressedFindings(t *testing.T) {
 	})
 }
 
+func TestRunScanSARIFOmitPathExcludedFindings(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "ignored.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":[".github/workflows/ignored.yml"]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=sarif", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	assertString(t, "version", report.Version, "2.1.0")
+	if len(report.Runs[0].Results) != 0 {
+		t.Fatalf("SARIF results = %#v, want excluded finding omitted", report.Runs[0].Results)
+	}
+	if strings.Contains(stdout, "ignored.yml") || strings.Contains(stdout, "path_exclusions") {
+		t.Fatalf("SARIF output contains excluded file or config detail: %s", stdout)
+	}
+}
+
 func TestRunScanGitHubActionsSARIFOutputShapeAndFinding(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "build workflow.yml", `name: Build

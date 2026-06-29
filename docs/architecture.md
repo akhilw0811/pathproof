@@ -17,35 +17,42 @@ and local directory scans with:
 
 The scan command is intentionally only an orchestration layer. It validates the
 local directory input, optionally loads one explicit local JSON config file
-from `--config <file>`, parses Kubernetes manifests and local GitHub Actions
-workflows under `.github/workflows`, parses local Terraform `.tf` files for a
-narrow static AWS IAM role OIDC trust-policy slice, constructs the in-memory
-graph, runs deterministic analysis, applies configured rule filtering and
-exact finding-ID suppressions, builds advisory remediation plans for supported
-unsuppressed Kubernetes findings and `PP-GHA-001` unpinned action findings,
-optionally builds read-only patch previews for supported remediation changes,
-optionally writes patched copies for supported generated previews to a
-separate output directory, optionally validates written Kubernetes patches by
-rescanning a temporary complete patched manifest overlay, projects findings,
-plans, previews, patch output summaries, and validation results into a private
-CLI report shape, and writes human-readable output, JSON, or SARIF. GitHub
-Actions pinning patches are local-only: PathProof reads only an optional local
-JSON pin mapping supplied with `--github-action-pins`, never calls GitHub,
-never resolves tags or branches, never guesses SHAs, and does not validate
-`PP-GHA-001` patches in this slice. It does not persist the graph or expose
-graph internals beyond the ordered finding path, evidence, remediation plan
-fields, optional preview fields, optional patch output summaries, optional
-validation results, and SARIF finding projection.
+from `--config <file>`, applies configured path exclusions to scan input
+selection before parsing, parses non-excluded Kubernetes manifests and local
+GitHub Actions workflows under `.github/workflows`, parses non-excluded local
+Terraform `.tf` files for a narrow static AWS IAM role OIDC trust-policy
+slice, constructs the in-memory graph, runs deterministic analysis, applies
+configured rule filtering and exact finding-ID suppressions, builds advisory
+remediation plans for supported unsuppressed Kubernetes findings and
+`PP-GHA-001` unpinned action findings, optionally builds read-only patch
+previews for supported remediation changes, optionally writes patched copies
+for supported generated previews to a separate output directory, optionally
+validates written Kubernetes patches by rescanning a temporary complete
+patched manifest overlay with the same effective scan exclusions, projects
+findings, plans, previews, patch output summaries, and validation results into
+a private CLI report shape, and writes human-readable output, JSON, or SARIF.
+GitHub Actions pinning patches are local-only: PathProof reads only an
+optional local JSON pin mapping supplied with `--github-action-pins`, never
+calls GitHub, never resolves tags or branches, never guesses SHAs, and does
+not validate `PP-GHA-001` patches in this slice. It does not persist the graph
+or expose graph internals beyond the ordered finding path, evidence,
+remediation plan fields, optional preview fields, optional patch output
+summaries, optional validation results, and SARIF finding projection.
 
 Config loading lives under `internal/config` and uses only Go standard library
 JSON parsing. Config is explicit-flag-only: there is no per-directory
 discovery, environment expansion, remote URL loading, includes, inheritance,
-YAML, TOML, path exclusions, or baseline generation in this slice. Rule
-controls are applied after analysis and before remediation, patch preview,
-patch writing, validation, JSON, human output, and SARIF. Suppressions are
-exact finding-ID matches applied after rule filtering; suppressed findings are
-omitted from output and downstream remediation/patch/validation behavior.
-Suppression reasons are required and validated but are not printed.
+YAML, TOML, glob patterns, regex patterns, or baseline generation in this
+slice. Config supports literal relative path exclusions and trailing-slash
+directory-prefix exclusions. Exclusions are normalized to slash-separated
+clean relative paths, rejected if they can escape the scan root or use
+unsupported pattern syntax, and matched against lexical paths under the scan
+root before parser file opening. Rule controls are applied after analysis and
+before remediation, patch preview, patch writing, validation, JSON, human
+output, and SARIF. Suppressions are exact finding-ID matches applied after
+rule filtering; suppressed findings are omitted from output and downstream
+remediation/patch/validation behavior. Suppression reasons are required and
+validated but are not printed.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported

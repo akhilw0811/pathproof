@@ -94,6 +94,175 @@ func TestParseUnknownRuleIDErrorsDeterministically(t *testing.T) {
 	assertErrorDoesNotContain(t, err, "FAKE_CONFIG_RULE_SECRET_DO_NOT_RETAIN")
 }
 
+func TestParsePathExclusions(t *testing.T) {
+	cfg := mustParse(t, `{
+		"path_exclusions": [
+			"vendor/",
+			"third_party/../third_party/",
+			"testdata/ignored/",
+			".github/workflows/ignored.yml",
+			"infra/generated.tf"
+		]
+	}`)
+
+	want := PathExclusions{
+		{Path: ".github/workflows/ignored.yml"},
+		{Path: "infra/generated.tf"},
+		{Path: "testdata/ignored", Directory: true},
+		{Path: "third_party", Directory: true},
+		{Path: "vendor", Directory: true},
+	}
+	if !reflect.DeepEqual(cfg.PathExclusions, want) {
+		t.Fatalf("path exclusions = %#v, want %#v", cfg.PathExclusions, want)
+	}
+}
+
+func TestParsePathExclusionsDedupesAndPreservesFileDirectorySemantics(t *testing.T) {
+	cfg := mustParse(t, `{"path_exclusions":["vendor/","vendor","vendor/","a/../vendor"]}`)
+
+	want := PathExclusions{
+		{Path: "vendor"},
+		{Path: "vendor", Directory: true},
+	}
+	if !reflect.DeepEqual(cfg.PathExclusions, want) {
+		t.Fatalf("path exclusions = %#v, want %#v", cfg.PathExclusions, want)
+	}
+}
+
+func TestPathExclusionsMatchExactFilesAndDirectories(t *testing.T) {
+	exclusions := PathExclusions{
+		{Path: ".github/workflows/ignored.yml"},
+		{Path: "infra/generated.tf"},
+		{Path: "exact-dir-name"},
+		{Path: "vendor", Directory: true},
+		{Path: "with spaces/ignored.yml"},
+	}
+	tests := []struct {
+		rel  string
+		want bool
+	}{
+		{rel: ".github/workflows/ignored.yml", want: true},
+		{rel: ".github/workflows/ignored.yaml", want: false},
+		{rel: "infra/generated.tf", want: true},
+		{rel: "infra/nested/generated.tf", want: false},
+		{rel: "exact-dir-name", want: true},
+		{rel: "exact-dir-name/", want: false},
+		{rel: "exact-dir-name/file.yml", want: false},
+		{rel: "vendor", want: false},
+		{rel: "vendor/", want: true},
+		{rel: "vendor/a.yaml", want: true},
+		{rel: "vendor/nested/b.tf", want: true},
+		{rel: "vendor-other/a.yaml", want: false},
+		{rel: "with spaces/ignored.yml", want: true},
+		{rel: "../vendor/a.yaml", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.rel, func(t *testing.T) {
+			if got := exclusions.Excludes(tt.rel); got != tt.want {
+				t.Fatalf("Excludes(%q) = %t, want %t", tt.rel, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseRejectsInvalidPathExclusions(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "null field",
+			content: `{"path_exclusions":null}`,
+			want:    "path_exclusions must be an array of strings",
+		},
+		{
+			name:    "non array",
+			content: `{"path_exclusions":"vendor/"}`,
+			want:    "path_exclusions must be an array of strings",
+		},
+		{
+			name:    "null entry",
+			content: `{"path_exclusions":[null]}`,
+			want:    "path_exclusions[0] must be a string",
+		},
+		{
+			name:    "non string entry",
+			content: `{"path_exclusions":[42]}`,
+			want:    "path_exclusions[0] must be a string",
+		},
+		{
+			name:    "empty",
+			content: `{"path_exclusions":[""]}`,
+			want:    "path_exclusions[0] is empty",
+		},
+		{
+			name:    "control",
+			content: "{\"path_exclusions\":[\"bad\\u0001.yml\"]}",
+			want:    "path_exclusions[0] contains a control character",
+		},
+		{
+			name:    "absolute",
+			content: `{"path_exclusions":["/tmp/file.yml"]}`,
+			want:    "path_exclusions[0] must be relative to the scan root",
+		},
+		{
+			name:    "windows drive slash",
+			content: `{"path_exclusions":["C:/tmp/file.yml"]}`,
+			want:    "path_exclusions[0] must be relative to the scan root",
+		},
+		{
+			name:    "windows drive backslash",
+			content: `{"path_exclusions":["C:\\tmp\\file.yml"]}`,
+			want:    "path_exclusions[0] must be relative to the scan root",
+		},
+		{
+			name:    "outside root",
+			content: `{"path_exclusions":["../secret.yml"]}`,
+			want:    "path_exclusions[0] must stay within the scan root",
+		},
+		{
+			name:    "root pattern",
+			content: `{"path_exclusions":["."]}`,
+			want:    "path_exclusions[0] must not target the scan root",
+		},
+		{
+			name:    "url scheme",
+			content: `{"path_exclusions":["https://example.com/x.yml"]}`,
+			want:    "path_exclusions[0] must be a local relative path",
+		},
+		{
+			name:    "backslash",
+			content: `{"path_exclusions":["dir\\file.yml"]}`,
+			want:    "path_exclusions[0] contains an unsupported path separator",
+		},
+		{
+			name:    "star glob",
+			content: `{"path_exclusions":["vendor/*"]}`,
+			want:    "path_exclusions[0] contains unsupported pattern syntax",
+		},
+		{
+			name:    "question glob",
+			content: `{"path_exclusions":["vendor/?.yml"]}`,
+			want:    "path_exclusions[0] contains unsupported pattern syntax",
+		},
+		{
+			name:    "character class glob",
+			content: `{"path_exclusions":["vendor/[ab].yml"]}`,
+			want:    "path_exclusions[0] contains unsupported pattern syntax",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := parseError(t, tt.content)
+			assertErrorContains(t, err, tt.want)
+			assertErrorDoesNotContain(t, err, "secret.yml")
+			assertErrorDoesNotContain(t, err, "example.com")
+			assertErrorDoesNotContain(t, err, "vendor/*")
+		})
+	}
+}
+
 func TestParseValidSuppressions(t *testing.T) {
 	cfg := mustParse(t, `{"suppressions":[{"finding_id":"finding:PP-K8S-001:abc","reason":"Accepted risk for fixture"}]}`)
 
@@ -165,7 +334,6 @@ func TestParseRejectsUnknownFields(t *testing.T) {
 		content string
 	}{
 		{name: "top level", content: `{"unknown":true}`},
-		{name: "path exclusions unsupported", content: `{"path_exclusions":["vendor/**"]}`},
 		{name: "rules", content: `{"rules":{"extra":[]}}`},
 		{name: "suppression", content: `{"suppressions":[{"finding_id":"finding:PP-K8S-001:abc","reason":"Accepted","owner":"team"}]}`},
 	}
