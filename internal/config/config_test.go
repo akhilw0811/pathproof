@@ -8,23 +8,14 @@ import (
 	"testing"
 
 	"pathproof/internal/analysis"
+	"pathproof/internal/rules"
 )
 
 func TestParseEmptyConfigEnablesAllRules(t *testing.T) {
 	cfg := mustParse(t, `{}`)
 
-	for _, ruleID := range []analysis.RuleID{
-		analysis.RulePublicWorkloadCanReadSecret,
-		analysis.RuleGitHubActionsUnpinnedAction,
-		analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout,
-		analysis.RuleGitHubActionsDangerousPermissions,
-		analysis.RuleAWSIAMRoleAdministrativePermissions,
-		analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole,
-		analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole,
-		analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket,
-		analysis.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket,
-	} {
-		if !cfg.EnabledRules[ruleID] {
+	for _, ruleID := range rules.IDs() {
+		if !cfg.EnabledRules[analysis.RuleID(ruleID)] {
 			t.Fatalf("%s enabled = false, want true", ruleID)
 		}
 	}
@@ -85,6 +76,34 @@ func TestParseDuplicateRuleIDsDedupe(t *testing.T) {
 	wantDisabled := []analysis.RuleID{analysis.RulePublicWorkloadCanReadSecret}
 	if !reflect.DeepEqual(cfg.DisabledRules, wantDisabled) {
 		t.Fatalf("disabled rules = %#v, want %#v", cfg.DisabledRules, wantDisabled)
+	}
+}
+
+func TestParseEnableAcceptsEveryRegistryRule(t *testing.T) {
+	for _, ruleID := range rules.IDs() {
+		t.Run(ruleID, func(t *testing.T) {
+			cfg := mustParse(t, `{"rules":{"enable":["`+ruleID+`"]}}`)
+			if !cfg.EnabledRules[analysis.RuleID(ruleID)] {
+				t.Fatalf("%s enabled = false, want true", ruleID)
+			}
+			if len(cfg.DisabledRules) != len(rules.IDs())-1 {
+				t.Fatalf("disabled rules = %#v, want every other implemented rule", cfg.DisabledRules)
+			}
+		})
+	}
+}
+
+func TestParseDisableAcceptsEveryRegistryRule(t *testing.T) {
+	for _, ruleID := range rules.IDs() {
+		t.Run(ruleID, func(t *testing.T) {
+			cfg := mustParse(t, `{"rules":{"disable":["`+ruleID+`"]}}`)
+			if cfg.EnabledRules[analysis.RuleID(ruleID)] {
+				t.Fatalf("%s enabled = true, want false", ruleID)
+			}
+			if !reflect.DeepEqual(cfg.DisabledRules, []analysis.RuleID{analysis.RuleID(ruleID)}) {
+				t.Fatalf("disabled rules = %#v, want %s only", cfg.DisabledRules, ruleID)
+			}
+		})
 	}
 }
 

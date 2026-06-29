@@ -114,6 +114,10 @@
   existing conservative local metadata is `sensitive` and has at least one
   sanitized sensitivity reason. This does not broaden S3 access semantics,
   sensitivity classification, IAM semantics, or remediation.
+- Static in-code rule metadata registry for implemented deterministic rules.
+  It centralizes rule IDs, titles, severities, SARIF levels, categories, and
+  short descriptions for config validation, analysis finding metadata, and
+  SARIF rule metadata. It is not dynamic rule loading or rule execution.
 - Read-only deterministic remediation planning for `PP-K8S-001`, using typed
   structured `CanRead` authorization metadata. Implemented advisory actions are
   `RemoveSecretsResource`, `RemoveSecretReadVerb`, and `NarrowBindingSubject`.
@@ -189,6 +193,8 @@
   suppression expiration, owner/team metadata, and severity thresholds.
 - Enterprise policy packs, remote configs, config discovery, inheritance, and
   includes.
+- Dynamic rule registries, plugin systems, DSLs, policy packs, remote rule
+  registries, and rule execution frameworks.
 - Full CI/CD attack-path modeling.
 - Exact GitHub Actions workflow permission inheritance/override modeling.
 - Broad Terraform/HCL support, modules, variables, locals, functions,

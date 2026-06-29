@@ -34,8 +34,8 @@ func TestAnalyzeAWSIAMRoleInlineAdminPermissionEmitsPPAWS001(t *testing.T) {
 			findings := Analyze(g)
 
 			finding := onlyAWSFinding(t, findings)
-			if finding.Title != awsIAMRoleAdministrativePermissionsTitle {
-				t.Fatalf("title = %q, want %q", finding.Title, awsIAMRoleAdministrativePermissionsTitle)
+			if finding.Title != ruleTitle(RuleAWSIAMRoleAdministrativePermissions) {
+				t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RuleAWSIAMRoleAdministrativePermissions))
 			}
 			if finding.Severity != SeverityHigh {
 				t.Fatalf("severity = %q, want High", finding.Severity)

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"pathproof/internal/analysis"
+	"pathproof/internal/rules"
 )
 
 const BaselineDefaultReason = "Baseline accepted at generation time"
@@ -108,8 +109,7 @@ func validateBaselineFindingID(id string) error {
 	if !ok || ruleValue == "" || digest == "" || strings.Contains(digest, ":") {
 		return fmt.Errorf("baseline suppression finding_id has unsupported format")
 	}
-	ruleID := analysis.RuleID(ruleValue)
-	if _, ok := knownRules[ruleID]; !ok {
+	if _, ok := rules.Lookup(ruleValue); !ok {
 		return fmt.Errorf("baseline suppression finding_id has unsupported rule ID")
 	}
 	if len(digest) != 64 {

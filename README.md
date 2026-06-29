@@ -584,6 +584,9 @@ only publishes the SARIF file as an artifact.
 
 PathProof keeps parsing, graph storage, routing, analysis, remediation, patch
 generation, and CLI presentation separate.
+Implemented rule metadata is centralized in a static in-code registry used by
+config validation, finding metadata, and SARIF rule metadata; rule detection
+remains deterministic analysis/routing code.
 
 The scan loop is:
 

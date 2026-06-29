@@ -9,6 +9,7 @@ import (
 
 	"pathproof/internal/analysis"
 	"pathproof/internal/graph"
+	rulespkg "pathproof/internal/rules"
 )
 
 type cliSARIFLog struct {
@@ -1176,20 +1177,31 @@ func assertValidSARIFReport(t *testing.T, output string) cliSARIFLog {
 
 func assertSARIFRuleSet(t *testing.T, rules []cliSARIFRule) {
 	t.Helper()
-	want := []string{
-		"PP-K8S-001",
-		"PP-GHA-001",
-		"PP-GHA-002",
-		"PP-GHA-003",
-		"PP-AWS-001",
-		"PP-XDOMAIN-001",
-		"PP-XDOMAIN-002",
-		"PP-XDOMAIN-003",
-		"PP-XDOMAIN-004",
-	}
+	want := rulespkgIDs()
 	counts := make(map[string]int, len(rules))
-	for _, rule := range rules {
+	for i, rule := range rules {
 		counts[rule.ID]++
+		if i >= len(want) {
+			continue
+		}
+		if rule.ID != want[i] {
+			t.Fatalf("SARIF rule[%d].ID = %q, want %q in registry order", i, rule.ID, want[i])
+		}
+		metadata := rulespkg.MustLookup(rule.ID)
+		if rule.Name != metadata.Title || rule.ShortDescription.Text != metadata.Title {
+			t.Fatalf("SARIF rule %s title metadata = %#v, want %q", rule.ID, rule, metadata.Title)
+		}
+		if rule.FullDescription.Text != metadata.Description {
+			t.Fatalf("SARIF rule %s description = %q, want registry description %q", rule.ID, rule.FullDescription.Text, metadata.Description)
+		}
+		if rule.DefaultConfiguration.Level != metadata.SARIFLevel {
+			t.Fatalf("SARIF rule %s level = %q, want %q", rule.ID, rule.DefaultConfiguration.Level, metadata.SARIFLevel)
+		}
+		for _, forbidden := range []string{"patch", "validation", "baseline", "suppression"} {
+			if strings.Contains(strings.ToLower(rule.FullDescription.Text), forbidden) {
+				t.Fatalf("SARIF rule %s description contains %q: %#v", rule.ID, forbidden, rule)
+			}
+		}
 	}
 	for _, id := range want {
 		if counts[id] != 1 {
@@ -1199,6 +1211,10 @@ func assertSARIFRuleSet(t *testing.T, rules []cliSARIFRule) {
 	if len(rules) != len(want) {
 		t.Fatalf("SARIF rules len = %d, want %d expected rules exactly: %#v", len(rules), len(want), rules)
 	}
+}
+
+func rulespkgIDs() []string {
+	return rulespkg.IDs()
 }
 
 func mustSARIFRule(t *testing.T, rules []cliSARIFRule, id string) cliSARIFRule {

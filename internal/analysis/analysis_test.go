@@ -29,8 +29,8 @@ func TestAnalyzeCompletePublicWorkloadCanReadSecretPath(t *testing.T) {
 	if finding.RuleID != RulePublicWorkloadCanReadSecret {
 		t.Fatalf("rule ID = %q, want %q", finding.RuleID, RulePublicWorkloadCanReadSecret)
 	}
-	if finding.Title != publicWorkloadCanReadSecretTitle {
-		t.Fatalf("title = %q, want %q", finding.Title, publicWorkloadCanReadSecretTitle)
+	if finding.Title != ruleTitle(RulePublicWorkloadCanReadSecret) {
+		t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RulePublicWorkloadCanReadSecret))
 	}
 	if finding.Severity != SeverityHigh {
 		t.Fatalf("severity = %q, want %q", finding.Severity, SeverityHigh)

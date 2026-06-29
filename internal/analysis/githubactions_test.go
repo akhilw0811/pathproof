@@ -46,8 +46,8 @@ func TestAnalyzeGitHubActionsUnpinnedActionFindings(t *testing.T) {
 				if finding.RuleID != RuleGitHubActionsUnpinnedAction {
 					t.Fatalf("rule_id = %q, want %q", finding.RuleID, RuleGitHubActionsUnpinnedAction)
 				}
-				if finding.Title != githubActionsUnpinnedActionTitle {
-					t.Fatalf("title = %q, want %q", finding.Title, githubActionsUnpinnedActionTitle)
+				if finding.Title != ruleTitle(RuleGitHubActionsUnpinnedAction) {
+					t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RuleGitHubActionsUnpinnedAction))
 				}
 				if finding.Severity != SeverityMedium {
 					t.Fatalf("severity = %q, want Medium", finding.Severity)
@@ -307,8 +307,8 @@ jobs:
 				return
 			}
 			finding := onlyFindingByRule(t, findings, RuleGitHubActionsDangerousPermissions)
-			if finding.Title != githubActionsDangerousPermissionsTitle {
-				t.Fatalf("title = %q, want %q", finding.Title, githubActionsDangerousPermissionsTitle)
+			if finding.Title != ruleTitle(RuleGitHubActionsDangerousPermissions) {
+				t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RuleGitHubActionsDangerousPermissions))
 			}
 			if finding.Severity != SeverityHigh {
 				t.Fatalf("severity = %q, want High", finding.Severity)

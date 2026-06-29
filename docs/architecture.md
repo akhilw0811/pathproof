@@ -267,6 +267,12 @@ it consumes the in-memory graph and emits structured findings without changing
 nodes, edges, parser output, or routing behavior. `PP-K8S-001` requires this
 exact directed chain:
 
+Static rule metadata lives under `internal/rules`. The registry centralizes
+implemented rule IDs, titles, severities, SARIF levels, categories, and short
+descriptions for config validation, analysis finding metadata, and SARIF rule
+metadata. It does not register or execute rules. Detection remains
+deterministic code in analysis and routing; rules are not dynamically loaded.
+
 `PublicEndpoint --RoutesTo--> Workload --RunsAs--> ServiceAccount --CanRead--> Secret`
 
 The rule does not infer missing relationships. Unresolved roles and unsupported
