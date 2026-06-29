@@ -46,6 +46,12 @@ forms; this is not IAM simulation.
 `PP-XDOMAIN-002` reports the current local cross-domain admin slice: a risky
 `pull_request_target` workflow or job with modeled OIDC capability can assume
 an AWS IAM role that also has a supported static administrative permission.
+`PP-GHA-001` findings include advisory remediation to pin the action to a full
+40-character commit SHA. When `--github-action-pins <file>` points to a local
+JSON mapping from exact action refs to exact commit SHAs, PathProof can preview
+and write deterministic patched workflow copies for safe static action uses.
+It never calls GitHub, resolves tags or branches, guesses SHAs, clones action
+repositories, or trusts mutable refs.
 `PP-XDOMAIN-003` reports one narrow local cross-domain S3 slice: the same
 risky OIDC context reaches an AWS IAM role with explicit static read or write
 access to a locally modeled `aws_s3_bucket`. Modeled S3 buckets may carry
@@ -202,6 +208,31 @@ Finding count: 1
 Rule: PP-GHA-001
 Title: GitHub Actions workflow uses an action that is not pinned to a full commit SHA
 Severity: Medium
+Remediation:
+  Option 1: PinGitHubActionToSHA ...
+```
+
+Preview an action-pinning patch only when a local pin mapping supplies the
+exact SHA:
+
+```sh
+cat > /tmp/pathproof-action-pins.json <<'JSON'
+{
+  "actions/checkout@v4": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+JSON
+./bin/pathproof scan --github-action-pins /tmp/pathproof-action-pins.json --preview-patches ./examples/github-actions/unpinned-action
+```
+
+Expected shape:
+
+```text
+Patch Preview:
+  Status: generated
+  File: .github/workflows/unpinned.yml
+  Diff:
+    --- .github/workflows/unpinned.yml
+    +++ .github/workflows/unpinned.yml
 ```
 
 Scan the cross-domain GitHub Actions OIDC to AWS IAM role demo fixture:

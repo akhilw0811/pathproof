@@ -19,6 +19,7 @@ const (
 	RemoveSecretsResource Action = "RemoveSecretsResource"
 	RemoveSecretReadVerb  Action = "RemoveSecretReadVerb"
 	NarrowBindingSubject  Action = "NarrowBindingSubject"
+	PinGitHubActionToSHA  Action = "PinGitHubActionToSHA"
 )
 
 type Plan struct {
@@ -47,6 +48,14 @@ type Change struct {
 	PermissionSHA256 string `json:"permission_sha256,omitempty"`
 	MatchedVerb      string `json:"matched_verb,omitempty"`
 	Subject          string `json:"subject,omitempty"`
+	ActionRef        string `json:"action_ref,omitempty"`
+	ReplacementSHA   string `json:"replacement_sha,omitempty"`
+	ReplacementRef   string `json:"replacement_ref,omitempty"`
+	PatchSupported   bool   `json:"patch_supported,omitempty"`
+	Advisory         bool   `json:"advisory,omitempty"`
+	Reason           string `json:"reason,omitempty"`
+	SourceLine       int    `json:"source_line,omitempty"`
+	SourceColumn     int    `json:"source_column,omitempty"`
 }
 
 type Target struct {
@@ -83,9 +92,21 @@ type changeIdentity struct {
 	MatchedVerb      string `json:"matched_verb,omitempty"`
 	Subject          string `json:"subject,omitempty"`
 	SourceReference  string `json:"source_reference"`
+	ActionRef        string `json:"action_ref,omitempty"`
+	ReplacementSHA   string `json:"replacement_sha,omitempty"`
+	ReplacementRef   string `json:"replacement_ref,omitempty"`
+	PatchSupported   bool   `json:"patch_supported,omitempty"`
+	Advisory         bool   `json:"advisory,omitempty"`
+	Reason           string `json:"reason,omitempty"`
+	SourceLine       int    `json:"source_line,omitempty"`
+	SourceColumn     int    `json:"source_column,omitempty"`
 }
 
 func Build(g *graph.Graph, findings []analysis.Finding) ([]Plan, error) {
+	return BuildWithGitHubActionPins(g, findings, nil)
+}
+
+func BuildWithGitHubActionPins(g *graph.Graph, findings []analysis.Finding, pins GitHubActionPins) ([]Plan, error) {
 	plans := make([]Plan, 0)
 	if len(findings) == 0 {
 		return plans, nil
@@ -97,6 +118,16 @@ func Build(g *graph.Graph, findings []analysis.Finding) ([]Plan, error) {
 	})
 
 	for _, finding := range orderedFindings {
+		if finding.RuleID == analysis.RuleGitHubActionsUnpinnedAction {
+			plan, ok, err := githubActionPinPlan(g, finding, pins)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				plans = append(plans, plan)
+			}
+			continue
+		}
 		if finding.RuleID != analysis.RulePublicWorkloadCanReadSecret {
 			continue
 		}
@@ -130,6 +161,94 @@ func Build(g *graph.Graph, findings []analysis.Finding) ([]Plan, error) {
 	}
 
 	return plans, nil
+}
+
+func githubActionPinPlan(g *graph.Graph, finding analysis.Finding, pins GitHubActionPins) (Plan, bool, error) {
+	if g == nil {
+		return Plan{}, false, fmt.Errorf("finding %q cannot be remediated without a graph", finding.ID)
+	}
+	actionUse, ok := githubActionUseForFinding(g, finding)
+	if !ok {
+		return Plan{}, false, fmt.Errorf("finding %q lacks GitHub action use metadata", finding.ID)
+	}
+	change := githubActionPinChange(actionUse, pins)
+	identity, err := stableChangeIdentity(change)
+	if err != nil {
+		return Plan{}, false, err
+	}
+	option, err := makeOption(1, PinGitHubActionToSHA, []changeCandidate{{change: change, identity: identity}},
+		"Pin the GitHub Action reference to a full 40-character commit SHA.",
+		"Full commit SHA pinning avoids trusting mutable tags or branches. PathProof does not resolve refs; patching is supported only when a local pin mapping supplies the exact SHA.",
+	)
+	if err != nil {
+		return Plan{}, false, err
+	}
+	id, err := stablePlanID(finding.ID, []string{option.identity})
+	if err != nil {
+		return Plan{}, false, err
+	}
+	return Plan{
+		ID:        id,
+		FindingID: finding.ID,
+		RuleID:    finding.RuleID,
+		Summary:   "Pin the GitHub Action reference to a full 40-character commit SHA using a locally supplied trusted mapping when available.",
+		Options:   []Option{option.option},
+	}, true, nil
+}
+
+func githubActionUseForFinding(g *graph.Graph, finding analysis.Finding) (graph.GitHubActionUse, bool) {
+	if finding.RuleID != analysis.RuleGitHubActionsUnpinnedAction || len(finding.EdgeIDs) == 0 {
+		return graph.GitHubActionUse{}, false
+	}
+	edge, ok := g.Edge(finding.EdgeIDs[len(finding.EdgeIDs)-1])
+	if !ok || edge.Metadata == nil || edge.Metadata.GitHubActionUse == nil {
+		return graph.GitHubActionUse{}, false
+	}
+	return *edge.Metadata.GitHubActionUse, true
+}
+
+func githubActionPinChange(actionUse graph.GitHubActionUse, pins GitHubActionPins) Change {
+	targetName := actionUse.Owner + "/" + actionUse.Repo
+	if actionUse.Path != "" {
+		targetName += "/" + actionUse.Path
+	}
+	change := Change{
+		Action:          PinGitHubActionToSHA,
+		Target:          Target{Kind: "GitHubAction", Name: targetName},
+		Summary:         "Pin " + actionUse.Uses + " to a full 40-character commit SHA.",
+		SourceReference: actionUse.WorkflowFile + "#document=1",
+		ActionRef:       actionUse.Uses,
+		Advisory:        true,
+		SourceLine:      actionUse.UsesLine,
+		SourceColumn:    actionUse.UsesColumn,
+	}
+	sha, ok := pins.SHAFor(actionUse.Uses)
+	if !ok {
+		change.Reason = "no local SHA mapping was provided for this exact action ref"
+		return change
+	}
+	replacementRef := targetName + "@" + sha
+	change.ReplacementSHA = sha
+	change.ReplacementRef = replacementRef
+	if actionUse.Ref == "" {
+		change.Reason = "action ref has no explicit ref to replace"
+		return change
+	}
+	if actionUse.Ref == "<expression>" || strings.Contains(actionUse.Ref, "${{") || strings.Contains(actionUse.Ref, "}}") {
+		change.Reason = "action ref is expression-based"
+		return change
+	}
+	if actionUse.UsesLine <= 0 || actionUse.UsesColumn <= 0 {
+		change.Reason = "uses source location is not precise enough to patch"
+		return change
+	}
+	if actionUse.PatchUnsupportedReason != "" {
+		change.Reason = actionUse.PatchUnsupportedReason
+		return change
+	}
+	change.PatchSupported = true
+	change.Reason = ""
+	return change
 }
 
 type findingContext struct {
@@ -454,6 +573,14 @@ func stableChangeIdentity(change Change) (string, error) {
 		MatchedVerb:      change.MatchedVerb,
 		Subject:          change.Subject,
 		SourceReference:  change.SourceReference,
+		ActionRef:        change.ActionRef,
+		ReplacementSHA:   change.ReplacementSHA,
+		ReplacementRef:   change.ReplacementRef,
+		PatchSupported:   change.PatchSupported,
+		Advisory:         change.Advisory,
+		Reason:           change.Reason,
+		SourceLine:       change.SourceLine,
+		SourceColumn:     change.SourceColumn,
 	})
 	if err != nil {
 		return "", err

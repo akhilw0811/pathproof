@@ -164,6 +164,9 @@ func buildChangePreview(root string, planID remediation.PlanID, optionIndex int,
 		Status:       StatusUnsupported,
 		Summary:      change.Summary,
 	}
+	if change.Action == remediation.PinGitHubActionToSHA || optionAction == remediation.PinGitHubActionToSHA {
+		return buildGitHubActionPinPreview(root, preview, optionAction, change)
+	}
 	if change.Action != remediation.NarrowBindingSubject || optionAction != remediation.NarrowBindingSubject {
 		preview.Reason = "patch previews support only NarrowBindingSubject"
 		return preview
@@ -224,6 +227,31 @@ func buildChangePreview(root string, planID remediation.PlanID, optionIndex int,
 		return preview
 	}
 
+	preview.Status = StatusGenerated
+	preview.Reason = ""
+	preview.Diff = diff
+	return preview
+}
+
+func buildGitHubActionPinPreview(root string, preview Preview, optionAction remediation.Action, change remediation.Change) Preview {
+	if change.Action != remediation.PinGitHubActionToSHA || optionAction != remediation.PinGitHubActionToSHA {
+		preview.Reason = "patch previews support only PinGitHubActionToSHA"
+		return preview
+	}
+	patched, source, reason := buildGitHubActionPatchedContent(root, change)
+	if reason != "" {
+		preview.Reason = reason
+		if source.relPath != "" {
+			preview.File = source.relPath
+		}
+		return preview
+	}
+	preview.File = source.relPath
+	diff := unifiedDiffWithContext(source.relPath, patched.original, patched.content, 0)
+	if diff == "" {
+		preview.Reason = "patch preview produced no changes"
+		return preview
+	}
 	preview.Status = StatusGenerated
 	preview.Reason = ""
 	preview.Diff = diff
@@ -321,6 +349,14 @@ func buildWriteCandidate(root string, sourceCache map[string]*sourceState, planI
 		ChangeIndex:  changeIndex,
 		Status:       StatusUnsupported,
 		Summary:      change.Summary,
+	}
+	if change.Action == remediation.PinGitHubActionToSHA || optionAction == remediation.PinGitHubActionToSHA {
+		preview = buildGitHubActionPinPreview(root, preview, optionAction, change)
+		source, reason := resolveSourceReference(root, change.SourceReference)
+		if reason == "" {
+			return writeCandidate{preview: preview, source: source, change: change}
+		}
+		return writeCandidate{preview: preview, change: change}
 	}
 	if change.Action != remediation.NarrowBindingSubject || optionAction != remediation.NarrowBindingSubject {
 		preview.Reason = "patch previews support only NarrowBindingSubject"
@@ -422,6 +458,15 @@ func prepareSourceOutput(outputRoot, displayRoot string, candidates []writeCandi
 		return a.File < b.File
 	})
 
+	if candidates[0].change.Action == remediation.PinGitHubActionToSHA {
+		return prepareGitHubActionSourceOutput(outputRoot, displayRoot, candidates)
+	}
+	for _, candidate := range candidates {
+		if candidate.change.Action != remediation.NarrowBindingSubject {
+			return preparedOutput{}, false, "multiple generated patches for this source file conflict", nil
+		}
+	}
+
 	state := candidates[0].state
 	if state == nil {
 		return preparedOutput{}, false, "source file could not be prepared for writing", nil
@@ -484,6 +529,127 @@ func prepareSourceOutput(outputRoot, displayRoot string, candidates []writeCandi
 		fullPath:  fullPath,
 		content:   []byte(ensureTrailingNewline(patched)),
 	}, true, "", nil
+}
+
+type githubActionPatchedContent struct {
+	original string
+	content  string
+}
+
+func buildGitHubActionPatchedContent(root string, change remediation.Change) (githubActionPatchedContent, resolvedSource, string) {
+	if !change.PatchSupported {
+		if change.Reason != "" {
+			return githubActionPatchedContent{}, resolvedSource{}, change.Reason
+		}
+		return githubActionPatchedContent{}, resolvedSource{}, "patching is not supported for this advisory remediation"
+	}
+	if change.ActionRef == "" || change.ReplacementRef == "" || change.ReplacementSHA == "" {
+		return githubActionPatchedContent{}, resolvedSource{}, "replacement metadata is incomplete"
+	}
+	if change.SourceLine <= 0 || change.SourceColumn <= 0 {
+		return githubActionPatchedContent{}, resolvedSource{}, "uses source location is not precise enough to patch"
+	}
+	source, reason := resolveSourceReference(root, change.SourceReference)
+	if reason != "" {
+		return githubActionPatchedContent{}, resolvedSource{}, reason
+	}
+	originalBytes, err := os.ReadFile(source.fullPath)
+	if err != nil {
+		return githubActionPatchedContent{}, source, "source file cannot be read"
+	}
+	original := normalizeLineEndings(string(originalBytes))
+	patched, reason := replaceGitHubActionRef(original, change)
+	if reason != "" {
+		return githubActionPatchedContent{}, source, reason
+	}
+	return githubActionPatchedContent{original: original, content: patched}, source, ""
+}
+
+func prepareGitHubActionSourceOutput(outputRoot, displayRoot string, candidates []writeCandidate) (preparedOutput, bool, string, error) {
+	for _, candidate := range candidates {
+		if candidate.change.Action != remediation.PinGitHubActionToSHA {
+			return preparedOutput{}, false, "multiple generated patches for this source file conflict", nil
+		}
+	}
+	source := candidates[0].source
+	originalBytes, err := os.ReadFile(source.fullPath)
+	if err != nil {
+		return preparedOutput{}, false, "source file cannot be read", nil
+	}
+	working := normalizeLineEndings(string(originalBytes))
+	ordered := append([]writeCandidate(nil), candidates...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		a, b := ordered[i].change, ordered[j].change
+		if a.SourceLine != b.SourceLine {
+			return a.SourceLine > b.SourceLine
+		}
+		if a.SourceColumn != b.SourceColumn {
+			return a.SourceColumn > b.SourceColumn
+		}
+		return githubActionWriteChangeIdentity(ordered[i]) < githubActionWriteChangeIdentity(ordered[j])
+	})
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range ordered {
+		identity := githubActionWriteChangeIdentity(candidate)
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		patched, reason := replaceGitHubActionRef(working, candidate.change)
+		if reason != "" {
+			return preparedOutput{}, false, "multiple generated patches for this source file conflict", nil
+		}
+		working = patched
+	}
+	if working == normalizeLineEndings(string(originalBytes)) {
+		return preparedOutput{}, false, "patch output produced no changes", nil
+	}
+	fullPath := filepath.Join(outputRoot, filepath.FromSlash(source.relPath))
+	if !pathWithinRoot(outputRoot, fullPath) {
+		return preparedOutput{}, false, "", fmt.Errorf("patch output path escapes output directory")
+	}
+	return preparedOutput{
+		sourceRel: source.relPath,
+		display:   filepath.ToSlash(filepath.Join(displayRoot, filepath.FromSlash(source.relPath))),
+		fullPath:  fullPath,
+		content:   []byte(ensureTrailingNewline(working)),
+	}, true, "", nil
+}
+
+func githubActionWriteChangeIdentity(candidate writeCandidate) string {
+	return strings.Join([]string{
+		candidate.source.relPath,
+		strconv.Itoa(candidate.change.SourceLine),
+		strconv.Itoa(candidate.change.SourceColumn),
+		candidate.change.ActionRef,
+		candidate.change.ReplacementRef,
+	}, "\x00")
+}
+
+func replaceGitHubActionRef(content string, change remediation.Change) (string, string) {
+	lines := splitLines(ensureTrailingNewline(content))
+	lineIndex := change.SourceLine - 1
+	if lineIndex < 0 || lineIndex >= len(lines) {
+		return "", "uses source location is outside the file"
+	}
+	line := strings.TrimSuffix(lines[lineIndex], "\n")
+	columnIndex := change.SourceColumn - 1
+	if columnIndex < 0 || columnIndex > len(line) {
+		return "", "uses source location is outside the line"
+	}
+	if !strings.HasPrefix(line[columnIndex:], change.ActionRef) {
+		return "", "uses source location does not match the action ref"
+	}
+	if _, ref, ok := strings.Cut(change.ActionRef, "@"); !ok || ref == "" {
+		return "", "action ref has no explicit ref to replace"
+	}
+	lineEnd := columnIndex + len(change.ActionRef)
+	if strings.Contains(line[lineEnd:], "#") {
+		return "", "uses value has a same-line comment"
+	}
+	patchedLine := line[:columnIndex] + change.ReplacementRef + line[lineEnd:]
+	lines[lineIndex] = patchedLine + "\n"
+	return strings.Join(lines, ""), ""
 }
 
 func writeChangeIdentity(candidate writeCandidate) string {
@@ -972,6 +1138,10 @@ func replaceDocument(content string, r documentRange, encoded string) string {
 }
 
 func unifiedDiff(path, oldContent, newContent string) string {
+	return unifiedDiffWithContext(path, oldContent, newContent, 3)
+}
+
+func unifiedDiffWithContext(path, oldContent, newContent string, context int) string {
 	oldLines := splitLines(ensureTrailingNewline(oldContent))
 	newLines := splitLines(ensureTrailingNewline(newContent))
 	ops := diffLines(oldLines, newLines)
@@ -989,7 +1159,7 @@ func unifiedDiff(path, oldContent, newContent string) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "--- %s\n", filepath.ToSlash(path))
 	fmt.Fprintf(&out, "+++ %s\n", filepath.ToSlash(path))
-	writeHunks(&out, ops)
+	writeHunksWithContext(&out, ops, context)
 	return ensureTrailingNewline(out.String())
 }
 
@@ -1050,7 +1220,13 @@ func diffLines(oldLines, newLines []string) []diffOp {
 }
 
 func writeHunks(out *strings.Builder, ops []diffOp) {
-	const context = 3
+	writeHunksWithContext(out, ops, 3)
+}
+
+func writeHunksWithContext(out *strings.Builder, ops []diffOp, context int) {
+	if context < 0 {
+		context = 0
+	}
 	oldLine, newLine := 1, 1
 	oldBefore := make([]int, len(ops)+1)
 	newBefore := make([]int, len(ops)+1)

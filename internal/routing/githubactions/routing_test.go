@@ -108,6 +108,88 @@ func TestAddRoutesKeepsRepeatedActionUsesDistinctByStep(t *testing.T) {
 	}
 }
 
+func TestAddRoutesPreservesGitHubActionUsesCoordinatesAndPatchSafety(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflowForRoutingTest(t, root, "workflow.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        env:
+          TOKEN: FAKE_ROUTING_GHA_COORD_SECRET_DO_NOT_RETAIN
+`)
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	var actionUse *graph.GitHubActionUse
+	for _, edge := range g.Edges() {
+		if edge.Kind == graph.UsesAction && edge.Metadata != nil {
+			actionUse = edge.Metadata.GitHubActionUse
+		}
+	}
+	if actionUse == nil {
+		t.Fatal("GitHubActionUse metadata missing")
+	}
+	if actionUse.UsesLine != 4 || actionUse.UsesColumn != 15 {
+		t.Fatalf("uses coordinates = %d/%d, want 4/15", actionUse.UsesLine, actionUse.UsesColumn)
+	}
+	if actionUse.PatchUnsupportedReason == "" {
+		t.Fatalf("patch unsupported reason is empty")
+	}
+	data, err := json.Marshal(g)
+	if err != nil {
+		t.Fatalf("marshal graph: %v", err)
+	}
+	if strings.Contains(string(data), "FAKE_ROUTING_GHA_COORD_SECRET_DO_NOT_RETAIN") || strings.Contains(string(data), "TOKEN") {
+		t.Fatalf("graph output contains secret-like workflow value: %s", data)
+	}
+}
+
+func TestAddRoutesPreservesQuotedUsesPatchColumnAndHarmlessContext(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflowForRoutingTest(t, root, "workflow.yml", `jobs:
+  test:
+    env:
+      SAFE_ENV: local
+    steps:
+      - run: go test ./...
+      - uses: "actions/setup-go@v5"
+        with:
+          go-version: '1.22'
+`)
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	g := graph.New()
+
+	if err := AddRoutes(g, resources); err != nil {
+		t.Fatalf("add routes: %v", err)
+	}
+
+	var actionUse *graph.GitHubActionUse
+	for _, edge := range g.Edges() {
+		if edge.Kind == graph.UsesAction && edge.Metadata != nil {
+			actionUse = edge.Metadata.GitHubActionUse
+		}
+	}
+	if actionUse == nil {
+		t.Fatal("GitHubActionUse metadata missing")
+	}
+	if actionUse.Uses != "actions/setup-go@v5" || actionUse.UsesLine != 7 || actionUse.UsesColumn != 16 {
+		t.Fatalf("action metadata = %#v, want quoted setup-go coordinates 7/16", actionUse)
+	}
+	if actionUse.PatchUnsupportedReason != "" {
+		t.Fatalf("patch unsupported reason = %q, want empty", actionUse.PatchUnsupportedReason)
+	}
+}
+
 func TestAddRoutesGraphJSONExcludesIgnoredWorkflowValues(t *testing.T) {
 	root := t.TempDir()
 	writeWorkflowForRoutingTest(t, root, "workflow.yml", `name: Secret safety

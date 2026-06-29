@@ -31,12 +31,14 @@ jobs:
 		Jobs: []Job{{
 			ID: "test",
 			Steps: []Step{{
-				Index: 0,
-				Name:  "Checkout",
-				Uses:  "actions/checkout@v4",
-				Owner: "actions",
-				Repo:  "checkout",
-				Ref:   "v4",
+				Index:      0,
+				Name:       "Checkout",
+				Uses:       "actions/checkout@v4",
+				UsesLine:   7,
+				UsesColumn: 15,
+				Owner:      "actions",
+				Repo:       "checkout",
+				Ref:        "v4",
 			}},
 		}},
 	}}}
@@ -600,6 +602,217 @@ func TestParseDirDoesNotRetainExpressionOnlyUsesValues(t *testing.T) {
 		t.Fatalf("marshal resources: %v", err)
 	}
 	for _, forbidden := range []string{"secrets.ACTION_REF", "matrix.action", "matrix.ref", "${{"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("parser output contains %q: %s", forbidden, data)
+		}
+	}
+}
+
+func TestParseDirRecordsUsesCoordinatesAndPatchSafetyReason(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "unsafe-context.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4 # comment disables patching
+        env:
+          TOKEN: FAKE_GHA_COORD_SECRET_DO_NOT_RETAIN
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	workflow := resources.Workflows[0]
+	step := workflow.Jobs[0].Steps[0]
+	if step.UsesLine != 4 || step.UsesColumn != 15 {
+		t.Fatalf("uses coordinates = %d/%d, want 4/15", step.UsesLine, step.UsesColumn)
+	}
+	if step.PatchUnsupportedReason == "" || workflow.PatchUnsupportedReason == "" {
+		t.Fatalf("patch unsupported reasons = step %q workflow %q, want both set", step.PatchUnsupportedReason, workflow.PatchUnsupportedReason)
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	if strings.Contains(string(data), "FAKE_GHA_COORD_SECRET_DO_NOT_RETAIN") || strings.Contains(string(data), "TOKEN") {
+		t.Fatalf("parser output contains secret-like workflow value: %s", data)
+	}
+}
+
+func TestParseDirRecordsQuotedUsesValueCoordinates(t *testing.T) {
+	tests := []struct {
+		name       string
+		line       string
+		wantColumn int
+	}{
+		{
+			name:       "double quoted",
+			line:       `      - uses: "actions/checkout@v4"`,
+			wantColumn: 16,
+		},
+		{
+			name:       "single quoted",
+			line:       `      - uses: 'actions/checkout@v4'`,
+			wantColumn: 16,
+		},
+		{
+			name:       "double quoted with whitespace",
+			line:       `      - uses: " actions/checkout@v4 "`,
+			wantColumn: 17,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeWorkflow(t, root, "quoted.yml", "jobs:\n  test:\n    steps:\n"+tt.line+"\n")
+
+			resources, err := ParseDir(root)
+			if err != nil {
+				t.Fatalf("parse dir: %v", err)
+			}
+
+			step := resources.Workflows[0].Jobs[0].Steps[0]
+			if step.UsesLine != 4 || step.UsesColumn != tt.wantColumn {
+				t.Fatalf("uses coordinates = %d/%d, want 4/%d", step.UsesLine, step.UsesColumn, tt.wantColumn)
+			}
+			if step.PatchUnsupportedReason != "" || resources.Workflows[0].PatchUnsupportedReason != "" {
+				t.Fatalf("patch unsupported reasons = step %q workflow %q, want empty", step.PatchUnsupportedReason, resources.Workflows[0].PatchUnsupportedReason)
+			}
+		})
+	}
+}
+
+func TestParseDirAllowsIDTokenPermissionForPatching(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "oidc.yml", `permissions:
+  id-token: write
+  contents: read
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	workflow := resources.Workflows[0]
+	if workflow.PatchUnsupportedReason != "" {
+		t.Fatalf("workflow patch unsupported reason = %q, want empty", workflow.PatchUnsupportedReason)
+	}
+	if got := workflow.Jobs[0].Steps[0].PatchUnsupportedReason; got != "" {
+		t.Fatalf("step patch unsupported reason = %q, want empty", got)
+	}
+}
+
+func TestParseDirMarksUsesSharingLineWithRunUnsupported(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "flow.yml", `jobs:
+  test:
+    steps: [{run: echo FAKE_GHA_SAME_LINE_RUN_SECRET_DO_NOT_RETAIN, uses: actions/checkout@v4}]
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	step := resources.Workflows[0].Jobs[0].Steps[0]
+	if step.PatchUnsupportedReason == "" {
+		t.Fatalf("step patch unsupported reason is empty, want same-line unsupported reason")
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	if strings.Contains(string(data), "FAKE_GHA_SAME_LINE_RUN_SECRET_DO_NOT_RETAIN") {
+		t.Fatalf("parser output contains same-line run content: %s", data)
+	}
+}
+
+func TestParseDirMarksBlockStyleUsesUnsupportedForPatching(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "block.yml", `jobs:
+  test:
+    steps:
+      - uses: >
+          actions/checkout@v4
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	step := resources.Workflows[0].Jobs[0].Steps[0]
+	if step.Uses != "actions/checkout@v4" {
+		t.Fatalf("uses = %q, want canonical action ref", step.Uses)
+	}
+	if step.PatchUnsupportedReason == "" {
+		t.Fatalf("step patch unsupported reason is empty, want block-style unsupported reason")
+	}
+}
+
+func TestParseDirAllowsHarmlessWorkflowContextForPatching(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "harmless-context.yml", `jobs:
+  test:
+    env:
+      SAFE_ENV: local
+    steps:
+      - run: go test ./...
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+        env:
+          CACHE_NAME: gomod
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	workflow := resources.Workflows[0]
+	if workflow.PatchUnsupportedReason != "" {
+		t.Fatalf("workflow patch unsupported reason = %q, want empty", workflow.PatchUnsupportedReason)
+	}
+	step := workflow.Jobs[0].Steps[0]
+	if step.Uses != "actions/setup-go@v5" || step.PatchUnsupportedReason != "" {
+		t.Fatalf("step = %#v, want setup-go with no patch unsupported reason", step)
+	}
+}
+
+func TestParseDirTreatsHyphenatedSensitiveKeysAsUnsafe(t *testing.T) {
+	root := t.TempDir()
+	const accessKey = "AKIAIOSFODNN7EXAMPLE"
+	const privateKey = "opaque-key-material"
+	writeWorkflow(t, root, "hyphenated-keys.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          access-key: AKIAIOSFODNN7EXAMPLE
+          private-key: opaque-key-material
+`)
+
+	resources, err := ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+
+	workflow := resources.Workflows[0]
+	if workflow.PatchUnsupportedReason == "" {
+		t.Fatalf("workflow patch unsupported reason is empty, want secret-like context")
+	}
+	data, err := json.Marshal(resources)
+	if err != nil {
+		t.Fatalf("marshal resources: %v", err)
+	}
+	for _, forbidden := range []string{accessKey, privateKey, "access-key", "private-key"} {
 		if strings.Contains(string(data), forbidden) {
 			t.Fatalf("parser output contains %q: %s", forbidden, data)
 		}

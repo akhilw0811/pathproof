@@ -10,7 +10,9 @@ import (
 
 	"pathproof/internal/analysis"
 	"pathproof/internal/graph"
+	parsergithubactions "pathproof/internal/parser/githubactions"
 	parserkubernetes "pathproof/internal/parser/kubernetes"
+	routinggithubactions "pathproof/internal/routing/githubactions"
 	routingkubernetes "pathproof/internal/routing/kubernetes"
 )
 
@@ -47,6 +49,153 @@ func TestBuildRoleBindingGetSecretsProducesCompleteResourceAndVerbOptions(t *tes
 	}
 	if _, ok := findOption(plan, NarrowBindingSubject); ok {
 		t.Fatalf("single-subject binding produced NarrowBindingSubject: %#v", plan.Options)
+	}
+}
+
+func TestLoadGitHubActionPinsValidatesLocalJSONMapping(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{
+			name:    "lowercase sha",
+			content: `{"actions/checkout@v4":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		},
+		{
+			name:    "uppercase sha",
+			content: `{"actions/checkout@v4":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`,
+		},
+		{
+			name:    "short sha",
+			content: `{"actions/checkout@v4":"aaaaaaaa"}`,
+			wantErr: "invalid commit SHA",
+		},
+		{
+			name:    "non hex sha",
+			content: `{"actions/checkout@v4":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}`,
+			wantErr: "invalid commit SHA",
+		},
+		{
+			name:    "malformed json",
+			content: `{"actions/checkout@v4":"FAKE_MAPPING_SECRET_DO_NOT_RETAIN"`,
+			wantErr: "not valid JSON",
+		},
+		{
+			name:    "null",
+			content: `null`,
+			wantErr: "JSON object",
+		},
+		{
+			name:    "array",
+			content: `[]`,
+			wantErr: "JSON object",
+		},
+		{
+			name:    "string",
+			content: `"bad"`,
+			wantErr: "JSON object",
+		},
+		{
+			name:    "number",
+			content: `42`,
+			wantErr: "JSON object",
+		},
+		{
+			name:    "boolean",
+			content: `true`,
+			wantErr: "JSON object",
+		},
+		{
+			name:    "invalid key",
+			content: `{"${{ secrets.ACTION_REF }}":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+			wantErr: "invalid action ref key",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pins.json")
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatalf("write pins: %v", err)
+			}
+
+			pins, err := LoadGitHubActionPins(path)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatal("LoadGitHubActionPins error = nil, want error")
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %q, want %q", err.Error(), tt.wantErr)
+				}
+				if strings.Contains(err.Error(), "FAKE_MAPPING_SECRET_DO_NOT_RETAIN") || strings.Contains(err.Error(), tt.content) {
+					t.Fatalf("error leaks mapping content: %q", err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadGitHubActionPins: %v", err)
+			}
+			if got, ok := pins.SHAFor("actions/checkout@v4"); !ok || got == "" {
+				t.Fatalf("pin lookup = %q/%t, want SHA", got, ok)
+			}
+		})
+	}
+}
+
+func TestBuildGitHubActionsUnpinnedActionAdvisoryOnlyWithoutMapping(t *testing.T) {
+	g, findings := scanWorkflowForRemediation(t, `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	finding := onlyFindingByRuleForRemediation(t, findings, analysis.RuleGitHubActionsUnpinnedAction)
+
+	plans := mustBuild(t, g, findings)
+
+	if len(plans) != 1 {
+		t.Fatalf("plans = %#v, want one PP-GHA-001 plan", plans)
+	}
+	plan := plans[0]
+	if plan.FindingID != finding.ID || plan.RuleID != analysis.RuleGitHubActionsUnpinnedAction {
+		t.Fatalf("plan identity = %#v, finding = %#v", plan, finding)
+	}
+	option := optionByAction(t, plan, PinGitHubActionToSHA)
+	change := option.Changes[0]
+	if !change.Advisory || change.PatchSupported || change.ActionRef != "actions/checkout@v4" || change.ReplacementSHA != "" {
+		t.Fatalf("change = %#v, want advisory-only action pinning", change)
+	}
+	if strings.Contains(change.SourceReference, filepath.Dir(os.TempDir())) || strings.Contains(change.Reason, "FAKE") {
+		t.Fatalf("change contains unsafe data: %#v", change)
+	}
+}
+
+func TestBuildGitHubActionsUnpinnedActionPatchSupportedWithMapping(t *testing.T) {
+	g, findings := scanWorkflowForRemediation(t, `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	finding := onlyFindingByRuleForRemediation(t, findings, analysis.RuleGitHubActionsUnpinnedAction)
+	pins := GitHubActionPins{"actions/checkout@v4": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+
+	plans := mustBuildWithPins(t, g, findings, pins)
+	repeated := mustBuildWithPins(t, g, findings, pins)
+
+	if !reflect.DeepEqual(plans, repeated) {
+		t.Fatalf("plans are not deterministic:\nfirst=%#v\nsecond=%#v", plans, repeated)
+	}
+	if len(plans) != 1 || plans[0].FindingID != finding.ID {
+		t.Fatalf("plans = %#v, want one plan for finding %s", plans, finding.ID)
+	}
+	change := optionByAction(t, plans[0], PinGitHubActionToSHA).Changes[0]
+	if !change.Advisory || !change.PatchSupported || change.ReplacementSHA != pins["actions/checkout@v4"] || change.ReplacementRef != "actions/checkout@"+pins["actions/checkout@v4"] {
+		t.Fatalf("change = %#v, want patch-supported SHA replacement", change)
+	}
+	if change.SourceLine <= 0 || change.SourceColumn <= 0 {
+		t.Fatalf("change source coordinates = %d/%d, want positive", change.SourceLine, change.SourceColumn)
+	}
+	if onlyFindingByRuleForRemediation(t, findings, analysis.RuleGitHubActionsUnpinnedAction).ID != finding.ID {
+		t.Fatalf("finding ID changed after remediation planning")
 	}
 }
 
@@ -813,6 +962,15 @@ func mustBuild(t *testing.T, g *graph.Graph, findings []analysis.Finding) []Plan
 	return plans
 }
 
+func mustBuildWithPins(t *testing.T, g *graph.Graph, findings []analysis.Finding, pins GitHubActionPins) []Plan {
+	t.Helper()
+	plans, err := BuildWithGitHubActionPins(g, findings, pins)
+	if err != nil {
+		t.Fatalf("BuildWithGitHubActionPins: %v", err)
+	}
+	return plans
+}
+
 func mustSinglePlan(t *testing.T, g *graph.Graph, findings []analysis.Finding) Plan {
 	t.Helper()
 	plans := mustBuild(t, g, findings)
@@ -820,6 +978,41 @@ func mustSinglePlan(t *testing.T, g *graph.Graph, findings []analysis.Finding) P
 		t.Fatalf("plan count = %d, want 1: %#v", len(plans), plans)
 	}
 	return plans[0]
+}
+
+func scanWorkflowForRemediation(t *testing.T, content string) (*graph.Graph, []analysis.Finding) {
+	t.Helper()
+	root := t.TempDir()
+	workflowDir := filepath.Join(root, ".github", "workflows")
+	if err := os.MkdirAll(workflowDir, 0o700); err != nil {
+		t.Fatalf("mkdir workflow dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workflowDir, "build.yml"), []byte(content), 0o600); err != nil {
+		t.Fatalf("write workflow: %v", err)
+	}
+	resources, err := parsergithubactions.ParseDir(root)
+	if err != nil {
+		t.Fatalf("parse workflow: %v", err)
+	}
+	g := graph.New()
+	if err := routinggithubactions.AddRoutes(g, resources); err != nil {
+		t.Fatalf("route workflow: %v", err)
+	}
+	return g, analysis.Analyze(g)
+}
+
+func onlyFindingByRuleForRemediation(t *testing.T, findings []analysis.Finding, ruleID analysis.RuleID) analysis.Finding {
+	t.Helper()
+	var matches []analysis.Finding
+	for _, finding := range findings {
+		if finding.RuleID == ruleID {
+			matches = append(matches, finding)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("finding count for %s = %d, want 1: %#v", ruleID, len(matches), findings)
+	}
+	return matches[0]
 }
 
 func optionByAction(t *testing.T, plan Plan, action Action) Option {

@@ -178,12 +178,24 @@ func actionUseMetadata(workflow parsergithubactions.Workflow, job parsergithubac
 		StepIndex:                 step.Index,
 		StepName:                  step.Name,
 		Uses:                      step.Uses,
+		UsesLine:                  step.UsesLine,
+		UsesColumn:                step.UsesColumn,
 		Owner:                     step.Owner,
 		Repo:                      step.Repo,
 		Path:                      step.Path,
 		Ref:                       step.Ref,
 		CheckoutHeadSelectors:     checkoutHeadSelectors(step.CheckoutHeadSelectors),
+		PatchUnsupportedReason:    firstNonEmpty(step.PatchUnsupportedReason, workflow.PatchUnsupportedReason),
 	}, true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func permissionGrants(grants []parsergithubactions.PermissionGrant) []graph.GitHubActionsPermissionGrant {
