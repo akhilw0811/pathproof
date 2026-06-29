@@ -551,6 +551,10 @@ actually issued a Secret read request.
 ## Findings
 
 Findings are produced by read-only analysis over the in-memory graph.
+Finding `rule_id`, `title`, and `severity` values for implemented rules come
+from the static in-code rule registry. The registry centralizes metadata only;
+the graph schema, finding identity inputs, path order, and evidence schema are
+unchanged.
 Implemented rules are:
 
 - Rule ID: `PP-K8S-001`

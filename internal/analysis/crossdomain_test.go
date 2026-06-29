@@ -21,8 +21,8 @@ permissions: write-all
 `, []string{"deploy"}, "owner/repo"))
 
 	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole)
-	if finding.Title != crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle {
-		t.Fatalf("title = %q, want %q", finding.Title, crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle)
+	if finding.Title != ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole) {
+		t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole))
 	}
 	if finding.Severity != SeverityHigh {
 		t.Fatalf("severity = %q, want High", finding.Severity)
@@ -278,8 +278,8 @@ permissions: write-all
 `, terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*"), "owner/repo"))
 
 	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
-	if finding.Title != crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle {
-		t.Fatalf("title = %q, want %q", finding.Title, crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle)
+	if finding.Title != ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole) {
+		t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole))
 	}
 	if finding.Severity != SeverityHigh {
 		t.Fatalf("severity = %q, want High", finding.Severity)
@@ -587,8 +587,8 @@ permissions: write-all
 `, terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-artifacts", "read", "s3:GetObject", "arn:aws:s3:::prod-artifacts/*"), "owner/repo"))
 
 	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
-	if finding.Title != crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle {
-		t.Fatalf("title = %q, want %q", finding.Title, crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle)
+	if finding.Title != ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket) {
+		t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket))
 	}
 	if finding.Severity != SeverityHigh {
 		t.Fatalf("severity = %q, want High", finding.Severity)
@@ -740,8 +740,8 @@ permissions: write-all
 `, terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"), "owner/repo"))
 
 	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
-	if finding.Title != crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle {
-		t.Fatalf("title = %q, want %q", finding.Title, crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle)
+	if finding.Title != ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket) {
+		t.Fatalf("title = %q, want %q", finding.Title, ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket))
 	}
 	if finding.Severity != SeverityHigh {
 		t.Fatalf("severity = %q, want High", finding.Severity)

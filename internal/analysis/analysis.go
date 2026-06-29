@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"pathproof/internal/graph"
+	"pathproof/internal/rules"
 )
 
 type FindingID string
@@ -16,28 +17,18 @@ type RuleID string
 type Severity string
 
 const (
-	RulePublicWorkloadCanReadSecret                                RuleID   = "PP-K8S-001"
-	RuleGitHubActionsUnpinnedAction                                RuleID   = "PP-GHA-001"
-	RuleGitHubActionsUnsafePullRequestTargetCheckout               RuleID   = "PP-GHA-002"
-	RuleGitHubActionsDangerousPermissions                          RuleID   = "PP-GHA-003"
-	RuleAWSIAMRoleAdministrativePermissions                        RuleID   = "PP-AWS-001"
-	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole              RuleID   = "PP-XDOMAIN-001"
-	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole         RuleID   = "PP-XDOMAIN-002"
-	RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket          RuleID   = "PP-XDOMAIN-003"
-	RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket RuleID   = "PP-XDOMAIN-004"
-	SeverityHigh                                                   Severity = "High"
-	SeverityMedium                                                 Severity = "Medium"
+	RulePublicWorkloadCanReadSecret                                RuleID   = RuleID(rules.RulePublicWorkloadCanReadSecret)
+	RuleGitHubActionsUnpinnedAction                                RuleID   = RuleID(rules.RuleGitHubActionsUnpinnedAction)
+	RuleGitHubActionsUnsafePullRequestTargetCheckout               RuleID   = RuleID(rules.RuleGitHubActionsUnsafePullRequestTargetCheckout)
+	RuleGitHubActionsDangerousPermissions                          RuleID   = RuleID(rules.RuleGitHubActionsDangerousPermissions)
+	RuleAWSIAMRoleAdministrativePermissions                        RuleID   = RuleID(rules.RuleAWSIAMRoleAdministrativePermissions)
+	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole              RuleID   = RuleID(rules.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole)
+	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole         RuleID   = RuleID(rules.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole)
+	RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket          RuleID   = RuleID(rules.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket)
+	RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket RuleID   = RuleID(rules.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	SeverityHigh                                                   Severity = Severity(rules.SeverityHigh)
+	SeverityMedium                                                 Severity = Severity(rules.SeverityMedium)
 )
-
-const publicWorkloadCanReadSecretTitle = "Public workload can read Kubernetes Secret"
-const githubActionsUnpinnedActionTitle = "GitHub Actions workflow uses an action that is not pinned to a full commit SHA"
-const githubActionsUnsafePullRequestTargetCheckoutTitle = "pull_request_target workflow checks out untrusted pull request head code"
-const githubActionsDangerousPermissionsTitle = "pull_request_target workflow grants dangerous token permissions"
-const awsIAMRoleAdministrativePermissionsTitle = "AWS IAM role grants administrative permissions"
-const crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle = "Risky GitHub Actions workflow can assume AWS IAM role"
-const crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle = "Risky GitHub Actions workflow can assume administrative AWS IAM role"
-const crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle = "Risky GitHub Actions workflow can access AWS S3 bucket"
-const crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle = "Risky GitHub Actions workflow can access sensitive AWS S3 bucket"
 
 type Finding struct {
 	ID                FindingID                  `json:"id"`
@@ -221,6 +212,14 @@ type githubActionsRiskSignal struct {
 	summary      string
 }
 
+func ruleTitle(ruleID RuleID) string {
+	return rules.MustLookup(string(ruleID)).Title
+}
+
+func ruleSeverity(ruleID RuleID) Severity {
+	return Severity(rules.MustLookup(string(ruleID)).Severity)
+}
+
 func Analyze(g *graph.Graph) []Finding {
 	findings := make([]Finding, 0)
 	if g == nil {
@@ -377,8 +376,8 @@ func newAWSIAMRoleAdministrativePermissionFindings(g *graph.Graph, grantsPermiss
 		findings = append(findings, Finding{
 			ID:               id,
 			RuleID:           RuleAWSIAMRoleAdministrativePermissions,
-			Title:            awsIAMRoleAdministrativePermissionsTitle,
-			Severity:         SeverityHigh,
+			Title:            ruleTitle(RuleAWSIAMRoleAdministrativePermissions),
+			Severity:         ruleSeverity(RuleAWSIAMRoleAdministrativePermissions),
 			NodeIDs:          []graph.NodeID{role.ID, permission.ID},
 			EdgeIDs:          []graph.EdgeID{grants.ID},
 			Summary:          "AWS IAM role " + role.Name + " grants administrative permissions (" + metadata.AdminReason + ").",
@@ -436,8 +435,8 @@ func newGitHubActionsDangerousWorkflowPermissionFindings(workflow graph.Node) []
 		findings = append(findings, Finding{
 			ID:               id,
 			RuleID:           RuleGitHubActionsDangerousPermissions,
-			Title:            githubActionsDangerousPermissionsTitle,
-			Severity:         SeverityHigh,
+			Title:            ruleTitle(RuleGitHubActionsDangerousPermissions),
+			Severity:         ruleSeverity(RuleGitHubActionsDangerousPermissions),
 			NodeIDs:          []graph.NodeID{workflow.ID},
 			EdgeIDs:          nil,
 			Summary:          "GitHub Actions workflow " + workflowDisplay(workflowMetadata.WorkflowName, workflowMetadata.WorkflowFile) + " grants " + githubActionsPermissionGrantSummary(grant) + " at workflow scope under pull_request_target.",
@@ -470,8 +469,8 @@ func newGitHubActionsDangerousJobPermissionFindings(workflow, job graph.Node, de
 		findings = append(findings, Finding{
 			ID:               id,
 			RuleID:           RuleGitHubActionsDangerousPermissions,
-			Title:            githubActionsDangerousPermissionsTitle,
-			Severity:         SeverityHigh,
+			Title:            ruleTitle(RuleGitHubActionsDangerousPermissions),
+			Severity:         ruleSeverity(RuleGitHubActionsDangerousPermissions),
 			NodeIDs:          []graph.NodeID{workflow.ID, job.ID},
 			EdgeIDs:          []graph.EdgeID{definesJob.ID},
 			Summary:          "GitHub Actions workflow " + workflowDisplay(jobMetadata.WorkflowName, jobMetadata.WorkflowFile) + " job " + jobMetadata.JobID + " grants " + githubActionsPermissionGrantSummary(grant) + " under pull_request_target.",
@@ -598,8 +597,8 @@ func newGitHubActionsUnpinnedActionFinding(workflow, job, action graph.Node, def
 	return Finding{
 		ID:               id,
 		RuleID:           RuleGitHubActionsUnpinnedAction,
-		Title:            githubActionsUnpinnedActionTitle,
-		Severity:         SeverityMedium,
+		Title:            ruleTitle(RuleGitHubActionsUnpinnedAction),
+		Severity:         ruleSeverity(RuleGitHubActionsUnpinnedAction),
 		NodeIDs:          append([]graph.NodeID(nil), nodeIDs...),
 		EdgeIDs:          append([]graph.EdgeID(nil), edgeIDs...),
 		Summary:          "GitHub Actions workflow " + actionUse.WorkflowFile + " job " + actionUse.JobID + " step " + stepIndexString(actionUse.StepIndex) + " uses " + actionUse.Uses + ", which is not pinned to a full commit SHA.",
@@ -648,8 +647,8 @@ func newGitHubActionsUnsafePullRequestTargetCheckoutFinding(workflow, job, actio
 	return Finding{
 		ID:               id,
 		RuleID:           RuleGitHubActionsUnsafePullRequestTargetCheckout,
-		Title:            githubActionsUnsafePullRequestTargetCheckoutTitle,
-		Severity:         SeverityHigh,
+		Title:            ruleTitle(RuleGitHubActionsUnsafePullRequestTargetCheckout),
+		Severity:         ruleSeverity(RuleGitHubActionsUnsafePullRequestTargetCheckout),
 		NodeIDs:          append([]graph.NodeID(nil), nodeIDs...),
 		EdgeIDs:          append([]graph.EdgeID(nil), edgeIDs...),
 		Summary:          "GitHub Actions workflow " + actionUse.WorkflowFile + " job " + actionUse.JobID + " step " + stepIndexString(actionUse.StepIndex) + " uses " + actionUse.Uses + " in pull_request_target with " + githubActionsSelectorSummary(actionUse.CheckoutHeadSelectors) + ".",
@@ -699,8 +698,8 @@ func newCrossDomainGitHubActionsAWSRoleFindings(g *graph.Graph, definesJob []gra
 		findings = append(findings, Finding{
 			ID:               id,
 			RuleID:           RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole,
-			Title:            crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle,
-			Severity:         SeverityHigh,
+			Title:            ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole),
+			Severity:         ruleSeverity(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole),
 			NodeIDs:          nodeIDs(nodes),
 			EdgeIDs:          edgeIDs(edges),
 			Summary:          crossDomainSummary(nodes, risk),
@@ -831,8 +830,8 @@ func newCrossDomainGitHubActionsAWSAdminRoleFindings(g *graph.Graph, definesJob 
 		findings = append(findings, Finding{
 			ID:               id,
 			RuleID:           RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole,
-			Title:            crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle,
-			Severity:         SeverityHigh,
+			Title:            ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole),
+			Severity:         ruleSeverity(RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole),
 			NodeIDs:          nodeIDs(nodes),
 			EdgeIDs:          edgeIDs(edges),
 			Summary:          crossDomainAdminSummary(nodes, risk, permissionMetadata),
@@ -957,8 +956,8 @@ func newCrossDomainGitHubActionsAWSS3BucketFindings(g *graph.Graph, definesJob [
 		findings = append(findings, Finding{
 			ID:               id,
 			RuleID:           RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket,
-			Title:            crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle,
-			Severity:         SeverityHigh,
+			Title:            ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket),
+			Severity:         ruleSeverity(RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket),
 			NodeIDs:          nodeIDs(nodes),
 			EdgeIDs:          edgeIDs(edges),
 			Summary:          crossDomainS3Summary(nodes, risk, accessMetadata),
@@ -1025,8 +1024,8 @@ func newCrossDomainGitHubActionsSensitiveAWSS3BucketFindings(g *graph.Graph, def
 		findings = append(findings, Finding{
 			ID:                id,
 			RuleID:            RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket,
-			Title:             crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle,
-			Severity:          SeverityHigh,
+			Title:             ruleTitle(RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket),
+			Severity:          ruleSeverity(RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket),
 			NodeIDs:           nodeIDs(nodes),
 			EdgeIDs:           edgeIDs(edges),
 			Summary:           crossDomainSensitiveS3Summary(nodes, risk, accessMetadata, sensitivity),
@@ -1648,8 +1647,8 @@ func newPublicWorkloadCanReadSecretFinding(endpoint, workload, serviceAccount, s
 	return Finding{
 		ID:               id,
 		RuleID:           RulePublicWorkloadCanReadSecret,
-		Title:            publicWorkloadCanReadSecretTitle,
-		Severity:         SeverityHigh,
+		Title:            ruleTitle(RulePublicWorkloadCanReadSecret),
+		Severity:         ruleSeverity(RulePublicWorkloadCanReadSecret),
 		NodeIDs:          append([]graph.NodeID(nil), nodeIDs...),
 		EdgeIDs:          append([]graph.EdgeID(nil), edgeIDs...),
 		Summary:          "Public endpoint " + endpoint.Name + " routes to workload " + workload.Name + ", which runs as service account " + serviceAccount.Name + " that can read Secret " + secret.Name + ".",

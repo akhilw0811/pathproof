@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"pathproof/internal/analysis"
+	"pathproof/internal/rules"
 )
 
 const sarifSchema = "https://json.schemastore.org/sarif-2.1.0.json"
@@ -102,18 +103,8 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 			{
 				Tool: sarifTool{
 					Driver: sarifDriver{
-						Name: "PathProof",
-						Rules: []sarifRule{
-							sarifPublicWorkloadCanReadSecretRule(),
-							sarifGitHubActionsUnpinnedActionRule(),
-							sarifGitHubActionsUnsafePullRequestTargetCheckoutRule(),
-							sarifGitHubActionsDangerousPermissionsRule(),
-							sarifAWSIAMRoleAdministrativePermissionsRule(),
-							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule(),
-							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleRule(),
-							sarifCrossDomainRiskyGitHubActionsCanAccessAWSS3BucketRule(),
-							sarifCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketRule(),
-						},
+						Name:  "PathProof",
+						Rules: newSARIFRules(),
 					},
 				},
 				Results: results,
@@ -122,129 +113,46 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 	}
 }
 
-func sarifPublicWorkloadCanReadSecretRule() sarifRule {
-	const title = "Public workload can read Kubernetes Secret"
-	return sarifRule{
-		ID:               string(analysis.RulePublicWorkloadCanReadSecret),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects a deterministic attack path: PublicEndpoint -> Workload -> ServiceAccount -> Secret."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "PathProof provides deterministic remediation plans for verified paths. Where applicable, NarrowBindingSubject patch support can remove the implicated ServiceAccount subject from a RoleBinding or ClusterRoleBinding."},
+func newSARIFRules() []sarifRule {
+	registered := rules.All()
+	out := make([]sarifRule, 0, len(registered))
+	for _, rule := range registered {
+		out = append(out, sarifRule{
+			ID:               rule.ID,
+			Name:             rule.Title,
+			ShortDescription: sarifMessage{Text: rule.Title},
+			FullDescription:  sarifMessage{Text: rule.Description},
+			DefaultConfiguration: sarifDefaultConfiguration{
+				Level: rule.SARIFLevel,
+			},
+			Help: sarifMessage{Text: sarifRuleHelp(rule.ID)},
+		})
 	}
+	return out
 }
 
-func sarifGitHubActionsUnpinnedActionRule() sarifRule {
-	const title = "GitHub Actions workflow uses an action that is not pinned to a full commit SHA"
-	return sarifRule{
-		ID:               string(analysis.RuleGitHubActionsUnpinnedAction),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects GitHub Actions uses: references that are not pinned to a 40-character commit SHA."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "warning",
-		},
-		Help: sarifMessage{Text: "Pin GitHub Actions uses: references to a full 40-character commit SHA. Local actions and docker:// actions are outside this rule."},
-	}
-}
-
-func sarifGitHubActionsUnsafePullRequestTargetCheckoutRule() sarifRule {
-	const title = "pull_request_target workflow checks out untrusted pull request head code"
-	return sarifRule{
-		ID:               string(analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects GitHub Actions pull_request_target workflows where actions/checkout is configured to check out pull request head code."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "Avoid checking out untrusted pull request head code in pull_request_target workflows. Use pull_request for untrusted code, or check out a trusted base ref before privileged operations."},
-	}
-}
-
-func sarifGitHubActionsDangerousPermissionsRule() sarifRule {
-	const title = "pull_request_target workflow grants dangerous token permissions"
-	return sarifRule{
-		ID:               string(analysis.RuleGitHubActionsDangerousPermissions),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects GitHub Actions pull_request_target workflows with explicit workflow-level or job-level dangerous token permission grants."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "Avoid granting write-like token permissions in pull_request_target workflows unless explicitly required. PathProof reports explicit workflow-level and job-level grants; exact GitHub permission inheritance and override modeling is future work."},
-	}
-}
-
-func sarifAWSIAMRoleAdministrativePermissionsRule() sarifRule {
-	const title = "AWS IAM role grants administrative permissions"
-	return sarifRule{
-		ID:               string(analysis.RuleAWSIAMRoleAdministrativePermissions),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects local Terraform AWS IAM role permissions that obviously grant administrative access."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "Review the static local Terraform role policy or AdministratorAccess attachment. PathProof does not call AWS APIs, execute Terraform, simulate IAM, or provide remediation for this rule."},
-	}
-}
-
-func sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule() sarifRule {
-	const title = "Risky GitHub Actions workflow can assume AWS IAM role"
-	return sarifRule{
-		ID:               string(analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects a deterministic local cross-domain path where a risky GitHub Actions workflow or job has OIDC capability that can assume a statically modeled AWS IAM role trust."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "Review the risky pull_request_target workflow condition and the AWS IAM role trust. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, or provide remediation for this rule."},
-	}
-}
-
-func sarifCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleRule() sarifRule {
-	const title = "Risky GitHub Actions workflow can assume administrative AWS IAM role"
-	return sarifRule{
-		ID:               string(analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects a deterministic local cross-domain path where a risky GitHub Actions workflow or job has OIDC capability that can assume a statically modeled AWS IAM role with administrative permissions."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "Review the risky pull_request_target workflow condition, AWS IAM role trust, and administrative permission. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, or provide remediation for this rule."},
-	}
-}
-
-func sarifCrossDomainRiskyGitHubActionsCanAccessAWSS3BucketRule() sarifRule {
-	const title = "Risky GitHub Actions workflow can access AWS S3 bucket"
-	return sarifRule{
-		ID:               string(analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects a deterministic local cross-domain path where a risky GitHub Actions workflow or job has OIDC capability that can assume a statically modeled AWS IAM role with explicit static S3 access to a modeled bucket."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "Review the risky pull_request_target workflow condition, AWS IAM role trust, and explicit S3 policy grant. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, parse S3 bucket policies, or provide remediation for this rule."},
-	}
-}
-
-func sarifCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketRule() sarifRule {
-	const title = "Risky GitHub Actions workflow can access sensitive AWS S3 bucket"
-	return sarifRule{
-		ID:               string(analysis.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket),
-		Name:             title,
-		ShortDescription: sarifMessage{Text: title},
-		FullDescription:  sarifMessage{Text: "Detects a deterministic local cross-domain path where a risky GitHub Actions workflow or job has OIDC capability that can assume a statically modeled AWS IAM role with explicit static S3 access to a modeled bucket classified sensitive by conservative local metadata."},
-		DefaultConfiguration: sarifDefaultConfiguration{
-			Level: "error",
-		},
-		Help: sarifMessage{Text: "Review the risky pull_request_target workflow condition, AWS IAM role trust, explicit S3 policy grant, and conservative S3 sensitivity reason. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, parse S3 bucket policies, perform data discovery, model KMS, or provide remediation for this rule."},
+func sarifRuleHelp(ruleID string) string {
+	switch ruleID {
+	case rules.RulePublicWorkloadCanReadSecret:
+		return "PathProof provides deterministic remediation plans for verified paths. Where applicable, NarrowBindingSubject patch support can remove the implicated ServiceAccount subject from a RoleBinding or ClusterRoleBinding."
+	case rules.RuleGitHubActionsUnpinnedAction:
+		return "Pin GitHub Actions uses: references to a full 40-character commit SHA. Local actions and docker:// actions are outside this rule."
+	case rules.RuleGitHubActionsUnsafePullRequestTargetCheckout:
+		return "Avoid checking out untrusted pull request head code in pull_request_target workflows. Use pull_request for untrusted code, or check out a trusted base ref before privileged operations."
+	case rules.RuleGitHubActionsDangerousPermissions:
+		return "Avoid granting write-like token permissions in pull_request_target workflows unless explicitly required. PathProof reports explicit workflow-level and job-level grants; exact GitHub permission inheritance and override modeling is future work."
+	case rules.RuleAWSIAMRoleAdministrativePermissions:
+		return "Review the static local Terraform role policy or AdministratorAccess attachment. PathProof does not call AWS APIs, execute Terraform, simulate IAM, or provide remediation for this rule."
+	case rules.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole:
+		return "Review the risky pull_request_target workflow condition and the AWS IAM role trust. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, or provide remediation for this rule."
+	case rules.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole:
+		return "Review the risky pull_request_target workflow condition, AWS IAM role trust, and administrative permission. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, or provide remediation for this rule."
+	case rules.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket:
+		return "Review the risky pull_request_target workflow condition, AWS IAM role trust, and explicit S3 policy grant. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, parse S3 bucket policies, or provide remediation for this rule."
+	case rules.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket:
+		return "Review the risky pull_request_target workflow condition, AWS IAM role trust, explicit S3 policy grant, and conservative S3 sensitivity reason. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, parse S3 bucket policies, perform data discovery, model KMS, or provide remediation for this rule."
+	default:
+		return ""
 	}
 }
 

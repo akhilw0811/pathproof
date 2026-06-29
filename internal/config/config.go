@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"pathproof/internal/analysis"
+	"pathproof/internal/rules"
 )
 
 type Config struct {
@@ -51,22 +52,11 @@ type rawSuppression struct {
 	Reason    string `json:"reason"`
 }
 
-var allRules = []analysis.RuleID{
-	analysis.RuleAWSIAMRoleAdministrativePermissions,
-	analysis.RuleGitHubActionsUnpinnedAction,
-	analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout,
-	analysis.RuleGitHubActionsDangerousPermissions,
-	analysis.RulePublicWorkloadCanReadSecret,
-	analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole,
-	analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole,
-	analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket,
-	analysis.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket,
-}
-
-var knownRules = func() map[analysis.RuleID]struct{} {
-	out := make(map[analysis.RuleID]struct{}, len(allRules))
-	for _, ruleID := range allRules {
-		out[ruleID] = struct{}{}
+var allRules = func() []analysis.RuleID {
+	ids := rules.IDs()
+	out := make([]analysis.RuleID, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, analysis.RuleID(id))
 	}
 	return out
 }()
@@ -142,6 +132,9 @@ func normalize(raw rawConfig) (Config, error) {
 			disabledRules = append(disabledRules, ruleID)
 		}
 	}
+	sort.Slice(disabledRules, func(i, j int) bool {
+		return disabledRules[i] < disabledRules[j]
+	})
 
 	suppressions := make(map[analysis.FindingID]Suppression, len(raw.Suppressions))
 	for i, rawSuppression := range raw.Suppressions {
@@ -174,7 +167,7 @@ func validateRuleID(value, field string) (analysis.RuleID, error) {
 		return "", fmt.Errorf("pathproof config %s contains an empty rule ID", field)
 	}
 	ruleID := analysis.RuleID(value)
-	if _, ok := knownRules[ruleID]; !ok {
+	if _, ok := rules.Lookup(value); !ok {
 		return "", fmt.Errorf("pathproof config %s contains an unknown rule ID", field)
 	}
 	return ruleID, nil

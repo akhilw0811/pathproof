@@ -55,6 +55,14 @@ and unsuppressed scans exit `1`, malformed configs exit `2` with empty stdout,
 JSON config metadata is deterministic, human suppressed counts appear only
 when findings are actually suppressed, and finding IDs do not change merely
 because config was supplied.
+Rule registry coverage asserts that every implemented deterministic rule has
+one static metadata entry, IDs are unique, required metadata fields are
+nonempty, `All()` and `IDs()` return defensive copies in deterministic order,
+lookups accept implemented IDs and reject unknown IDs, SARIF levels are valid,
+and severities match current behavior. Config and SARIF tests assert that rule
+validation and SARIF rule metadata consume the registry while existing finding
+IDs, human output, JSON output, baseline behavior, remediation, patch output,
+validation, and secret/value exclusion behavior remain unchanged.
 Baseline writer coverage asserts suppressions-only JSON output, deterministic
 finding-ID sorting, duplicate finding-ID deduplication, the exact default
 reason, empty suppression arrays when no unsuppressed findings remain,
