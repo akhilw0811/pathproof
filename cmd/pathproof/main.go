@@ -599,17 +599,18 @@ type scanReport struct {
 }
 
 type scanFinding struct {
-	ID               analysis.FindingID `json:"id"`
-	RuleID           analysis.RuleID    `json:"rule_id"`
-	Title            string             `json:"title"`
-	Severity         analysis.Severity  `json:"severity"`
-	Summary          string             `json:"summary"`
-	Path             []scanPathNode     `json:"path"`
-	Evidence         []scanEvidence     `json:"evidence"`
-	SourceReferences []string           `json:"source_references"`
-	RiskSignal       *scanRiskSignal    `json:"risk_signal,omitempty"`
-	Remediation      *scanRemediation   `json:"remediation,omitempty"`
-	SARIFSources     []string           `json:"-"`
+	ID                analysis.FindingID     `json:"id"`
+	RuleID            analysis.RuleID        `json:"rule_id"`
+	Title             string                 `json:"title"`
+	Severity          analysis.Severity      `json:"severity"`
+	Summary           string                 `json:"summary"`
+	Path              []scanPathNode         `json:"path"`
+	Evidence          []scanEvidence         `json:"evidence"`
+	SourceReferences  []string               `json:"source_references"`
+	RiskSignal        *scanRiskSignal        `json:"risk_signal,omitempty"`
+	BucketSensitivity *scanBucketSensitivity `json:"bucket_sensitivity,omitempty"`
+	Remediation       *scanRemediation       `json:"remediation,omitempty"`
+	SARIFSources      []string               `json:"-"`
 }
 
 type scanRiskSignal struct {
@@ -627,6 +628,19 @@ type scanRiskSignal struct {
 type scanGitHubActionsSelector struct {
 	Field             string `json:"field"`
 	MatchedExpression string `json:"matched_expression"`
+}
+
+type scanBucketSensitivity struct {
+	SensitivityLevel string                        `json:"sensitivity_level"`
+	Reasons          []scanBucketSensitivityReason `json:"reasons"`
+}
+
+type scanBucketSensitivityReason struct {
+	Source       string `json:"source"`
+	MatchedToken string `json:"matched_token,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Value        string `json:"value,omitempty"`
+	SourceRef    string `json:"source_ref"`
 }
 
 type scanPathNode struct {
@@ -804,18 +818,20 @@ func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scan
 	}
 	sarifSources := structuredFindingSourceReferences(finding, g)
 	riskSignal := projectRiskSignal(root, finding.RiskSignal)
+	bucketSensitivity := projectBucketSensitivity(root, finding.BucketSensitivity)
 
 	return scanFinding{
-		ID:               finding.ID,
-		RuleID:           finding.RuleID,
-		Title:            finding.Title,
-		Severity:         finding.Severity,
-		Summary:          finding.Summary,
-		Path:             path,
-		Evidence:         evidence,
-		SourceReferences: sourceReferences,
-		RiskSignal:       riskSignal,
-		SARIFSources:     sarifSources,
+		ID:                finding.ID,
+		RuleID:            finding.RuleID,
+		Title:             finding.Title,
+		Severity:          finding.Severity,
+		Summary:           finding.Summary,
+		Path:              path,
+		Evidence:          evidence,
+		SourceReferences:  sourceReferences,
+		RiskSignal:        riskSignal,
+		BucketSensitivity: bucketSensitivity,
+		SARIFSources:      sarifSources,
 	}, nil
 }
 
@@ -840,6 +856,26 @@ func projectRiskSignal(root string, risk *analysis.RiskSignal) *scanRiskSignal {
 		Permission:      risk.Permission,
 		Access:          risk.Access,
 		Summary:         risk.Summary,
+	}
+}
+
+func projectBucketSensitivity(root string, sensitivity *analysis.BucketSensitivityEvidence) *scanBucketSensitivity {
+	if sensitivity == nil {
+		return nil
+	}
+	reasons := make([]scanBucketSensitivityReason, 0, len(sensitivity.Reasons))
+	for _, reason := range sensitivity.Reasons {
+		reasons = append(reasons, scanBucketSensitivityReason{
+			Source:       reason.Source,
+			MatchedToken: reason.MatchedToken,
+			Key:          reason.Key,
+			Value:        reason.Value,
+			SourceRef:    normalizeDisplaySourceReferences(root, reason.SourceRef),
+		})
+	}
+	return &scanBucketSensitivity{
+		SensitivityLevel: sensitivity.SensitivityLevel,
+		Reasons:          reasons,
 	}
 }
 
@@ -1151,6 +1187,11 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 				return err
 			}
 		}
+		if finding.BucketSensitivity != nil {
+			if _, err := fmt.Fprintf(w, "Bucket sensitivity: %s\n", humanBucketSensitivitySummary(finding.BucketSensitivity)); err != nil {
+				return err
+			}
+		}
 		if _, err := fmt.Fprintln(w, "Sources:"); err != nil {
 			return err
 		}
@@ -1225,6 +1266,21 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 		return err
 	}
 	return writeHumanValidation(w, report)
+}
+
+func humanBucketSensitivitySummary(sensitivity *scanBucketSensitivity) string {
+	if sensitivity == nil || len(sensitivity.Reasons) == 0 {
+		return "sensitive"
+	}
+	reason := sensitivity.Reasons[0]
+	switch reason.Source {
+	case "bucket_name":
+		return sensitivity.SensitivityLevel + " from bucket_name token " + reason.MatchedToken
+	case "tag":
+		return sensitivity.SensitivityLevel + " from tag " + reason.Key + "=" + reason.Value
+	default:
+		return sensitivity.SensitivityLevel
+	}
 }
 
 func writeHumanBaselineReport(w io.Writer, suppressionCount int) error {

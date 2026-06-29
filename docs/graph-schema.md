@@ -618,6 +618,16 @@ Implemented rules are:
   job-level OIDC uses
   `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`
 
+- Rule ID: `PP-XDOMAIN-004`
+- Title:
+  `Risky GitHub Actions workflow can access sensitive AWS S3 bucket`
+- Severity: fixed `High`
+- Required path:
+  workflow-level OIDC uses
+  `Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`;
+  job-level OIDC uses
+  `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`
+
 `PP-K8S-001` is emitted only when all four Kubernetes nodes exist with the
 expected kinds and all three directed edges exist with the expected kinds. The
 ordered finding chain stores the four node IDs followed by the three edge IDs
@@ -704,6 +714,15 @@ matches do not trigger this finding. AdministratorAccess, `Action "*"
 Resource "*"`, and existing administrative `AWSPermission` metadata do not
 imply S3 bucket access in this slice.
 
+`PP-XDOMAIN-004` is emitted only when the same verified PP-XDOMAIN-003 path
+targets an `AWSS3Bucket` whose existing metadata has `sensitivity_level`
+`sensitive` and at least one sanitized sensitivity reason. Unknown sensitivity,
+absent bucket sensitivity metadata, and sensitive-without-reasons metadata do
+not trigger this rule. The rule does not create sensitivity metadata, broaden
+S3 access semantics, infer S3 access from admin permissions, parse bucket
+policies, model KMS, discover S3 objects, call cloud APIs, or use unsupported
+sensitivity sources.
+
 Finding IDs are deterministic and stable. `PP-K8S-001` IDs are SHA-256 hashes of a
 canonical JSON identity containing only fixed field names for `rule_id`,
 ordered `node_ids`, and ordered `edge_ids`. Evidence, source references,
@@ -740,16 +759,25 @@ uses access mode, access kind, action, resource, policy resource name, attached
 role resource name, and statement index. Evidence prose, source-reference
 display paths, raw policy JSON, absolute paths, and S3 bucket sensitivity
 metadata are not part of identity.
+`PP-XDOMAIN-004` IDs use the same canonical path, risk signal, role, bucket,
+access mode, and S3 grant identity fields as `PP-XDOMAIN-003`, plus the
+sensitivity level and ordered sanitized sensitivity reason identities. A
+sensitivity reason identity contains only the reason source (`bucket_name` or
+`tag`), matched token for bucket-name reasons, allowlisted key/value for tag
+reasons, and sanitized source reference. Raw Terraform, raw tags, tag maps,
+raw policy JSON, source display formatting, absolute paths, summaries,
+suppression reasons, baseline output, and remediation text are not part of
+identity.
 
 Finding evidence preserves the complete ordered edge evidence for the matched
 path. `source_references` are derived from those edge evidence sources in
 chain order, omit empty strings, and deduplicate exact repeated references
 while preserving first appearance. They are not globally sorted.
 
-`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003` keep only the actual
-cross-domain graph path in `node_ids`, `edge_ids`, and ordered evidence.
-Non-path risk evidence is represented in an optional structured `risk_signal`
-field:
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and
+`PP-XDOMAIN-004` keep only the actual cross-domain graph path in `node_ids`,
+`edge_ids`, and ordered evidence. Non-path risk evidence is represented in an
+optional structured `risk_signal` field:
 
 ```json
 {
@@ -776,6 +804,31 @@ For `PP-GHA-003` risk, `risk_signal` uses `permission` and `access` instead of
 sanitized structured fields and never raw workflow YAML, raw Terraform, raw
 trust policy JSON, env values, arbitrary `with` values, run scripts, secrets,
 token values, provider credentials, or raw evidence blobs.
+
+`PP-XDOMAIN-004` additionally includes optional structured
+`bucket_sensitivity` evidence:
+
+```json
+{
+  "bucket_sensitivity": {
+    "sensitivity_level": "sensitive",
+    "reasons": [
+      {
+        "source": "tag",
+        "key": "DataClassification",
+        "value": "sensitive",
+        "source_ref": "infra/s3.tf#resource=aws_s3_bucket.artifacts"
+      }
+    ]
+  }
+}
+```
+
+Bucket-name reasons use `source: "bucket_name"` plus `matched_token`; tag
+reasons use only the allowlisted key and canonical allowlisted value. The
+field is omitted for other rules and does not include raw Terraform, raw tag
+maps, unrelated tags, raw policy JSON, workflow YAML, env values, run scripts,
+secrets, tokens, credentials, provider values, or absolute paths.
 
 Secret values are absent from findings because Secret values are never
 ingested into parser output or graph evidence. GitHub Actions env, arbitrary
@@ -804,8 +857,8 @@ SARIF scan output is also a private CLI projection, not a graph schema. It is
 selected with `pathproof scan --format sarif <directory>` and emits SARIF 2.1.0
 with one PathProof run, deterministic rule entries for `PP-K8S-001`,
 `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and
-`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`, and one result per
-finding.
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and
+`PP-XDOMAIN-004`, and one result per finding.
 Result properties include finding ID, severity, ordered node IDs, ordered edge
 IDs, and clean display source references when available.
 
@@ -1042,24 +1095,25 @@ The graph and analysis do not model Kubernetes User or Group RBAC subjects,
 non-resource URLs, aggregated ClusterRoles, Secret values, live-cluster state,
 workflow execution, GitHub API state, expression evaluation, workflow
 permissions, reusable workflow resolution, action source inspection,
-CI/CD-to-cloud findings beyond `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and
-`PP-XDOMAIN-003`,
+CI/CD-to-cloud findings beyond `PP-XDOMAIN-001`, `PP-XDOMAIN-002`,
+`PP-XDOMAIN-003`, and `PP-XDOMAIN-004`,
 in-place patch application, live validation, or attack-path rules beyond
 `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
-`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`. Terraform
-support is limited to static `aws_iam_role` GitHub Actions OIDC trust
-metadata, optional `CanAssumeRole` edges when `--repo OWNER/REPO` is supplied,
-static `aws_s3_bucket` names, narrow static AWS IAM role permission facts for
-`PP-AWS-001`, and exact static S3 role access edges for modeled buckets;
-PathProof does not execute Terraform, evaluate modules or variables, call AWS
-or GitHub, validate cloud state, parse S3 bucket policies, model KMS, model S3
-objects, or simulate IAM. The
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and
+`PP-XDOMAIN-004`. Terraform support is limited to static `aws_iam_role`
+GitHub Actions OIDC trust metadata, optional `CanAssumeRole` edges when
+`--repo OWNER/REPO` is supplied, static `aws_s3_bucket` names with
+conservative local sensitivity metadata, narrow static AWS IAM role permission
+facts for `PP-AWS-001`, and exact static S3 role access edges for modeled
+buckets; PathProof does not execute Terraform, evaluate modules or variables,
+call AWS or GitHub, validate cloud state, parse S3 bucket policies, model KMS,
+model S3 objects, or simulate IAM. The
 scan CLI currently supports local Kubernetes YAML directories and local
 GitHub Actions workflow files under `.github/workflows` plus local `.tf`
 files for that narrow Terraform slice. Patch previews and patch output are
 limited to Kubernetes `NarrowBindingSubject` and local-mapping-backed safe
 `PP-GHA-001` `PinGitHubActionToSHA` replacements. They do not cover
 `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`,
-`PP-XDOMAIN-002`, `PP-XDOMAIN-003`, Terraform, GitHub API ref resolution,
-workflow validation, RBAC rule edits, Secret-bearing source files, unsafe
-workflow files, or broader YAML patch types.
+`PP-XDOMAIN-002`, `PP-XDOMAIN-003`, `PP-XDOMAIN-004`, Terraform, GitHub API
+ref resolution, workflow validation, RBAC rule edits, Secret-bearing source
+files, unsafe workflow files, or broader YAML patch types.

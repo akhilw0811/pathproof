@@ -679,6 +679,105 @@ permissions: write-all
 	assertNoRuleInJSONReport(t, nonmatchingBucketStdout, "PP-XDOMAIN-003")
 }
 
+func TestRunScanCrossDomainSensitiveS3HumanAndJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe-sensitive-s3.yml", `name: Sensitive S3
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  audit:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+	writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*")+"\n# FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN\n")
+
+	humanStdout, humanStderr, humanCode := runCommand("scan", "--repo", "owner/repo", dir)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", "--repo", "owner/repo", dir)
+
+	assertCode(t, humanCode, 1)
+	assertString(t, "human stderr", humanStderr, "")
+	assertContains(t, humanStdout, "Rule: PP-XDOMAIN-003\n")
+	assertContains(t, humanStdout, "Rule: PP-XDOMAIN-004\n")
+	assertContains(t, humanStdout, "Title: Risky GitHub Actions workflow can access sensitive AWS S3 bucket\n")
+	assertContains(t, humanStdout, "read access")
+	assertContains(t, humanStdout, "assets")
+	assertContains(t, humanStdout, "dangerous pull_request_target permission grant")
+	assertContains(t, humanStdout, "Bucket sensitivity: sensitive from tag DataClassification=sensitive")
+	if strings.Contains(humanStdout, "Remediation:") || strings.Contains(humanStdout, "Patch Preview:") || strings.Contains(humanStdout, "Validation:") {
+		t.Fatalf("PP-XDOMAIN-004 received unsupported remediation/patch/validation output: %s", humanStdout)
+	}
+	assertDoesNotContainCrossDomainS3SecretValues(t, humanStdout, humanStderr)
+	if strings.Contains(humanStdout, dir) || strings.Contains(humanStderr, dir) {
+		t.Fatalf("human output contains absolute temp path\nstdout:%s\nstderr:%s", humanStdout, humanStderr)
+	}
+
+	assertCode(t, jsonCode, 1)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	var sensitive []cliJSONFinding
+	for _, finding := range report.Findings {
+		if finding.RuleID == "PP-XDOMAIN-004" {
+			sensitive = append(sensitive, finding)
+		}
+	}
+	if len(sensitive) != 1 {
+		t.Fatalf("PP-XDOMAIN-004 count = %d, want 1: %#v", len(sensitive), report.Findings)
+	}
+	finding := sensitive[0]
+	if finding.RiskSignal == nil || finding.RiskSignal.RuleID != "PP-GHA-003" {
+		t.Fatalf("risk_signal = %#v, want PP-GHA-003", finding.RiskSignal)
+	}
+	if finding.BucketSensitivity == nil || finding.BucketSensitivity.SensitivityLevel != "sensitive" || len(finding.BucketSensitivity.Reasons) != 1 {
+		t.Fatalf("bucket_sensitivity = %#v, want sensitive evidence", finding.BucketSensitivity)
+	}
+	reason := finding.BucketSensitivity.Reasons[0]
+	if reason.Source != "tag" || reason.Key != "DataClassification" || reason.Value != "sensitive" || reason.SourceRef != "infra/iam.tf#resource=aws_s3_bucket.artifacts" {
+		t.Fatalf("bucket sensitivity reason = %#v, want sanitized tag evidence", reason)
+	}
+	if finding.Remediation != nil {
+		t.Fatalf("remediation = %#v, want nil", finding.Remediation)
+	}
+	if got := countCLIFindingsByRule(report.Findings, "PP-XDOMAIN-003"); got != 1 {
+		t.Fatalf("PP-XDOMAIN-003 count = %d, want sibling finding", got)
+	}
+	assertDoesNotContainCrossDomainS3SecretValues(t, jsonStdout, jsonStderr)
+	for _, forbidden := range []string{"assume_role_policy", "Principal", "Condition", "Statement", "policy =", "Owner"} {
+		if strings.Contains(jsonStdout, forbidden) || strings.Contains(jsonStderr, forbidden) {
+			t.Fatalf("JSON output contains %q\nstdout:%s\nstderr:%s", forbidden, jsonStdout, jsonStderr)
+		}
+	}
+}
+
+func TestRunScanCrossDomainSensitiveS3Negatives(t *testing.T) {
+	unknownDir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, unknownDir, "unsafe-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, unknownDir, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"))
+	unknownStdout, unknownStderr, unknownCode := runCommand("scan", "--format=json", "--repo", "owner/repo", unknownDir)
+	assertCode(t, unknownCode, 1)
+	assertString(t, "unknown stderr", unknownStderr, "")
+	assertNoRuleInJSONReport(t, unknownStdout, "PP-XDOMAIN-004")
+	if got := countCLIFindingsByRule(assertValidJSONReport(t, unknownStdout).Findings, "PP-XDOMAIN-003"); got != 1 {
+		t.Fatalf("unknown sensitivity PP-XDOMAIN-003 count = %d, want 1", got)
+	}
+
+	branchDir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, branchDir, "unsafe-s3.yml", `on:
+  push:
+    branches: [main]
+  pull_request_target:
+permissions: write-all
+`)
+	writeTerraformForTest(t, branchDir, "infra/iam.tf", terraformOIDCSensitiveS3Role("deploy", "repo:owner/repo:ref:refs/heads/main", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"))
+	branchStdout, branchStderr, branchCode := runCommand("scan", "--format=json", "--repo", "owner/repo", branchDir)
+	assertCode(t, branchCode, 1)
+	assertString(t, "branch stderr", branchStderr, "")
+	assertNoRuleInJSONReport(t, branchStdout, "PP-XDOMAIN-004")
+}
+
 func TestRunScanCrossDomainS3PatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "scan")
@@ -743,7 +842,7 @@ resource "aws_s3_bucket" "backups" {
 	if len(sarif.Runs[0].Results) != 0 {
 		t.Fatalf("SARIF results = %#v, want none", sarif.Runs[0].Results)
 	}
-	for _, forbidden := range []string{"sensitivity", "prod-data-backups", "DataClassification", "Owner", "FAKE_CLI_S3_SENSITIVITY"} {
+	for _, forbidden := range []string{"prod-data-backups", "DataClassification", "Owner", "FAKE_CLI_S3_SENSITIVITY"} {
 		if strings.Contains(sarifStdout, forbidden) || strings.Contains(sarifStderr, forbidden) {
 			t.Fatalf("SARIF output contains graph metadata or secret-like value %q\nstdout:%s", forbidden, sarifStdout)
 		}
@@ -1747,10 +1846,97 @@ func TestRunScanConfigEnableAllowlistEmitsOnlyAllowedRule(t *testing.T) {
 	if report.FindingCount != 1 || len(report.Findings) != 1 || report.Findings[0].RuleID != "PP-GHA-001" {
 		t.Fatalf("findings = %#v count=%d, want only PP-GHA-001", report.Findings, report.FindingCount)
 	}
-	if len(report.DisabledRules) != 7 {
-		t.Fatalf("disabled_rules = %#v, want seven non-allowlisted rules", report.DisabledRules)
+	if len(report.DisabledRules) != 8 {
+		t.Fatalf("disabled_rules = %#v, want eight non-allowlisted rules", report.DisabledRules)
 	}
 	assertNoRuleInJSONReport(t, stdout, "PP-K8S-001")
+}
+
+func TestRunScanConfigControlsCrossDomainSensitiveS3Rule(t *testing.T) {
+	t.Run("disable omits PP-XDOMAIN-004 only", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unsafe-sensitive-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+		writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"))
+		writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["PP-XDOMAIN-004"]}}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--repo", "owner/repo", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 1)
+		assertString(t, "stderr", stderr, "")
+		assertNoRuleInJSONReport(t, stdout, "PP-XDOMAIN-004")
+		if got := countCLIFindingsByRule(assertValidJSONReport(t, stdout).Findings, "PP-XDOMAIN-003"); got != 1 {
+			t.Fatalf("PP-XDOMAIN-003 count = %d, want sibling still enabled", got)
+		}
+	})
+
+	t.Run("enable allowlist emits only PP-XDOMAIN-004", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unsafe-sensitive-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+		writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"))
+		writeFileForTest(t, parent, "pathproof.json", `{"rules":{"enable":["PP-XDOMAIN-004"]}}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--repo", "owner/repo", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 1)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		if report.FindingCount != 1 || len(report.Findings) != 1 || report.Findings[0].RuleID != "PP-XDOMAIN-004" {
+			t.Fatalf("findings = %#v count=%d, want only PP-XDOMAIN-004", report.Findings, report.FindingCount)
+		}
+	})
+}
+
+func TestRunScanConfigSuppressesAndExcludesCrossDomainSensitiveS3Rule(t *testing.T) {
+	t.Run("suppression by finding ID", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unsafe-sensitive-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+		writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"))
+		baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "--repo", "owner/repo", "scan")
+		assertCode(t, baselineCode, 1)
+		assertString(t, "baseline stderr", baselineStderr, "")
+		finding := firstCLIFindingByRule(t, assertValidJSONReport(t, baselineStdout).Findings, "PP-XDOMAIN-004")
+		writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted sensitive S3 path"}]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--repo", "owner/repo", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 1)
+		assertString(t, "stderr", stderr, "")
+		assertNoRuleInJSONReport(t, stdout, "PP-XDOMAIN-004")
+		if got := countCLIFindingsByRule(assertValidJSONReport(t, stdout).Findings, "PP-XDOMAIN-003"); got != 1 {
+			t.Fatalf("PP-XDOMAIN-003 count = %d, want sibling still unsuppressed", got)
+		}
+		if strings.Contains(stdout, "Accepted sensitive S3 path") {
+			t.Fatalf("stdout contains suppression reason: %s", stdout)
+		}
+	})
+
+	t.Run("path exclusion", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unsafe-sensitive-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+		writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"))
+		writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":[".github/workflows/unsafe-sensitive-s3.yml"]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--repo", "owner/repo", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		if report.FindingCount != 0 || len(report.Findings) != 0 {
+			t.Fatalf("findings = %#v, want excluded PP-XDOMAIN-004 path", report.Findings)
+		}
+	})
 }
 
 func TestRunScanConfigDisableWinsOverEnable(t *testing.T) {
@@ -2001,6 +2187,39 @@ func TestRunScanWriteBaselineWritesConfigAndRoundTrips(t *testing.T) {
 	if after, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "unpinned.yml")); err != nil || !strings.Contains(string(after), "actions/checkout@v4") {
 		t.Fatalf("input workflow changed or could not be read: %v\n%s", err, after)
 	}
+}
+
+func TestRunScanWriteBaselineIncludesCrossDomainSensitiveS3Finding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unsafe-sensitive-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+	writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"))
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--repo", "owner/repo", "--write-baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Baseline written.")
+	baseline := readGeneratedBaselineForTest(t, filepath.Join(parent, "baseline.json"))
+	var hasSensitiveS3 bool
+	for _, suppression := range baseline.Suppressions {
+		if strings.Contains(suppression.FindingID, "PP-XDOMAIN-004") {
+			hasSensitiveS3 = true
+		}
+		if strings.Contains(suppression.FindingID, "FAKE_CLI_XDOMAIN4_TAG_SECRET_DO_NOT_RETAIN") {
+			t.Fatalf("baseline leaked tag secret: %#v", baseline.Suppressions)
+		}
+	}
+	if !hasSensitiveS3 {
+		t.Fatalf("baseline suppressions = %#v, want PP-XDOMAIN-004 finding ID", baseline.Suppressions)
+	}
+
+	secondStdout, secondStderr, secondCode := runCommandInDir(t, parent, "scan", "--format=json", "--repo", "owner/repo", "--config", "baseline.json", "scan")
+	assertCode(t, secondCode, 0)
+	assertString(t, "second stderr", secondStderr, "")
+	assertNoRuleInJSONReport(t, secondStdout, "PP-XDOMAIN-004")
 }
 
 func TestRunScanWriteBaselineNoFindingsWritesEmptySuppressions(t *testing.T) {
@@ -4645,16 +4864,17 @@ type cliJSONBaseline struct {
 }
 
 type cliJSONFinding struct {
-	ID               string              `json:"id"`
-	RuleID           string              `json:"rule_id"`
-	Title            string              `json:"title"`
-	Severity         string              `json:"severity"`
-	Summary          string              `json:"summary"`
-	Path             []cliJSONPathNode   `json:"path"`
-	Evidence         []cliJSONEvidence   `json:"evidence"`
-	SourceReferences []string            `json:"source_references"`
-	RiskSignal       *cliJSONRiskSignal  `json:"risk_signal,omitempty"`
-	Remediation      *cliJSONRemediation `json:"remediation,omitempty"`
+	ID                string                    `json:"id"`
+	RuleID            string                    `json:"rule_id"`
+	Title             string                    `json:"title"`
+	Severity          string                    `json:"severity"`
+	Summary           string                    `json:"summary"`
+	Path              []cliJSONPathNode         `json:"path"`
+	Evidence          []cliJSONEvidence         `json:"evidence"`
+	SourceReferences  []string                  `json:"source_references"`
+	RiskSignal        *cliJSONRiskSignal        `json:"risk_signal,omitempty"`
+	BucketSensitivity *cliJSONBucketSensitivity `json:"bucket_sensitivity,omitempty"`
+	Remediation       *cliJSONRemediation       `json:"remediation,omitempty"`
 }
 
 type cliJSONRiskSignal struct {
@@ -4672,6 +4892,19 @@ type cliJSONRiskSignal struct {
 type cliJSONRiskSelector struct {
 	Field             string `json:"field"`
 	MatchedExpression string `json:"matched_expression"`
+}
+
+type cliJSONBucketSensitivity struct {
+	SensitivityLevel string                           `json:"sensitivity_level"`
+	Reasons          []cliJSONBucketSensitivityReason `json:"reasons"`
+}
+
+type cliJSONBucketSensitivityReason struct {
+	Source       string `json:"source"`
+	MatchedToken string `json:"matched_token,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Value        string `json:"value,omitempty"`
+	SourceRef    string `json:"source_ref"`
 }
 
 type cliJSONPathNode struct {
@@ -5294,6 +5527,23 @@ resource "aws_iam_role_policy" "` + policyName + `" {
 `
 }
 
+func terraformOIDCSensitiveS3Role(roleName, subject, bucketResourceName, bucketName, policyName, action, resource string) string {
+	return terraformOIDCRole(roleName, subject) + `
+resource "aws_s3_bucket" "` + bucketResourceName + `" {
+  bucket = "` + bucketName + `"
+  tags = {
+    DataClassification = "Sensitive"
+    Owner = "FAKE_CLI_XDOMAIN4_TAG_SECRET_DO_NOT_RETAIN"
+  }
+}
+
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + roleName + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
 func terraformOIDCSubjectsAdminRole(name string, subjects []string, policyName, action, resource string) string {
 	var patterns strings.Builder
 	for i, subject := range subjects {
@@ -5451,6 +5701,7 @@ func assertDoesNotContainCrossDomainS3SecretValues(t *testing.T, outputs ...stri
 			"FAKE_CLI_XDOMAIN3_GHA_WITH_SECRET_DO_NOT_RETAIN",
 			"FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN",
 			"FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN",
+			"FAKE_CLI_XDOMAIN4_TAG_SECRET_DO_NOT_RETAIN",
 		} {
 			if strings.Contains(output, forbidden) {
 				t.Fatalf("output contains cross-domain S3 secret-like value %q: %s", forbidden, output)
@@ -5467,6 +5718,16 @@ func assertNoRuleInJSONReport(t *testing.T, output, ruleID string) {
 			t.Fatalf("JSON report contains %s: %#v", ruleID, report.Findings)
 		}
 	}
+}
+
+func countCLIFindingsByRule(findings []cliJSONFinding, ruleID string) int {
+	count := 0
+	for _, finding := range findings {
+		if finding.RuleID == ruleID {
+			count++
+		}
+	}
+	return count
 }
 
 func firstCLIFindingByRule(t *testing.T, findings []cliJSONFinding, ruleID string) cliJSONFinding {

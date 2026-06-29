@@ -615,7 +615,6 @@ permissions: write-all
 resource "aws_s3_bucket" "artifacts" {
   bucket = "prod-data-backups"
   tags = {
-    DataClassification = "Sensitive"
     Owner = "FAKE_SARIF_S3_SENSITIVITY_TAG_SECRET_DO_NOT_RETAIN"
   }
 }
@@ -639,6 +638,94 @@ resource "aws_iam_role_policy" "read" {
 			t.Fatalf("SARIF output contains bucket sensitivity metadata or secret-like value %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
 		}
 	}
+}
+
+func TestRunScanCrossDomainSensitiveS3SARIFOutputShapeAndFiltering(t *testing.T) {
+	t.Run("result and rule metadata", func(t *testing.T) {
+		dir := t.TempDir()
+		writeGitHubActionsWorkflowForTest(t, dir, "sensitive s3.yml", `name: Sensitive S3
+on: pull_request_target
+permissions: write-all
+env:
+  TOKEN: FAKE_CLI_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  deploy:
+    steps:
+      - run: echo FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN
+`)
+		writeTerraformForTest(t, dir, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-assets", "write", "s3:PutObject", "arn:aws:s3:::prod-assets/*")+"\n# FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN\n")
+
+		stdout, stderr, code := runCommand("scan", "--format=sarif", "--repo", "owner/repo", dir)
+
+		assertCode(t, code, 1)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidSARIFReport(t, stdout)
+		run := report.Runs[0]
+		assertSARIFRuleSet(t, run.Tool.Driver.Rules)
+		rule := mustSARIFRule(t, run.Tool.Driver.Rules, "PP-XDOMAIN-004")
+		assertString(t, "rule id", rule.ID, "PP-XDOMAIN-004")
+		assertString(t, "rule name", rule.Name, "Risky GitHub Actions workflow can access sensitive AWS S3 bucket")
+		assertString(t, "rule default level", rule.DefaultConfiguration.Level, "error")
+		assertContains(t, rule.FullDescription.Text, "classified sensitive")
+		assertContains(t, rule.Help.Text, "does not execute workflows")
+		assertContains(t, rule.Help.Text, "perform data discovery")
+
+		var result cliSARIFResult
+		for _, candidate := range run.Results {
+			if candidate.RuleID == "PP-XDOMAIN-004" {
+				result = candidate
+				break
+			}
+		}
+		if result.RuleID == "" {
+			t.Fatalf("PP-XDOMAIN-004 SARIF result not found: %#v", run.Results)
+		}
+		assertString(t, "level", result.Level, "error")
+		assertString(t, "severity", result.Properties.Severity, "High")
+		assertContains(t, result.Message.Text, "sensitive S3 bucket")
+		assertContains(t, result.Message.Text, "write access")
+		assertContains(t, result.Message.Text, "prod-assets")
+		if len(result.Properties.NodeIDs) != 4 || len(result.Properties.EdgeIDs) != 3 {
+			t.Fatalf("properties node_ids/edge_ids = %#v/%#v, want sensitive S3 path", result.Properties.NodeIDs, result.Properties.EdgeIDs)
+		}
+		gotURIs := locationURIs(result.Locations)
+		if len(gotURIs) == 0 || gotURIs[0] != ".github/workflows/sensitive%20s3.yml#document=1" {
+			t.Fatalf("SARIF location URIs = %#v, want workflow source first", gotURIs)
+		}
+		if result.PartialFingerprints["pathproofFindingId"] == "" || result.Properties.FindingID != result.PartialFingerprints["pathproofFindingId"] {
+			t.Fatalf("finding fingerprint/properties mismatch: %#v", result)
+		}
+		for _, forbidden := range []string{"FAKE_CLI_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN3_GHA_RUN_SECRET_DO_NOT_RETAIN", "FAKE_CLI_XDOMAIN3_TF_SECRET_DO_NOT_RETAIN", "assume_role_policy", "Principal", "Condition", "Statement", "policy =", "arn:aws:iam", "sensitivity_level", "sensitivity_reasons"} {
+			if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+				t.Fatalf("SARIF output contains %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+			}
+		}
+	})
+
+	t.Run("disabled result omitted", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "sensitive-s3.yml", `on: pull_request_target
+permissions: write-all
+`)
+		writeTerraformForTest(t, root, "infra/iam.tf", terraformOIDCS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "prod-assets", "read", "s3:GetObject", "arn:aws:s3:::prod-assets/*"))
+		writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["PP-XDOMAIN-004"]}}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=sarif", "--repo", "owner/repo", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 1)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidSARIFReport(t, stdout)
+		if got := countSARIFResultsByRule(report, "PP-XDOMAIN-004"); got != 0 {
+			t.Fatalf("PP-XDOMAIN-004 SARIF result count = %d, want disabled result omitted", got)
+		}
+		if got := countSARIFResultsByRule(report, "PP-XDOMAIN-003"); got != 1 {
+			t.Fatalf("PP-XDOMAIN-003 SARIF result count = %d, want sibling still emitted", got)
+		}
+		if strings.Contains(stdout, "pathproof.json") || strings.Contains(stdout, "disable") {
+			t.Fatalf("SARIF output contains config details: %s", stdout)
+		}
+	})
 }
 
 func TestRunScanCrossDomainAdminRoleMixedTrustSARIFEmitsFinding(t *testing.T) {
@@ -1063,6 +1150,7 @@ func assertSARIFRuleSet(t *testing.T, rules []cliSARIFRule) {
 		"PP-XDOMAIN-001",
 		"PP-XDOMAIN-002",
 		"PP-XDOMAIN-003",
+		"PP-XDOMAIN-004",
 	}
 	counts := make(map[string]int, len(rules))
 	for _, rule := range rules {

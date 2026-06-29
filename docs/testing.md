@@ -137,9 +137,15 @@ the risky OIDC path uses the pull request subject and reaches explicit exact
 S3 read or write access to a modeled bucket, that missing or nonmatching
 `--repo` and nonmatching bucket policies omit `PP-XDOMAIN-003`, and that
 remediation, patch preview, patch output, validation, raw policy/trust content,
-and secret-like values are not attached or printed. It also asserts that
-graph-only S3 sensitivity metadata does not create findings and is not exposed
-through the public findings-only JSON report.
+and secret-like values are not attached or printed. Sensitive S3 cross-domain
+CLI coverage asserts that `PP-XDOMAIN-004` is emitted as an additional finding
+only when the same verified path reaches a modeled bucket with existing
+`sensitivity_level: sensitive` metadata and at least one sanitized reason;
+unknown sensitivity, branch-only trust, suppressions, rule controls, and path
+exclusions omit `PP-XDOMAIN-004` without changing `PP-XDOMAIN-003`.
+It also asserts human and JSON bucket-sensitivity evidence is sanitized and
+that no remediation, patch preview, patch output, or validation data is
+attached to `PP-XDOMAIN-004`.
 AWS IAM CLI coverage asserts that static Terraform inline admin role policies
 and literal AdministratorAccess role-policy attachments emit `PP-AWS-001` in
 human, JSON, and SARIF output, that non-admin policies exit `0`, that malformed
@@ -150,9 +156,10 @@ attached to `PP-AWS-001`.
 SARIF tests assert valid JSON with SARIF 2.1.0 version and schema, one
 PathProof driver run, deterministic rule entries for `PP-K8S-001`,
 `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
-`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`, one result for
-vulnerable fixtures, zero results for safe fixtures, deterministic rule/result
-fields, byte-identical repeated scans, and unchanged exit codes. GitHub Actions
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and
+`PP-XDOMAIN-004`, one result for vulnerable fixtures, zero results for safe
+fixtures, deterministic rule/result fields, byte-identical repeated scans, and
+unchanged exit codes. GitHub Actions
 SARIF
 coverage asserts `PP-GHA-001` severity maps to `warning`, `PP-GHA-002` and
 `PP-GHA-003` severities map to `error`, workflow artifact URIs are relative
@@ -176,8 +183,11 @@ validation arrays, diffs, patched contents, mapping data, raw source, and
 secret-like values.
 Cross-domain S3 SARIF coverage asserts the same for `PP-XDOMAIN-003`, plus S3
 bucket name, access mode, sanitized matched grant evidence, and no remediation
-or raw policy text. It also asserts that existing SARIF findings remain
-findings-only when bucket sensitivity metadata exists.
+or raw policy text. Sensitive S3 SARIF coverage asserts `PP-XDOMAIN-004` rule
+metadata and `error` results, relative URI-safe workflow locations, sanitized
+summary text, disabled/suppressed result omission, valid SARIF 2.1.0 output,
+and absence of raw source, tags, policy JSON, config, baseline, patch,
+remediation, validation, and secret-like values.
 Source-location
 tests cover URI-encoded relative artifact URIs for paths with spaces,
 display-safe relative `properties.source_references`, omission of malformed
@@ -389,6 +399,19 @@ sensitive IDs; ordered path evidence through `CanReadObject` or
 `CanWriteObject`; finding ID stability when only S3 bucket sensitivity metadata
 changes; no finding for a sensitive bucket alone; and secret/raw-policy
 exclusion from finding JSON.
+`PP-XDOMAIN-004` analysis coverage adds the conservative sensitivity gate:
+positive workflow-level read and job-level write cases to sensitive buckets;
+read and write access to the same sensitive bucket producing distinct
+findings; negatives for unknown or absent sensitivity, sensitive metadata
+without sanitized reasons, safe workflows, PP-GHA-001 alone, branch-only and
+environment-only trust, admin permission without explicit S3 access, no S3
+access, and unsupported dynamic S3 or sensitivity inputs; deterministic
+multiple-bucket ordering; finding ID stability under reason reordering; ID
+changes when the bucket, role, path, access mode, risk signal, S3 grant
+identity, or sensitivity identity changes; sanitized bucket sensitivity
+evidence; and exclusion of raw workflow, raw Terraform, raw policy JSON, raw
+tags, env, `with`, run scripts, secrets, tokens, credentials, and absolute
+paths from finding JSON.
 
 Remediation tests cover the read-only `internal/remediation.Build` API for
 `PP-K8S-001`. Coverage asserts complete advisory options for

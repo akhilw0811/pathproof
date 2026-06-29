@@ -60,6 +60,7 @@ var allRules = []analysis.RuleID{
 	analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole,
 	analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole,
 	analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket,
+	analysis.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket,
 }
 
 var knownRules = func() map[analysis.RuleID]struct{} {

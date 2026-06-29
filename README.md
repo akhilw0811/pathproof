@@ -23,8 +23,10 @@ inline role policies, and reports `PP-XDOMAIN-003` when a risky GitHub Actions
 OIDC path can assume an AWS IAM role that can access a modeled S3 bucket.
 Terraform-modeled `AWSS3Bucket` graph nodes can also carry conservative local
 sensitivity metadata derived only from literal bucket-name tokens and
-allowlisted static tags on the same `aws_s3_bucket` resource; this metadata
-does not create findings or change `PP-XDOMAIN-003`.
+allowlisted static tags on the same `aws_s3_bucket` resource. `PP-XDOMAIN-004`
+reports the higher-signal version of the same verified OIDC-to-S3 path when
+the modeled bucket is classified sensitive by that existing conservative
+metadata.
 
 PathProof is currently a defensive Go CLI focused on two small, tested local
 slices. It scans local YAML manifests and workflows, builds an in-memory graph,
@@ -56,8 +58,10 @@ repositories, or trusts mutable refs.
 risky OIDC context reaches an AWS IAM role with explicit static read or write
 access to a locally modeled `aws_s3_bucket`. Modeled S3 buckets may carry
 graph-only `unknown` or `sensitive` metadata from conservative local
-Terraform literals, but PathProof does not perform S3 content discovery or
-cloud data classification.
+Terraform literals. `PP-XDOMAIN-004` reports the same verified explicit S3
+access path only when that modeled bucket is `sensitive` and has sanitized
+sensitivity reasons. PathProof does not perform S3 content discovery or cloud
+data classification.
 An explicit local JSON config can be supplied with `--config <file>` to
 deterministically enable or disable implemented rules and suppress exact
 finding IDs with a required human reason. Config can also exclude explicit
@@ -72,10 +76,10 @@ Terraform execution, module or variable evaluation, reusable workflow
 resolution, action source inspection, broader sensitive-resource types, live
 cluster scanning, cloud validation, IAM simulation, broad cross-domain
 analysis, S3 bucket policies, KMS modeling, public access block modeling,
-object modeling, full data discovery, DLP-style classification, sensitivity
-based findings, glob or regex exclusions, baseline diffing, newly introduced
-findings mode, pull request creation, AI/ML ranking, and dashboards are not
-implemented.
+object modeling, full data discovery, DLP-style classification, broad
+sensitivity-based findings, glob or regex exclusions, baseline diffing, newly
+introduced findings mode, pull request creation, AI/ML ranking, and dashboards
+are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, baseline write, and internal scan errors exit `2`.
@@ -384,7 +388,8 @@ Severity: High
 
 ## GitHub Actions Security
 
-PathProof currently implements three small local GitHub Actions checks:
+PathProof currently implements three small local GitHub Actions checks plus
+narrow local cross-domain OIDC findings:
 
 - `PP-GHA-001`: a workflow `uses:` reference is not pinned to a full
   40-character commit SHA.
@@ -409,6 +414,9 @@ PathProof currently implements three small local GitHub Actions checks:
 - `PP-XDOMAIN-003`: the same risky OIDC path reaches a statically modeled AWS
   IAM role with explicit exact S3 read or write access to a modeled
   `aws_s3_bucket`.
+- `PP-XDOMAIN-004`: the same verified PP-XDOMAIN-003 path reaches a modeled
+  `aws_s3_bucket` classified `sensitive` by conservative local bucket-name or
+  allowlisted static tag metadata.
 
 These checks are static and local. PathProof does not execute workflows, call
 GitHub APIs, evaluate expressions, inspect action source, model workflow
@@ -442,8 +450,10 @@ these findings.
 `AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket` edge from exact
 static S3 action/resource pairs. It does not expand AdministratorAccess,
 `Action "*" Resource "*"`, or `s3:* Resource "*"` into bucket access.
-`AWSS3Bucket` node sensitivity metadata is graph-only and is not required for
-this rule.
+`PP-XDOMAIN-004` additionally requires the same explicit S3 access path to
+target an `AWSS3Bucket` with `sensitivity_level` `sensitive` and at least one
+sanitized sensitivity reason. `PP-XDOMAIN-003` does not require sensitivity
+and still reports unknown-sensitivity buckets.
 
 This slice does not execute Terraform, parse modules, evaluate variables,
 locals, functions, `jsonencode`, interpolations, or
@@ -531,6 +541,8 @@ only publishes the SARIF file as an artifact.
 - `PP-XDOMAIN-003` detection for the local cross-domain GitHub Actions OIDC to
   AWS S3 bucket access path, gated by the same modeled risk signals and
   explicit exact static S3 access to modeled buckets.
+- `PP-XDOMAIN-004` detection for the higher-signal version of that path when
+  the modeled S3 bucket has conservative sanitized sensitivity metadata.
 - No Secret value ingestion or printing.
 
 ## Architecture
@@ -554,8 +566,8 @@ The scan loop is:
    `CanAssumeRole` edges when `--repo OWNER/REPO` supplies repository identity
    for static subject matching.
 8. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`,
-   `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and
-   `PP-XDOMAIN-003`.
+   `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, `PP-XDOMAIN-002`,
+   `PP-XDOMAIN-003`, and `PP-XDOMAIN-004`.
 9. Optionally write a local baseline config for current unsuppressed findings
    after configured rule filtering and suppressions.
 10. Build advisory remediation plans from structured graph metadata for
@@ -587,6 +599,8 @@ Implemented:
   modeling for modeled buckets.
 - `PP-XDOMAIN-003` finding for risky GitHub Actions OIDC access to a modeled
   AWS S3 bucket.
+- `PP-XDOMAIN-004` finding for risky GitHub Actions OIDC access to a
+  sensitive Terraform-modeled AWS S3 bucket.
 - SARIF 2.1.0 finding export.
 - Local baseline generation for current unsuppressed findings.
 - Deterministic remediation planning.

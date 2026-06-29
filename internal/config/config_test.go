@@ -22,6 +22,7 @@ func TestParseEmptyConfigEnablesAllRules(t *testing.T) {
 		analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole,
 		analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole,
 		analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket,
+		analysis.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket,
 	} {
 		if !cfg.EnabledRules[ruleID] {
 			t.Fatalf("%s enabled = false, want true", ruleID)
@@ -56,7 +57,7 @@ func TestParseEnableAllowlist(t *testing.T) {
 	if cfg.EnabledRules[analysis.RulePublicWorkloadCanReadSecret] || cfg.EnabledRules[analysis.RuleGitHubActionsDangerousPermissions] {
 		t.Fatalf("non-allowlisted rules enabled: %#v", cfg.EnabledRules)
 	}
-	if len(cfg.DisabledRules) != 7 {
+	if len(cfg.DisabledRules) != 8 {
 		t.Fatalf("disabled rules = %#v, want all non-allowlisted rules", cfg.DisabledRules)
 	}
 }
@@ -70,7 +71,7 @@ func TestParseDisableWinsOverEnableConflict(t *testing.T) {
 	if !cfg.EnabledRules[analysis.RulePublicWorkloadCanReadSecret] {
 		t.Fatalf("non-conflicting enabled rule disabled unexpectedly")
 	}
-	if len(cfg.DisabledRules) != 7 {
+	if len(cfg.DisabledRules) != 8 {
 		t.Fatalf("disabled rules = %#v, want conflicted rule and non-allowlisted rules", cfg.DisabledRules)
 	}
 }

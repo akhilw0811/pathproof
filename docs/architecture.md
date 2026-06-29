@@ -307,7 +307,10 @@ GitHub Actions risk signal from `PP-GHA-002` or `PP-GHA-003`. `PP-XDOMAIN-002`
 adds one required graph hop from that same risky pull request OIDC context to
 an administrative AWS permission. `PP-XDOMAIN-003` adds one required graph hop
 from that same risky pull request OIDC context to explicit modeled S3 bucket
-access. The supported `PP-XDOMAIN-001` paths are:
+access. `PP-XDOMAIN-004` is a higher-signal sibling of `PP-XDOMAIN-003` that
+requires the same explicit S3 access path to target an `AWSS3Bucket` with
+existing conservative `sensitive` metadata and at least one sanitized
+sensitivity reason. The supported `PP-XDOMAIN-001` paths are:
 
 `Workflow --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole`
 
@@ -331,6 +334,10 @@ and:
 
 `Workflow --DefinesJob--> WorkflowJob --CanRequestOIDCToken--> OIDCTokenCapability --CanAssumeRole--> AWSIAMRole --CanReadObject/CanWriteObject--> AWSS3Bucket`
 
+`PP-XDOMAIN-004` uses the same two path shapes as `PP-XDOMAIN-003`; the bucket
+sensitivity reason remains structured finding evidence and is not represented
+as a fake path edge.
+
 Workflow-level dangerous permission risk pairs only with workflow-level OIDC.
 Job-level dangerous permission risk pairs only with same-job OIDC. Unsafe
 checkout risk is a job/step risk and pairs with same-job OIDC when modeled; it
@@ -345,7 +352,11 @@ administrative with one of the same supported admin reason identities used by
 `PP-AWS-001`.
 `PP-XDOMAIN-003` also requires S3 access edge metadata with access mode
 `read` or `write` and at least one sanitized matched grant. Admin permissions
-alone do not imply S3 access in this slice.
+alone do not imply S3 access in this slice. `PP-XDOMAIN-004` additionally
+requires `AWSS3Bucket` metadata with `sensitivity_level` `sensitive` and
+sanitized bucket-name or allowlisted static tag reasons. It does not create
+sensitivity metadata, broaden S3 access matching, parse S3 bucket policies,
+model KMS, discover S3 objects, or call cloud APIs.
 
 Secret values are excluded by Kubernetes parsing and graph construction.
 Analysis preserves graph edge evidence as-is and does not implement generic
@@ -363,7 +374,7 @@ implemented actions are `RemoveSecretsResource`, `RemoveSecretReadVerb`, and
 `PP-GHA-001`. GitHub Actions action pinning is advisory unless a local
 `--github-action-pins` JSON mapping provides the exact original action ref and
 an exact 40-character commit SHA. `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
-`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003` receive no
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and `PP-XDOMAIN-004` receive no
 remediation plan, patch preview, patch output, or validation result in this
 slice.
 
@@ -416,8 +427,8 @@ contents.
 SARIF output is a findings-only CLI projection. `pathproof scan --format sarif`
 emits SARIF 2.1.0 with one PathProof tool driver, deterministic rule entries
 for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`,
-`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and `PP-XDOMAIN-003`, and one result per
-finding.
+`PP-XDOMAIN-001`, `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and `PP-XDOMAIN-004`,
+and one result per finding.
 SARIF stdout
 omits patch previews, patch output
 summaries, validation results, unified diffs, patched file contents, temporary
@@ -436,10 +447,11 @@ No live Kubernetes authorization evaluation, GitHub API integration, workflow
 execution, expression evaluation, reusable workflow resolution, action source
 inspection, exact GitHub workflow permission inheritance/override modeling,
 full CI/CD attack-path modeling beyond the current GitHub Actions OIDC to AWS
-IAM role trust and administrative-role findings, cloud provider integration,
-Terraform execution, broad HCL parsing, module or variable evaluation, IAM
-simulation, S3 bucket policy analysis, KMS modeling, provider default tag
-expansion, S3 object/content discovery, broad data classification,
-sensitivity-based findings, live validation, in-place patch application,
-persistence, AI, dashboard, plugin system, external service integration, pull
-request creation, or live Kubernetes cluster integration is implemented.
+IAM role trust, administrative-role, S3, and sensitive-S3 findings, cloud
+provider integration, Terraform execution, broad HCL parsing, module or
+variable evaluation, IAM simulation, S3 bucket policy analysis, KMS modeling,
+provider default tag expansion, S3 object/content discovery, broad data
+classification, sensitivity-based findings beyond `PP-XDOMAIN-004`, live
+validation, in-place patch application, persistence, AI, dashboard, plugin
+system, external service integration, pull request creation, or live
+Kubernetes cluster integration is implemented.
