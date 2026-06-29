@@ -859,8 +859,9 @@ with one PathProof run, deterministic rule entries for `PP-K8S-001`,
 `PP-GHA-001`, `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, and
 `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and
 `PP-XDOMAIN-004`, and one result per finding.
-Result properties include finding ID, severity, ordered node IDs, ordered edge
-IDs, and clean display source references when available.
+Result properties include finding ID, severity, optional baseline status when
+`--baseline` is supplied, ordered node IDs, ordered edge IDs, and clean display
+source references when available.
 
 SARIF locations are derived only from structured source-reference fields whose
 entire value is a clean `filename#document=N` reference or an exact supported
@@ -880,13 +881,36 @@ source location, not line ranges.
 SARIF remains findings-only even when patch flags are supplied. Patch previews,
 patch output summaries, validation results, unified diffs, patched file
 contents, temporary paths, raw manifests, and Secret values are not represented
-in SARIF.
+in SARIF. When `--baseline` is supplied, resolved baseline IDs are not emitted
+as SARIF results and raw baseline content is not represented in SARIF.
 
 Each CLI JSON finding includes the finding `id`, `rule_id`, `title`,
 `severity`, `summary`, ordered `path`, ordered `evidence`, and
 `source_references`. Each path entry contains the graph node `id`, `kind`, and
 `name`. Each evidence entry contains `edge_id`, `kind`, `source`, and `detail`.
 Path and evidence order match the deterministic analysis chain order.
+When `--baseline` is supplied, visible current findings also include
+`baseline_status` with value `new` or `existing`.
+
+When `pathproof scan --baseline <file>` is used, CLI JSON also includes
+top-level baseline comparison metadata. This is a CLI projection, not part of
+the graph schema, and it never includes suppression reasons or raw baseline
+content:
+
+```json
+{
+  "baseline_comparison": {
+    "new_findings_count": 1,
+    "existing_findings_count": 2,
+    "resolved_findings_count": 1,
+    "resolved_finding_ids": ["finding:PP-K8S-001:..."]
+  }
+}
+```
+
+Comparison uses current active-scope finding IDs after configured path
+exclusions and rule filtering but before active config suppressions. Baseline
+IDs come only from `suppressions[].finding_id` in the local baseline file.
 
 When a complete remediation plan exists, the CLI finding also includes:
 

@@ -72,6 +72,7 @@ type cliSARIFArtifactLocation struct {
 type cliSARIFProperties struct {
 	FindingID        string   `json:"finding_id"`
 	Severity         string   `json:"severity"`
+	BaselineStatus   string   `json:"baseline_status,omitempty"`
 	NodeIDs          []string `json:"node_ids"`
 	EdgeIDs          []string `json:"edge_ids"`
 	SourceReferences []string `json:"source_references"`
@@ -206,6 +207,40 @@ func TestRunScanSARIFOmitDisabledAndSuppressedFindings(t *testing.T) {
 			t.Fatalf("SARIF output contains suppression reason or suppressed finding ID: %s", stdout)
 		}
 	})
+}
+
+func TestRunScanSARIFBaselineStatusIsFindingsOnly(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	assertCode(t, initialCode, 1)
+	assertString(t, "initial stderr", initialErr, "")
+	finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+	resolvedID := testCLIBaselineFindingID("PP-GHA-001", "c")
+	writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"FAKE_SARIF_BASELINE_REASON_SECRET_DO_NOT_RETAIN"},{"finding_id":"`+resolvedID+`","reason":"Accepted stale"}]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=sarif", "--baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	if got := countSARIFResultsByRule(report, "PP-GHA-001"); got != 1 {
+		t.Fatalf("PP-GHA-001 SARIF result count = %d, want 1", got)
+	}
+	result := report.Runs[0].Results[0]
+	if result.Properties.BaselineStatus != "existing" {
+		t.Fatalf("baseline_status = %q, want existing", result.Properties.BaselineStatus)
+	}
+	for _, forbidden := range []string{"baseline_comparison", "resolved_finding_ids", resolvedID, "FAKE_SARIF_BASELINE_REASON_SECRET_DO_NOT_RETAIN"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF baseline output contains forbidden value %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
 }
 
 func TestRunScanSARIFOmitPathExcludedFindings(t *testing.T) {

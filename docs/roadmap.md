@@ -163,12 +163,17 @@
   not overwrite existing files, create parent directories, build remediation
   or patch output, call APIs, execute Terraform, or change graph or rule
   semantics.
+- Local baseline comparison through `pathproof scan --baseline <file>`. It
+  loads a local config-shaped JSON file, uses only suppression finding IDs for
+  comparison, classifies active-scope current findings as `new` or
+  `existing`, reports resolved baseline finding IDs, and does not suppress
+  findings unless `--config` also supplies active suppressions.
 - Local Kubernetes YAML, GitHub Actions workflow, and narrow Terraform scan CLI for
   `pathproof scan <directory>` with human-readable finding, supported
   Kubernetes remediation and optional patch preview output, optional
   `--repo OWNER/REPO` OIDC trust matching, optional `--config <file>` local
-  rule controls and finding suppressions, JSON output, SARIF 2.1.0 finding
-  output, and stable exit codes.
+  rule controls and finding suppressions, optional `--baseline <file>`
+  comparison, JSON output, SARIF 2.1.0 finding output, and stable exit codes.
 - Local findings-only SARIF export for `PP-K8S-001`, `PP-GHA-001`,
   `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, and
   `PP-XDOMAIN-002`, `PP-XDOMAIN-003`, and `PP-XDOMAIN-004`. SARIF artifact
@@ -180,8 +185,8 @@
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Globstar, glob, regex, or policy-driven path exclusions.
-- Baseline diffing, newly introduced findings mode, suppression expiration,
-  owner/team metadata, and severity thresholds.
+- Fail-on-new baseline gating, baseline update or merge, remote baselines,
+  suppression expiration, owner/team metadata, and severity thresholds.
 - Enterprise policy packs, remote configs, config discovery, inheritance, and
   includes.
 - Full CI/CD attack-path modeling.

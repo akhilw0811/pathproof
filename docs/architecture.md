@@ -9,6 +9,7 @@ and local directory scans with:
 - `pathproof scan --format=json <directory>`
 - `pathproof scan --format sarif <directory>`
 - `pathproof scan --config <file> <directory>`
+- `pathproof scan --baseline <file> <directory>`
 - `pathproof scan --repo OWNER/REPO <directory>`
 - `pathproof scan --github-action-pins <file> <directory>`
 - `pathproof scan --write-baseline <file> <directory>`
@@ -23,10 +24,12 @@ selection before parsing, parses non-excluded Kubernetes manifests and local
 GitHub Actions workflows under `.github/workflows`, parses non-excluded local
 Terraform `.tf` files for a narrow static AWS IAM role OIDC trust-policy
 slice, constructs the in-memory graph, runs deterministic analysis, applies
-configured rule filtering and exact finding-ID suppressions, optionally writes
-a local baseline config for the remaining unsuppressed findings, builds
+configured rule filtering, optionally compares active-scope findings against a
+local baseline config's suppression finding IDs, applies exact finding-ID
+suppressions, optionally writes a local baseline config for the remaining
+unsuppressed findings, builds
 advisory remediation plans for supported unsuppressed Kubernetes findings and
-`PP-GHA-001` unpinned action findings when baseline mode is not active,
+`PP-GHA-001` unpinned action findings when baseline writing is not active,
 optionally builds read-only patch previews for supported remediation changes,
 optionally writes patched copies for supported generated previews to a
 separate output directory, optionally validates written Kubernetes patches by
@@ -42,8 +45,9 @@ or expose graph internals beyond the ordered finding path, evidence,
 remediation plan fields, optional preview fields, optional patch output
 summaries, optional validation results, and SARIF finding projection.
 
-Config loading and baseline writing live under `internal/config` and use only
-Go standard library JSON parsing. Config is explicit-flag-only: there is no
+Config loading, baseline writing, and baseline comparison loading live under
+`internal/config` and use only Go standard library JSON parsing. Config is
+explicit-flag-only: there is no
 per-directory discovery, environment expansion, remote URL loading, includes,
 inheritance, YAML, TOML, glob patterns, or regex patterns. Config supports
 literal relative path exclusions and trailing-slash directory-prefix
@@ -56,6 +60,24 @@ output, and SARIF. Suppressions are exact finding-ID matches applied after
 rule filtering; suppressed findings are omitted from output and downstream
 remediation/patch/validation behavior. Suppression reasons are required and
 validated but are not printed.
+
+Baseline comparison is explicit and local-only through
+`pathproof scan --baseline <file>`. The baseline file uses the same local JSON
+config shape and parser, but comparison consumes only
+`suppressions[].finding_id`; rule controls and path exclusions in that file do
+not affect scanning unless the file is also supplied through `--config`.
+Comparison runs after configured path exclusions and rule filtering define the
+active scan scope and before active config suppressions hide findings.
+Current active-scope finding IDs present in the baseline are `existing`;
+current active-scope finding IDs absent from the baseline are `new`; baseline
+IDs absent from current active-scope findings are resolved. Duplicate
+baseline IDs are deduplicated, resolved IDs are sorted deterministically, and
+suppression reasons are never projected into output. Baseline comparison
+rejects suppression finding IDs that do not match PathProof's generated
+`finding:<rule>:<sha256>` shape, so arbitrary stale baseline content cannot be
+reported as a resolved finding ID. `--baseline` does not change remediation,
+patch preview, patch writing, validation, or exit-code behavior for
+unsuppressed findings.
 
 Baseline generation is local-only and writes a JSON config containing only
 `suppressions` entries with stable finding IDs and the deterministic reason
@@ -436,7 +458,9 @@ paths, and raw manifests even when patch flags are supplied. Patch
 write/validation side effects still follow the same scan flag contract. When
 `--write-baseline` is supplied with SARIF output, the baseline file is still
 written as a local side effect and SARIF stdout remains findings-only with no
-baseline metadata. SARIF
+baseline metadata. When `--baseline` is supplied, current SARIF results may
+include the safe `baseline_status` property, but resolved baseline IDs are not
+emitted as SARIF results and raw baseline content is omitted. SARIF
 locations use only clean structured `filename#document=N` source-reference
 fields; embedded references in prose are ignored. Artifact URIs are relative
 to the scan root and URI-encoded, while display source references in result

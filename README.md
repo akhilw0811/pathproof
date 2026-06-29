@@ -69,6 +69,11 @@ relative files or trailing-slash directory prefixes from the scan before
 parsing. Config files are local-only and are not discovered automatically.
 `pathproof scan --write-baseline <file>` can generate a local JSON config
 containing finding-ID suppressions for the current unsuppressed findings.
+`pathproof scan --baseline <file> <directory>` compares the active scan scope
+against a local config-shaped baseline file and reports current findings as
+new or existing, plus baseline finding IDs that are resolved. `--baseline`
+does not suppress findings by itself; pass a file through `--config` when its
+suppressions should hide accepted findings.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
@@ -77,9 +82,9 @@ resolution, action source inspection, broader sensitive-resource types, live
 cluster scanning, cloud validation, IAM simulation, broad cross-domain
 analysis, S3 bucket policies, KMS modeling, public access block modeling,
 object modeling, full data discovery, DLP-style classification, broad
-sensitivity-based findings, glob or regex exclusions, baseline diffing, newly
-introduced findings mode, pull request creation, AI/ML ranking, and dashboards
-are not implemented.
+sensitivity-based findings, glob or regex exclusions, fail-on-new baseline
+gating, baseline update or merge, remote baselines, pull request creation,
+AI/ML ranking, and dashboards are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, baseline write, and internal scan errors exit `2`.
@@ -293,13 +298,40 @@ Rerun with the generated baseline:
 ./bin/pathproof scan --config ./pathproof-baseline.json ./examples/kubernetes/public-secret-path
 ```
 
+Compare against the generated baseline without suppressing findings:
+
+```sh
+./bin/pathproof scan --baseline ./pathproof-baseline.json ./examples/kubernetes/public-secret-path
+```
+
+The comparison marks visible current findings with `new` or `existing` and
+reports resolved baseline finding IDs that are no longer present in the active
+scan scope. JSON output includes a top-level `baseline_comparison` object and
+per-finding `baseline_status` fields when `--baseline` is supplied. SARIF
+remains findings-focused: it includes current findings and may include a safe
+`baseline_status` result property, but it does not emit resolved findings as
+SARIF results.
+
+Use both flags when the same generated file should also suppress accepted
+findings:
+
+```sh
+./bin/pathproof scan --config ./pathproof-baseline.json --baseline ./pathproof-baseline.json ./examples/kubernetes/public-secret-path
+```
+
 If `--config` is supplied while writing a baseline, rule controls, path
 exclusions, and existing suppressions are applied before baseline generation.
 Already-suppressed and stale suppression entries are not copied into the new
 baseline. The baseline writer is local-only, does not overwrite existing
 files, does not create parent directories, and may write inside the scan root
 because scanning has already completed before the file is created. Baseline
-diffing and newly introduced finding mode are not implemented yet.
+comparison uses only `suppressions[].finding_id` from `--baseline`; any rules
+or path exclusions in that file affect scanning only if the same file is also
+passed through `--config`. Baseline comparison accepts only PathProof finding
+IDs with the generated `finding:<rule>:<sha256>` shape so stale entries cannot
+print arbitrary baseline file content. Fail-on-new, baseline update, baseline
+merge, remote baselines, expiration, owners, and severity thresholds are not
+implemented yet.
 
 Scan the GitHub Actions demo fixture:
 
@@ -498,6 +530,9 @@ The demo fixture is expected to produce `PP-K8S-001`, so CI handles exit code
 
 When `--write-baseline` succeeds, the scan exits `0` even if findings were
 written into the generated baseline.
+When `--baseline` is supplied without `--config` suppressions, existing
+baseline findings still count as current findings and keep the scan exit code
+at `1`.
 
 CI verifies that `pathproof.sarif` exists, is non-empty, contains SARIF version
 `2.1.0`, and contains `PP-K8S-001`, then uploads it with
@@ -570,11 +605,13 @@ The scan loop is:
    `PP-XDOMAIN-003`, and `PP-XDOMAIN-004`.
 9. Optionally write a local baseline config for current unsuppressed findings
    after configured rule filtering and suppressions.
-10. Build advisory remediation plans from structured graph metadata for
+10. Optionally compare active-scope findings against a local baseline config's
+   suppression finding IDs before active config suppressions are applied.
+11. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
-11. Optionally generate read-only `NarrowBindingSubject` patch previews.
-12. Optionally write patched copies to a separate output directory.
-13. Optionally validate by rescanning a complete temporary overlay that replaces
+12. Optionally generate read-only `NarrowBindingSubject` patch previews.
+13. Optionally write patched copies to a separate output directory.
+14. Optionally validate by rescanning a complete temporary overlay that replaces
    original files with generated patched copies.
 
 PathProof does not contact a live cluster, run `kubectl`, apply patches in
@@ -603,6 +640,7 @@ Implemented:
   sensitive Terraform-modeled AWS S3 bucket.
 - SARIF 2.1.0 finding export.
 - Local baseline generation for current unsuppressed findings.
+- Local baseline comparison for new, existing, and resolved finding IDs.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
 - Validation rescan.
@@ -618,7 +656,7 @@ Not implemented:
 - Action source inspection.
 - Automatic action pinning patches.
 - Automatic remediation for unsafe `pull_request_target` checkout patterns.
-- Baseline diffing or newly introduced finding mode.
+- Fail-on-new baseline gating, baseline update or merge, and remote baselines.
 - PR creation.
 - In-place edits.
 - Broad RBAC patching.

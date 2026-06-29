@@ -12,20 +12,22 @@ import (
 )
 
 func TestBaselineJSONWritesSuppressionsOnlySortedAndDeduped(t *testing.T) {
+	ghaID := testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "b")
+	k8sID := testBaselineFindingID(analysis.RulePublicWorkloadCanReadSecret, "a")
 	findings := []analysis.Finding{
 		{
-			ID:               "finding:PP-GHA-001:z",
+			ID:               ghaID,
 			RuleID:           analysis.RuleGitHubActionsUnpinnedAction,
 			Title:            "FAKE_BASELINE_TITLE_SECRET_DO_NOT_RETAIN",
 			Summary:          "FAKE_BASELINE_SUMMARY_SECRET_DO_NOT_RETAIN",
 			SourceReferences: []string{"source-secret.yaml#document=1"},
 		},
 		{
-			ID:       "finding:PP-K8S-001:a",
+			ID:       k8sID,
 			RuleID:   analysis.RulePublicWorkloadCanReadSecret,
 			Evidence: []analysis.FindingEvidence{{}},
 		},
-		{ID: "finding:PP-GHA-001:z"},
+		{ID: ghaID},
 	}
 
 	data, count, err := baselineJSON(findings)
@@ -36,7 +38,7 @@ func TestBaselineJSONWritesSuppressionsOnlySortedAndDeduped(t *testing.T) {
 		t.Fatalf("count = %d, want 2", count)
 	}
 
-	want := "{\n  \"suppressions\": [\n    {\n      \"finding_id\": \"finding:PP-GHA-001:z\",\n      \"reason\": \"Baseline accepted at generation time\"\n    },\n    {\n      \"finding_id\": \"finding:PP-K8S-001:a\",\n      \"reason\": \"Baseline accepted at generation time\"\n    }\n  ]\n}\n"
+	want := "{\n  \"suppressions\": [\n    {\n      \"finding_id\": \"" + string(ghaID) + "\",\n      \"reason\": \"Baseline accepted at generation time\"\n    },\n    {\n      \"finding_id\": \"" + string(k8sID) + "\",\n      \"reason\": \"Baseline accepted at generation time\"\n    }\n  ]\n}\n"
 	if string(data) != want {
 		t.Fatalf("baseline JSON = %s, want %s", data, want)
 	}
@@ -74,8 +76,9 @@ func TestBaselineJSONWritesEmptySuppressionsArray(t *testing.T) {
 func TestWriteBaselineGeneratedConfigLoads(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "baseline.json")
+	findingID := testBaselineFindingID(analysis.RulePublicWorkloadCanReadSecret, "a")
 
-	count, err := WriteBaseline(path, []analysis.Finding{{ID: "finding:PP-K8S-001:abc"}})
+	count, err := WriteBaseline(path, []analysis.Finding{{ID: findingID}})
 	if err != nil {
 		t.Fatalf("WriteBaseline: %v", err)
 	}
@@ -94,7 +97,7 @@ func TestWriteBaselineGeneratedConfigLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load generated baseline: %v", err)
 	}
-	suppression, ok := cfg.Suppressions["finding:PP-K8S-001:abc"]
+	suppression, ok := cfg.Suppressions[findingID]
 	if !ok {
 		t.Fatalf("generated suppression missing: %#v", cfg.Suppressions)
 	}
@@ -103,8 +106,137 @@ func TestWriteBaselineGeneratedConfigLoads(t *testing.T) {
 	}
 }
 
+func TestLoadBaselineIDsUsesConfigSuppressionsOnlySortedAndDeduped(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "baseline.json")
+	ghaID := testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "b")
+	k8sID := testBaselineFindingID(analysis.RulePublicWorkloadCanReadSecret, "a")
+	if err := os.WriteFile(path, []byte(`{
+		"rules": {"disable": ["PP-K8S-001"]},
+		"suppressions": [
+			{"finding_id": "`+string(ghaID)+`", "reason": "FAKE_BASELINE_REASON_SECRET_DO_NOT_RETAIN"},
+			{"finding_id": "`+string(k8sID)+`", "reason": "Accepted"},
+			{"finding_id": "`+string(ghaID)+`", "reason": "Duplicate"}
+		],
+		"path_exclusions": ["ignored/"]
+	}`), 0o600); err != nil {
+		t.Fatalf("write baseline: %v", err)
+	}
+
+	ids, err := LoadBaselineIDs(path)
+	if err != nil {
+		t.Fatalf("LoadBaselineIDs: %v", err)
+	}
+
+	want := []analysis.FindingID{ghaID, k8sID}
+	if !reflect.DeepEqual(ids, want) {
+		t.Fatalf("baseline IDs = %#v, want %#v", ids, want)
+	}
+}
+
+func TestCompareBaselineIDsClassifiesAndResolvesDeterministically(t *testing.T) {
+	existingID := testBaselineFindingID(analysis.RulePublicWorkloadCanReadSecret, "a")
+	newID := testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "b")
+	resolvedAID := testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "c")
+	resolvedBID := testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "d")
+	comparison := CompareBaselineIDs(
+		[]analysis.FindingID{
+			existingID,
+			resolvedBID,
+			resolvedAID,
+			resolvedBID,
+		},
+		[]analysis.Finding{
+			{ID: existingID},
+			{ID: newID},
+		},
+	)
+
+	if comparison.NewFindingsCount != 1 || comparison.ExistingFindingsCount != 1 {
+		t.Fatalf("comparison counts = %#v, want one new and one existing", comparison)
+	}
+	if comparison.StatusByFindingID[existingID] != BaselineStatusExisting {
+		t.Fatalf("existing status = %q", comparison.StatusByFindingID[existingID])
+	}
+	if comparison.StatusByFindingID[newID] != BaselineStatusNew {
+		t.Fatalf("new status = %q", comparison.StatusByFindingID[newID])
+	}
+	wantResolved := []analysis.FindingID{resolvedAID, resolvedBID}
+	if !reflect.DeepEqual(comparison.ResolvedFindingIDs, wantResolved) {
+		t.Fatalf("resolved IDs = %#v, want %#v", comparison.ResolvedFindingIDs, wantResolved)
+	}
+}
+
+func TestCompareBaselineIDsEmptyBaselineMarksAllCurrentFindingsNew(t *testing.T) {
+	comparison := CompareBaselineIDs(nil, []analysis.Finding{
+		{ID: testBaselineFindingID(analysis.RulePublicWorkloadCanReadSecret, "a")},
+		{ID: testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "b")},
+	})
+
+	if comparison.NewFindingsCount != 2 || comparison.ExistingFindingsCount != 0 || len(comparison.ResolvedFindingIDs) != 0 {
+		t.Fatalf("comparison = %#v, want all current findings new", comparison)
+	}
+}
+
+func TestLoadBaselineIDsRejectsInvalidInputsWithSanitizedErrors(t *testing.T) {
+	dir := t.TempDir()
+	malformed := filepath.Join(dir, "malformed.json")
+	if err := os.WriteFile(malformed, []byte(`{"suppressions":[{"finding_id":"finding:PP-K8S-001:abc","reason":"FAKE_BASELINE_PARSE_SECRET_DO_NOT_RETAIN"}`), 0o600); err != nil {
+		t.Fatalf("write malformed baseline: %v", err)
+	}
+	nonObject := filepath.Join(dir, "non-object.json")
+	if err := os.WriteFile(nonObject, []byte(`["FAKE_BASELINE_ARRAY_SECRET_DO_NOT_RETAIN"]`), 0o600); err != nil {
+		t.Fatalf("write non-object baseline: %v", err)
+	}
+	unknown := filepath.Join(dir, "unknown.json")
+	if err := os.WriteFile(unknown, []byte(`{"unknown":"FAKE_BASELINE_UNKNOWN_SECRET_DO_NOT_RETAIN"}`), 0o600); err != nil {
+		t.Fatalf("write unknown baseline: %v", err)
+	}
+	unsafeID := filepath.Join(dir, "unsafe-id.json")
+	if err := os.WriteFile(unsafeID, []byte(`{"suppressions":[{"finding_id":"finding:PP-GHA-001:/tmp/FAKE_BASELINE_ID_SECRET_DO_NOT_RETAIN","reason":"Accepted"}]}`), 0o600); err != nil {
+		t.Fatalf("write unsafe ID baseline: %v", err)
+	}
+	tokenID := filepath.Join(dir, "token-id.json")
+	if err := os.WriteFile(tokenID, []byte(`{"suppressions":[{"finding_id":"finding:PP-GHA-001:FAKE_BASELINE_TOKEN_SECRET_DO_NOT_RETAIN","reason":"Accepted"}]}`), 0o600); err != nil {
+		t.Fatalf("write token ID baseline: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		path      string
+		want      string
+		forbidden []string
+	}{
+		{name: "empty", path: "", want: "path is empty"},
+		{name: "remote", path: "https://example.invalid/baseline.json", want: "local file path", forbidden: []string{"example.invalid"}},
+		{name: "url-like", path: "s3:bucket/baseline.json", want: "local file path", forbidden: []string{"bucket"}},
+		{name: "missing", path: filepath.Join(dir, "missing.json"), want: "read baseline file", forbidden: []string{dir, "missing.json"}},
+		{name: "directory", path: dir, want: "path is a directory", forbidden: []string{dir}},
+		{name: "malformed", path: malformed, want: "not valid JSON", forbidden: []string{"FAKE_BASELINE_PARSE_SECRET_DO_NOT_RETAIN"}},
+		{name: "non object", path: nonObject, want: "must be a JSON object", forbidden: []string{"FAKE_BASELINE_ARRAY_SECRET_DO_NOT_RETAIN"}},
+		{name: "unknown field", path: unknown, want: "unknown or unsupported field", forbidden: []string{"FAKE_BASELINE_UNKNOWN_SECRET_DO_NOT_RETAIN"}},
+		{name: "unsafe id", path: unsafeID, want: "unsupported format", forbidden: []string{"FAKE_BASELINE_ID_SECRET_DO_NOT_RETAIN", dir, "/tmp/"}},
+		{name: "token id", path: tokenID, want: "unsupported format", forbidden: []string{"FAKE_BASELINE_TOKEN_SECRET_DO_NOT_RETAIN"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadBaselineIDs(tt.path)
+			if err == nil {
+				t.Fatal("LoadBaselineIDs error = nil")
+			}
+			assertErrorContains(t, err, tt.want)
+			for _, forbidden := range tt.forbidden {
+				assertErrorDoesNotContain(t, err, forbidden)
+			}
+		})
+	}
+}
+
 func TestBaselineJSONDeterministicRepeatedOutput(t *testing.T) {
-	findings := []analysis.Finding{{ID: "finding:b"}, {ID: "finding:a"}}
+	findings := []analysis.Finding{
+		{ID: testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "b")},
+		{ID: testBaselineFindingID(analysis.RuleGitHubActionsUnpinnedAction, "a")},
+	}
 	first, firstCount, err := baselineJSON(findings)
 	if err != nil {
 		t.Fatalf("first baselineJSON: %v", err)
@@ -175,7 +307,7 @@ func TestWriteBaselineWriteFailureIsSanitizedAndCleansUp(t *testing.T) {
 		openBaselineFile = original
 	}()
 
-	_, err := WriteBaseline(path, []analysis.Finding{{ID: "finding:PP-K8S-001:abc"}})
+	_, err := WriteBaseline(path, []analysis.Finding{{ID: testBaselineFindingID(analysis.RulePublicWorkloadCanReadSecret, "a")}})
 	if err == nil {
 		t.Fatal("WriteBaseline error = nil")
 	}
@@ -192,4 +324,8 @@ type failingBaselineFile struct {
 
 func (f failingBaselineFile) Write([]byte) (int, error) {
 	return 0, errors.New("FAKE_BASELINE_WRITE_SECRET_DO_NOT_RETAIN")
+}
+
+func testBaselineFindingID(ruleID analysis.RuleID, hexDigit string) analysis.FindingID {
+	return analysis.FindingID("finding:" + string(ruleID) + ":" + strings.Repeat(hexDigit, 64))
 }

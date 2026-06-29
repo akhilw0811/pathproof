@@ -2569,6 +2569,291 @@ jobs:
 	}
 }
 
+func TestRunScanBaselineJSONComparisonDoesNotSuppressFindings(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	assertCode(t, initialCode, 1)
+	assertString(t, "initial stderr", initialErr, "")
+	finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+
+	staleID := testCLIBaselineFindingID("PP-GHA-001", "c")
+	writeFileForTest(t, parent, "new-baseline.json", `{"suppressions":[{"finding_id":"`+staleID+`","reason":"FAKE_BASELINE_REASON_SECRET_DO_NOT_RETAIN"}]}`)
+	newOut, newErr, newCode := runCommandInDir(t, parent, "scan", "--format=json", "--baseline", "new-baseline.json", "scan")
+
+	assertCode(t, newCode, 1)
+	assertString(t, "new stderr", newErr, "")
+	newReport := assertValidJSONReport(t, newOut)
+	if newReport.BaselineComparison == nil {
+		t.Fatalf("baseline_comparison = nil")
+	}
+	if newReport.BaselineComparison.NewFindingsCount != 1 || newReport.BaselineComparison.ExistingFindingsCount != 0 || newReport.BaselineComparison.ResolvedFindingsCount != 1 {
+		t.Fatalf("new baseline comparison = %#v, want one new and one resolved", newReport.BaselineComparison)
+	}
+	if len(newReport.Findings) != 1 || newReport.Findings[0].BaselineStatus != "new" {
+		t.Fatalf("finding baseline status = %#v, want new", newReport.Findings)
+	}
+	if strings.Contains(newOut, "FAKE_BASELINE_REASON_SECRET_DO_NOT_RETAIN") || strings.Contains(newErr, "FAKE_BASELINE_REASON_SECRET_DO_NOT_RETAIN") {
+		t.Fatalf("baseline reason leaked\nstdout:%s\nstderr:%s", newOut, newErr)
+	}
+
+	writeFileForTest(t, parent, "existing-baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted"},{"finding_id":"`+staleID+`","reason":"Accepted stale"}]}`)
+	existingOut, existingErr, existingCode := runCommandInDir(t, parent, "scan", "--format=json", "--baseline", "existing-baseline.json", "scan")
+
+	assertCode(t, existingCode, 1)
+	assertString(t, "existing stderr", existingErr, "")
+	existingReport := assertValidJSONReport(t, existingOut)
+	if existingReport.BaselineComparison == nil {
+		t.Fatalf("baseline_comparison = nil")
+	}
+	if existingReport.BaselineComparison.NewFindingsCount != 0 || existingReport.BaselineComparison.ExistingFindingsCount != 1 || existingReport.BaselineComparison.ResolvedFindingsCount != 1 {
+		t.Fatalf("existing baseline comparison = %#v, want one existing and one resolved", existingReport.BaselineComparison)
+	}
+	wantResolved := []string{staleID}
+	if !reflect.DeepEqual(existingReport.BaselineComparison.ResolvedFindingIDs, wantResolved) {
+		t.Fatalf("resolved IDs = %#v, want %#v", existingReport.BaselineComparison.ResolvedFindingIDs, wantResolved)
+	}
+	if len(existingReport.Findings) != 1 || existingReport.Findings[0].BaselineStatus != "existing" {
+		t.Fatalf("finding baseline status = %#v, want existing", existingReport.Findings)
+	}
+}
+
+func TestRunScanBaselineHumanSummaryIsDeterministicAndSanitized(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	assertCode(t, initialCode, 1)
+	assertString(t, "initial stderr", initialErr, "")
+	finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+	staleID := testCLIBaselineFindingID("PP-GHA-001", "c")
+	writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"FAKE_BASELINE_HUMAN_REASON_SECRET_DO_NOT_RETAIN"},{"finding_id":"`+staleID+`","reason":"Accepted stale"}]}`)
+
+	firstOut, firstErr, firstCode := runCommandInDir(t, parent, "scan", "--baseline", "baseline.json", "scan")
+	secondOut, secondErr, secondCode := runCommandInDir(t, parent, "scan", "--baseline", "baseline.json", "scan")
+
+	assertCode(t, firstCode, 1)
+	assertCode(t, secondCode, 1)
+	assertString(t, "first stderr", firstErr, "")
+	assertString(t, "second stderr", secondErr, "")
+	assertString(t, "deterministic human baseline output", secondOut, firstOut)
+	assertContains(t, firstOut, "Finding count: 1\n")
+	assertContains(t, firstOut, "Baseline comparison:\n")
+	assertContains(t, firstOut, "New findings: 0\n")
+	assertContains(t, firstOut, "Existing findings: 1\n")
+	assertContains(t, firstOut, "Resolved findings: 1\n")
+	assertContains(t, firstOut, "Resolved finding IDs:\n  - "+staleID+"\n")
+	assertContains(t, firstOut, "Baseline status: existing\n")
+	if strings.Contains(firstOut, "FAKE_BASELINE_HUMAN_REASON_SECRET_DO_NOT_RETAIN") || strings.Contains(firstErr, "FAKE_BASELINE_HUMAN_REASON_SECRET_DO_NOT_RETAIN") {
+		t.Fatalf("human baseline output leaked reason\nstdout:%s\nstderr:%s", firstOut, firstErr)
+	}
+}
+
+func TestRunScanBaselineWithConfigSuppressionComparesBeforeSuppressing(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	assertCode(t, initialCode, 1)
+	assertString(t, "initial stderr", initialErr, "")
+	finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+	writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted baseline"}]}`)
+	writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"FAKE_BASELINE_CONFIG_SUPPRESSION_REASON_SECRET_DO_NOT_RETAIN"}]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("findings = %#v count=%d, want suppressed output", report.Findings, report.FindingCount)
+	}
+	if report.SuppressedFindingsCount == nil || *report.SuppressedFindingsCount != 1 {
+		t.Fatalf("suppressed count = %#v, want 1", report.SuppressedFindingsCount)
+	}
+	if report.BaselineComparison == nil || report.BaselineComparison.NewFindingsCount != 0 || report.BaselineComparison.ExistingFindingsCount != 1 || report.BaselineComparison.ResolvedFindingsCount != 0 {
+		t.Fatalf("baseline comparison = %#v, want one existing before suppression", report.BaselineComparison)
+	}
+	if strings.Contains(stdout, string(finding.ID)) || strings.Contains(stdout, "FAKE_BASELINE_CONFIG_SUPPRESSION_REASON_SECRET_DO_NOT_RETAIN") {
+		t.Fatalf("suppressed finding ID or reason leaked in JSON: %s", stdout)
+	}
+}
+
+func TestRunScanBaselineComparisonUsesActiveRuleAndPathScope(t *testing.T) {
+	t.Run("disabled rule", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+		assertCode(t, initialCode, 1)
+		assertString(t, "initial stderr", initialErr, "")
+		finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+		writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted"}]}`)
+		writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["PP-GHA-001"]}}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--baseline", "baseline.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		if report.BaselineComparison == nil || report.BaselineComparison.NewFindingsCount != 0 || report.BaselineComparison.ExistingFindingsCount != 0 || report.BaselineComparison.ResolvedFindingsCount != 1 {
+			t.Fatalf("baseline comparison = %#v, want disabled finding resolved in active scope", report.BaselineComparison)
+		}
+	})
+
+	t.Run("path excluded", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "ignored.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+		assertCode(t, initialCode, 1)
+		assertString(t, "initial stderr", initialErr, "")
+		finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+		writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted"}]}`)
+		writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":[".github/workflows/ignored.yml"]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--baseline", "baseline.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		if report.BaselineComparison == nil || report.BaselineComparison.NewFindingsCount != 0 || report.BaselineComparison.ExistingFindingsCount != 0 || report.BaselineComparison.ResolvedFindingsCount != 1 {
+			t.Fatalf("baseline comparison = %#v, want excluded finding resolved in active scope", report.BaselineComparison)
+		}
+		if strings.Contains(stdout, "ignored.yml") {
+			t.Fatalf("JSON output contains excluded source: %s", stdout)
+		}
+	})
+}
+
+func TestRunScanBaselineRejectsInvalidInputsAndWriteBaselineCombination(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "malformed.json", `{"suppressions":[{"finding_id":"finding:PP-GHA-001:abc","reason":"FAKE_BASELINE_CLI_PARSE_SECRET_DO_NOT_RETAIN"}`)
+	writeFileForTest(t, parent, "non-object.json", `["FAKE_BASELINE_CLI_ARRAY_SECRET_DO_NOT_RETAIN"]`)
+	writeFileForTest(t, parent, "unsafe-id.json", `{"suppressions":[{"finding_id":"finding:PP-GHA-001:/tmp/FAKE_BASELINE_CLI_ID_SECRET_DO_NOT_RETAIN","reason":"Accepted"}]}`)
+
+	tests := []struct {
+		name      string
+		args      []string
+		want      string
+		forbidden []string
+	}{
+		{name: "missing", args: []string{"scan", "--baseline", "missing.json", "scan"}, want: "read baseline file", forbidden: []string{"missing.json", parent}},
+		{name: "directory", args: []string{"scan", "--baseline", ".", "scan"}, want: "path is a directory", forbidden: []string{parent}},
+		{name: "malformed", args: []string{"scan", "--baseline", "malformed.json", "scan"}, want: "not valid JSON", forbidden: []string{"FAKE_BASELINE_CLI_PARSE_SECRET_DO_NOT_RETAIN"}},
+		{name: "non object", args: []string{"scan", "--baseline", "non-object.json", "scan"}, want: "must be a JSON object", forbidden: []string{"FAKE_BASELINE_CLI_ARRAY_SECRET_DO_NOT_RETAIN"}},
+		{name: "unsafe id", args: []string{"scan", "--baseline", "unsafe-id.json", "scan"}, want: "unsupported format", forbidden: []string{"FAKE_BASELINE_CLI_ID_SECRET_DO_NOT_RETAIN", "/tmp/", parent}},
+		{name: "write baseline", args: []string{"scan", "--baseline", "missing.json", "--write-baseline", "out.json", "scan"}, want: "--baseline cannot be combined with --write-baseline"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, code := runCommandInDir(t, parent, tt.args...)
+
+			assertCode(t, code, 2)
+			assertString(t, "stdout", stdout, "")
+			assertOneLineStderr(t, stderr)
+			assertContains(t, stderr, tt.want)
+			for _, forbidden := range tt.forbidden {
+				if strings.Contains(stderr, forbidden) {
+					t.Fatalf("stderr contains forbidden value %q: %s", forbidden, stderr)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(parent, "out.json")); !os.IsNotExist(err) {
+				t.Fatalf("baseline output exists after rejected comparison/write combination or unexpected stat error: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunScanBaselineDoesNotChangeRemediationPatchOrValidation(t *testing.T) {
+	t.Run("kubernetes", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+		initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+		assertCode(t, initialCode, 1)
+		assertString(t, "initial stderr", initialErr, "")
+		finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-K8S-001")
+		writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted"},{"finding_id":"`+testCLIBaselineFindingID("PP-K8S-001", "c")+`","reason":"Accepted stale"}]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--baseline", "baseline.json", "--preview-patches", "--write-patches", "patched", "--validate-patches", "scan")
+
+		assertCode(t, code, 1)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		gotFinding := firstCLIFindingByRule(t, report.Findings, "PP-K8S-001")
+		if gotFinding.BaselineStatus != "existing" || gotFinding.Remediation == nil {
+			t.Fatalf("finding = %#v, want existing with remediation", gotFinding)
+		}
+		if report.PatchOutputs == nil || len(*report.PatchOutputs) == 0 {
+			t.Fatalf("patch_outputs = %#v, want baseline to preserve patch output", report.PatchOutputs)
+		}
+		if len(report.Validation) != 1 || report.Validation[0].FindingID != finding.ID {
+			t.Fatalf("validation = %#v, want only current finding validation", report.Validation)
+		}
+	})
+
+	t.Run("github actions", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		sha := strings.Repeat("a", 40)
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+		initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+		assertCode(t, initialCode, 1)
+		assertString(t, "initial stderr", initialErr, "")
+		finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+		writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted"},{"finding_id":"`+testCLIBaselineFindingID("PP-GHA-001", "c")+`","reason":"Accepted stale"}]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--baseline", "baseline.json", "--github-action-pins", "pins.json", "--preview-patches", "--write-patches", "patched", "scan")
+
+		assertCode(t, code, 1)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		gotFinding := firstCLIFindingByRule(t, report.Findings, "PP-GHA-001")
+		if gotFinding.BaselineStatus != "existing" || gotFinding.Remediation == nil {
+			t.Fatalf("finding = %#v, want existing with remediation", gotFinding)
+		}
+		if report.PatchOutputs == nil || len(*report.PatchOutputs) == 0 {
+			t.Fatalf("patch_outputs = %#v, want baseline to preserve GitHub Actions patch output", report.PatchOutputs)
+		}
+		if len(report.Validation) != 0 {
+			t.Fatalf("validation = %#v, want no PP-GHA-001 validation", report.Validation)
+		}
+	})
+}
+
 func TestRunScanConfigPathExclusionsExcludeOnlyFinding(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "scan")
@@ -4514,7 +4799,7 @@ func TestProjectFindingRejectsMissingNode(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil, nil)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil, nil, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing node error")
 	}
@@ -4539,7 +4824,7 @@ func TestProjectFindingRejectsMissingEdge(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil, nil)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil, nil, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing edge error")
 	}
@@ -4855,12 +5140,20 @@ type cliJSONReport struct {
 	DisabledRules           []string              `json:"disabled_rules,omitempty"`
 	SuppressedFindingsCount *int                  `json:"suppressed_findings_count,omitempty"`
 	BaselineWritten         *cliJSONBaseline      `json:"baseline_written,omitempty"`
+	BaselineComparison      *cliJSONComparison    `json:"baseline_comparison,omitempty"`
 	PatchOutputs            *[]cliJSONPatchOutput `json:"patch_outputs,omitempty"`
 	Validation              []cliJSONValidation   `json:"validation,omitempty"`
 }
 
 type cliJSONBaseline struct {
 	SuppressionsGenerated int `json:"suppressions_generated"`
+}
+
+type cliJSONComparison struct {
+	NewFindingsCount      int      `json:"new_findings_count"`
+	ExistingFindingsCount int      `json:"existing_findings_count"`
+	ResolvedFindingsCount int      `json:"resolved_findings_count"`
+	ResolvedFindingIDs    []string `json:"resolved_finding_ids"`
 }
 
 type cliJSONFinding struct {
@@ -4874,6 +5167,7 @@ type cliJSONFinding struct {
 	SourceReferences  []string                  `json:"source_references"`
 	RiskSignal        *cliJSONRiskSignal        `json:"risk_signal,omitempty"`
 	BucketSensitivity *cliJSONBucketSensitivity `json:"bucket_sensitivity,omitempty"`
+	BaselineStatus    string                    `json:"baseline_status,omitempty"`
 	Remediation       *cliJSONRemediation       `json:"remediation,omitempty"`
 }
 
@@ -5452,6 +5746,10 @@ func readGeneratedBaselineForTest(t *testing.T, path string) generatedBaselineFo
 		}
 	}
 	return baseline
+}
+
+func testCLIBaselineFindingID(ruleID, hexDigit string) string {
+	return "finding:" + ruleID + ":" + strings.Repeat(hexDigit, 64)
 }
 
 func writeGitHubActionsWorkflowForTest(t *testing.T, root, name, content string) {

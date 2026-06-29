@@ -74,6 +74,7 @@ type sarifArtifactLocation struct {
 type sarifResultProperties struct {
 	FindingID        string   `json:"finding_id"`
 	Severity         string   `json:"severity"`
+	BaselineStatus   string   `json:"baseline_status,omitempty"`
 	NodeIDs          []string `json:"node_ids"`
 	EdgeIDs          []string `json:"edge_ids"`
 	SourceReferences []string `json:"source_references"`
@@ -271,6 +272,7 @@ func newSARIFResult(root string, finding scanFinding) sarifResult {
 		Properties: sarifResultProperties{
 			FindingID:        string(finding.ID),
 			Severity:         string(finding.Severity),
+			BaselineStatus:   string(finding.BaselineStatus),
 			NodeIDs:          sarifNodeIDs(finding.Path),
 			EdgeIDs:          sarifEdgeIDs(finding.Evidence),
 			SourceReferences: displayReferences,

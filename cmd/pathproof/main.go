@@ -27,7 +27,7 @@ import (
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--config <file>] [--repo OWNER/REPO] [--github-action-pins <file>] [--write-baseline <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--config <file>] [--baseline <file>] [--repo OWNER/REPO] [--github-action-pins <file>] [--write-baseline <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
@@ -45,6 +45,8 @@ type scanOptions struct {
 	repo             string
 	githubActionPins string
 	configPath       string
+	baselinePath     string
+	baselineSet      bool
 	writeBaseline    string
 	writeBaselineSet bool
 	directory        string
@@ -111,6 +113,16 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	var baselineComparison *config.BaselineComparison
+	var baselineIDs []analysis.FindingID
+	if options.baselineSet {
+		baselineIDs, err = config.LoadBaselineIDs(options.baselinePath)
+		if err != nil {
+			printError(stderr, err.Error())
+			return 2
+		}
+	}
+
 	var findings []analysis.Finding
 	var g *graph.Graph
 	if metadata != nil {
@@ -122,9 +134,18 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		printError(stderr, err.Error())
 		return 2
 	}
+	activeScopeFindings := findings
+	if metadata != nil {
+		activeScopeFindings = applyRuleFilteringToFindings(findings, cfg)
+	}
+	if options.baselineSet {
+		comparison := config.CompareBaselineIDs(baselineIDs, activeScopeFindings)
+		baselineComparison = &comparison
+	}
+	findings = activeScopeFindings
 	if metadata != nil {
 		var suppressedCount int
-		findings, suppressedCount = applyConfigToFindings(findings, cfg)
+		findings, suppressedCount = applySuppressionsToFindings(activeScopeFindings, cfg)
 		metadata.SuppressedFindingsCount = suppressedCount
 	}
 
@@ -138,7 +159,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return writeScanResultWithMetadataAndExclusions(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, cfg.PathExclusions, metadata, stdout, stderr)
+	return writeScanResultWithMetadataAndExclusions(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, cfg.PathExclusions, metadata, baselineComparison, stdout, stderr)
 }
 
 func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, stdout, stderr io.Writer) int {
@@ -146,10 +167,10 @@ func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, f
 }
 
 func writeScanResultWithMetadata(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, metadata *scanConfigMetadata, stdout, stderr io.Writer) int {
-	return writeScanResultWithMetadataAndExclusions(findings, g, root, format, previewPatches, writePatches, validatePatches, pins, nil, metadata, stdout, stderr)
+	return writeScanResultWithMetadataAndExclusions(findings, g, root, format, previewPatches, writePatches, validatePatches, pins, nil, metadata, nil, stdout, stderr)
 }
 
-func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, pathExclusions config.PathExclusions, metadata *scanConfigMetadata, stdout, stderr io.Writer) int {
+func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, pathExclusions config.PathExclusions, metadata *scanConfigMetadata, baselineComparison *config.BaselineComparison, stdout, stderr io.Writer) int {
 	plans, err := remediation.BuildWithGitHubActionPins(g, findings, pins)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
@@ -183,7 +204,7 @@ func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *gr
 			return 2
 		}
 	}
-	report, err := newScanReport(root, findings, g, plans, reportPreviews, patchOutputs, includePatchOutputs, validationResults, metadata)
+	report, err := newScanReport(root, findings, g, plans, reportPreviews, patchOutputs, includePatchOutputs, validationResults, metadata, baselineComparison)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -217,7 +238,7 @@ func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *gr
 }
 
 func writeBaselineScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, baselinePath string, metadata *scanConfigMetadata, stdout, stderr io.Writer) int {
-	report, err := newScanReport(root, findings, g, nil, nil, nil, false, nil, metadata)
+	report, err := newScanReport(root, findings, g, nil, nil, nil, false, nil, metadata, nil)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -262,6 +283,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	repoValue := flags.String("repo", "", "repository identity for GitHub Actions OIDC trust matching, in OWNER/REPO form")
 	githubActionPins := flags.String("github-action-pins", "", "local JSON mapping of GitHub Action refs to full commit SHAs")
 	configPath := flags.String("config", "", "local JSON PathProof config file")
+	baselinePath := flags.String("baseline", "", "local JSON baseline config file for comparison")
 	writeBaseline := flags.String("write-baseline", "", "write a local JSON baseline config for current unsuppressed findings")
 	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
 	writePatches := flags.String("write-patches", "", "write patched copies to an output directory")
@@ -271,12 +293,16 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	}
 	writePatchesSet := false
 	writeBaselineSet := false
+	baselineSet := false
 	flags.Visit(func(f *flag.Flag) {
 		if f.Name == "write-patches" {
 			writePatchesSet = true
 		}
 		if f.Name == "write-baseline" {
 			writeBaselineSet = true
+		}
+		if f.Name == "baseline" {
+			baselineSet = true
 		}
 	})
 	format := scanFormat(*formatValue)
@@ -307,6 +333,9 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	if writeBaselineSet && *validatePatches {
 		return scanOptions{}, fmt.Errorf("--write-baseline cannot be combined with --validate-patches")
 	}
+	if writeBaselineSet && baselineSet {
+		return scanOptions{}, fmt.Errorf("--baseline cannot be combined with --write-baseline")
+	}
 	if writePatchesSet {
 		if err := patchpreview.ValidateOutputRoot(dir, *writePatches); err != nil {
 			return scanOptions{}, err
@@ -325,16 +354,29 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			return scanOptions{}, err
 		}
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, configPath: *configPath, writeBaseline: *writeBaseline, writeBaselineSet: writeBaselineSet, directory: dir}, nil
+	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, configPath: *configPath, baselinePath: *baselinePath, baselineSet: baselineSet, writeBaseline: *writeBaseline, writeBaselineSet: writeBaselineSet, directory: dir}, nil
 }
 
 func applyConfigToFindings(findings []analysis.Finding, cfg config.Config) ([]analysis.Finding, int) {
+	filtered := applyRuleFilteringToFindings(findings, cfg)
+	return applySuppressionsToFindings(filtered, cfg)
+}
+
+func applyRuleFilteringToFindings(findings []analysis.Finding, cfg config.Config) []analysis.Finding {
 	filtered := make([]analysis.Finding, 0, len(findings))
-	suppressedCount := 0
 	for _, finding := range findings {
 		if !cfg.EnabledRules[finding.RuleID] {
 			continue
 		}
+		filtered = append(filtered, finding)
+	}
+	return filtered
+}
+
+func applySuppressionsToFindings(findings []analysis.Finding, cfg config.Config) ([]analysis.Finding, int) {
+	filtered := make([]analysis.Finding, 0, len(findings))
+	suppressedCount := 0
+	for _, finding := range findings {
 		if _, ok := cfg.Suppressions[finding.ID]; ok {
 			suppressedCount++
 			continue
@@ -588,14 +630,22 @@ func sanitizeValidationError(err error, overlay string) string {
 }
 
 type scanReport struct {
-	Findings                []scanFinding         `json:"findings"`
-	FindingCount            int                   `json:"finding_count"`
-	ConfigApplied           bool                  `json:"config_applied,omitempty"`
-	DisabledRules           []analysis.RuleID     `json:"disabled_rules,omitempty"`
-	SuppressedFindingsCount *int                  `json:"suppressed_findings_count,omitempty"`
-	BaselineWritten         *scanBaselineMetadata `json:"baseline_written,omitempty"`
-	PatchOutputs            *[]scanPatchOutput    `json:"patch_outputs,omitempty"`
-	Validation              []validation.Result   `json:"validation,omitempty"`
+	Findings                []scanFinding           `json:"findings"`
+	FindingCount            int                     `json:"finding_count"`
+	ConfigApplied           bool                    `json:"config_applied,omitempty"`
+	DisabledRules           []analysis.RuleID       `json:"disabled_rules,omitempty"`
+	SuppressedFindingsCount *int                    `json:"suppressed_findings_count,omitempty"`
+	BaselineWritten         *scanBaselineMetadata   `json:"baseline_written,omitempty"`
+	BaselineComparison      *scanBaselineComparison `json:"baseline_comparison,omitempty"`
+	PatchOutputs            *[]scanPatchOutput      `json:"patch_outputs,omitempty"`
+	Validation              []validation.Result     `json:"validation,omitempty"`
+}
+
+type scanBaselineComparison struct {
+	NewFindingsCount      int                  `json:"new_findings_count"`
+	ExistingFindingsCount int                  `json:"existing_findings_count"`
+	ResolvedFindingsCount int                  `json:"resolved_findings_count"`
+	ResolvedFindingIDs    []analysis.FindingID `json:"resolved_finding_ids"`
 }
 
 type scanFinding struct {
@@ -609,6 +659,7 @@ type scanFinding struct {
 	SourceReferences  []string               `json:"source_references"`
 	RiskSignal        *scanRiskSignal        `json:"risk_signal,omitempty"`
 	BucketSensitivity *scanBucketSensitivity `json:"bucket_sensitivity,omitempty"`
+	BaselineStatus    config.BaselineStatus  `json:"baseline_status,omitempty"`
 	Remediation       *scanRemediation       `json:"remediation,omitempty"`
 	SARIFSources      []string               `json:"-"`
 }
@@ -718,7 +769,7 @@ type scanPatchOutput struct {
 	Reason string              `json:"reason,omitempty"`
 }
 
-func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool, validationResults []validation.Result, metadata *scanConfigMetadata) (scanReport, error) {
+func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool, validationResults []validation.Result, metadata *scanConfigMetadata, baselineComparison *config.BaselineComparison) (scanReport, error) {
 	planByFinding := make(map[analysis.FindingID]remediation.Plan, len(plans))
 	for _, plan := range plans {
 		planByFinding[plan.FindingID] = plan
@@ -734,10 +785,21 @@ func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, pla
 		report.DisabledRules = append([]analysis.RuleID(nil), metadata.DisabledRules...)
 		report.SuppressedFindingsCount = &suppressedCount
 	}
+	if baselineComparison != nil {
+		report.BaselineComparison = &scanBaselineComparison{
+			NewFindingsCount:      baselineComparison.NewFindingsCount,
+			ExistingFindingsCount: baselineComparison.ExistingFindingsCount,
+			ResolvedFindingsCount: len(baselineComparison.ResolvedFindingIDs),
+			ResolvedFindingIDs:    append([]analysis.FindingID(nil), baselineComparison.ResolvedFindingIDs...),
+		}
+	}
 	for _, finding := range findings {
 		item, err := projectFinding(root, finding, g)
 		if err != nil {
 			return scanReport{}, err
+		}
+		if baselineComparison != nil {
+			item.BaselineStatus = baselineComparison.StatusByFindingID[finding.ID]
 		}
 		if plan, ok := planByFinding[finding.ID]; ok {
 			item.Remediation = projectRemediation(root, plan, previews)
@@ -1144,6 +1206,11 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 			return err
 		}
 	}
+	if report.BaselineComparison != nil {
+		if err := writeHumanBaselineComparison(w, report.BaselineComparison); err != nil {
+			return err
+		}
+	}
 	if report.FindingCount == 0 {
 		if _, err := fmt.Fprintln(w, "No findings."); err != nil {
 			return err
@@ -1156,6 +1223,11 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 	for _, finding := range report.Findings {
 		if _, err := fmt.Fprintf(w, "\nFinding: %s\n", finding.ID); err != nil {
 			return err
+		}
+		if finding.BaselineStatus != "" {
+			if _, err := fmt.Fprintf(w, "Baseline status: %s\n", finding.BaselineStatus); err != nil {
+				return err
+			}
 		}
 		if _, err := fmt.Fprintf(w, "Rule: %s\n", finding.RuleID); err != nil {
 			return err
@@ -1266,6 +1338,33 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 		return err
 	}
 	return writeHumanValidation(w, report)
+}
+
+func writeHumanBaselineComparison(w io.Writer, comparison *scanBaselineComparison) error {
+	if _, err := fmt.Fprintln(w, "Baseline comparison:"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "New findings: %d\n", comparison.NewFindingsCount); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Existing findings: %d\n", comparison.ExistingFindingsCount); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Resolved findings: %d\n", comparison.ResolvedFindingsCount); err != nil {
+		return err
+	}
+	if len(comparison.ResolvedFindingIDs) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "Resolved finding IDs:"); err != nil {
+		return err
+	}
+	for _, id := range comparison.ResolvedFindingIDs {
+		if _, err := fmt.Fprintf(w, "  - %s\n", id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func humanBucketSensitivitySummary(sensitivity *scanBucketSensitivity) string {
