@@ -8,6 +8,7 @@ and local directory scans with:
 - `pathproof scan --format json <directory>`
 - `pathproof scan --format=json <directory>`
 - `pathproof scan --format sarif <directory>`
+- `pathproof scan --config <file> <directory>`
 - `pathproof scan --repo OWNER/REPO <directory>`
 - `pathproof scan --github-action-pins <file> <directory>`
 - `pathproof scan --preview-patches <directory>`
@@ -15,11 +16,13 @@ and local directory scans with:
 - `pathproof scan --write-patches <output-directory> --validate-patches <directory>`
 
 The scan command is intentionally only an orchestration layer. It validates the
-local directory input, parses Kubernetes manifests and local GitHub Actions
+local directory input, optionally loads one explicit local JSON config file
+from `--config <file>`, parses Kubernetes manifests and local GitHub Actions
 workflows under `.github/workflows`, parses local Terraform `.tf` files for a
 narrow static AWS IAM role OIDC trust-policy slice, constructs the in-memory
-graph, runs deterministic analysis, builds advisory remediation plans for
-supported Kubernetes findings and `PP-GHA-001` unpinned action findings,
+graph, runs deterministic analysis, applies configured rule filtering and
+exact finding-ID suppressions, builds advisory remediation plans for supported
+unsuppressed Kubernetes findings and `PP-GHA-001` unpinned action findings,
 optionally builds read-only patch previews for supported remediation changes,
 optionally writes patched copies for supported generated previews to a
 separate output directory, optionally validates written Kubernetes patches by
@@ -33,6 +36,16 @@ never resolves tags or branches, never guesses SHAs, and does not validate
 graph internals beyond the ordered finding path, evidence, remediation plan
 fields, optional preview fields, optional patch output summaries, optional
 validation results, and SARIF finding projection.
+
+Config loading lives under `internal/config` and uses only Go standard library
+JSON parsing. Config is explicit-flag-only: there is no per-directory
+discovery, environment expansion, remote URL loading, includes, inheritance,
+YAML, TOML, path exclusions, or baseline generation in this slice. Rule
+controls are applied after analysis and before remediation, patch preview,
+patch writing, validation, JSON, human output, and SARIF. Suppressions are
+exact finding-ID matches applied after rule filtering; suppressed findings are
+omitted from output and downstream remediation/patch/validation behavior.
+Suppression reasons are required and validated but are not printed.
 
 Implemented Kubernetes parsing lives under `internal/parser/kubernetes`.
 It reads local YAML manifests and emits explicit Go types for supported

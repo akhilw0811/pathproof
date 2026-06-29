@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"pathproof/internal/analysis"
+	"pathproof/internal/config"
 	"pathproof/internal/graph"
 	parsergithubactions "pathproof/internal/parser/githubactions"
 	parserkubernetes "pathproof/internal/parser/kubernetes"
@@ -26,7 +27,7 @@ import (
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--repo OWNER/REPO] [--github-action-pins <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--config <file>] [--repo OWNER/REPO] [--github-action-pins <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
@@ -43,7 +44,14 @@ type scanOptions struct {
 	validatePatches  bool
 	repo             string
 	githubActionPins string
+	configPath       string
 	directory        string
+}
+
+type scanConfigMetadata struct {
+	ConfigApplied           bool
+	DisabledRules           []analysis.RuleID
+	SuppressedFindingsCount int
 }
 
 var scanValidationDirectory = scanDirectory
@@ -81,10 +89,30 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	var metadata *scanConfigMetadata
+	var cfg config.Config
+	if options.configPath != "" {
+		var err error
+		cfg, err = config.Load(options.configPath)
+		if err != nil {
+			printError(stderr, err.Error())
+			return 2
+		}
+		metadata = &scanConfigMetadata{
+			ConfigApplied: true,
+			DisabledRules: append([]analysis.RuleID(nil), cfg.DisabledRules...),
+		}
+	}
+
 	findings, g, err := scanDirectoryWithRepo(options.directory, options.repo)
 	if err != nil {
 		printError(stderr, err.Error())
 		return 2
+	}
+	if metadata != nil {
+		var suppressedCount int
+		findings, suppressedCount = applyConfigToFindings(findings, cfg)
+		metadata.SuppressedFindingsCount = suppressedCount
 	}
 
 	pins, err := remediation.LoadGitHubActionPins(options.githubActionPins)
@@ -93,10 +121,14 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return writeScanResult(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, stdout, stderr)
+	return writeScanResultWithMetadata(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, metadata, stdout, stderr)
 }
 
 func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, stdout, stderr io.Writer) int {
+	return writeScanResultWithMetadata(findings, g, root, format, previewPatches, writePatches, validatePatches, pins, nil, stdout, stderr)
+}
+
+func writeScanResultWithMetadata(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, metadata *scanConfigMetadata, stdout, stderr io.Writer) int {
 	plans, err := remediation.BuildWithGitHubActionPins(g, findings, pins)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
@@ -130,7 +162,7 @@ func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, f
 			return 2
 		}
 	}
-	report, err := newScanReport(root, findings, g, plans, reportPreviews, patchOutputs, includePatchOutputs, validationResults)
+	report, err := newScanReport(root, findings, g, plans, reportPreviews, patchOutputs, includePatchOutputs, validationResults, metadata)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -169,6 +201,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	formatValue := flags.String("format", string(scanFormatHuman), "output format")
 	repoValue := flags.String("repo", "", "repository identity for GitHub Actions OIDC trust matching, in OWNER/REPO form")
 	githubActionPins := flags.String("github-action-pins", "", "local JSON mapping of GitHub Action refs to full commit SHAs")
+	configPath := flags.String("config", "", "local JSON PathProof config file")
 	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
 	writePatches := flags.String("write-patches", "", "write patched copies to an output directory")
 	validatePatches := flags.Bool("validate-patches", false, "rescan a temporary patched manifest set after writing patches")
@@ -218,7 +251,23 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			return scanOptions{}, err
 		}
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, directory: dir}, nil
+	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, configPath: *configPath, directory: dir}, nil
+}
+
+func applyConfigToFindings(findings []analysis.Finding, cfg config.Config) ([]analysis.Finding, int) {
+	filtered := make([]analysis.Finding, 0, len(findings))
+	suppressedCount := 0
+	for _, finding := range findings {
+		if !cfg.EnabledRules[finding.RuleID] {
+			continue
+		}
+		if _, ok := cfg.Suppressions[finding.ID]; ok {
+			suppressedCount++
+			continue
+		}
+		filtered = append(filtered, finding)
+	}
+	return filtered, suppressedCount
 }
 
 func scanDirectory(dir string) ([]analysis.Finding, *graph.Graph, error) {
@@ -437,10 +486,13 @@ func sanitizeValidationError(err error, overlay string) string {
 }
 
 type scanReport struct {
-	Findings     []scanFinding       `json:"findings"`
-	FindingCount int                 `json:"finding_count"`
-	PatchOutputs *[]scanPatchOutput  `json:"patch_outputs,omitempty"`
-	Validation   []validation.Result `json:"validation,omitempty"`
+	Findings                []scanFinding       `json:"findings"`
+	FindingCount            int                 `json:"finding_count"`
+	ConfigApplied           bool                `json:"config_applied,omitempty"`
+	DisabledRules           []analysis.RuleID   `json:"disabled_rules,omitempty"`
+	SuppressedFindingsCount *int                `json:"suppressed_findings_count,omitempty"`
+	PatchOutputs            *[]scanPatchOutput  `json:"patch_outputs,omitempty"`
+	Validation              []validation.Result `json:"validation,omitempty"`
 }
 
 type scanFinding struct {
@@ -549,7 +601,7 @@ type scanPatchOutput struct {
 	Reason string              `json:"reason,omitempty"`
 }
 
-func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool, validationResults []validation.Result) (scanReport, error) {
+func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool, validationResults []validation.Result, metadata *scanConfigMetadata) (scanReport, error) {
 	planByFinding := make(map[analysis.FindingID]remediation.Plan, len(plans))
 	for _, plan := range plans {
 		planByFinding[plan.FindingID] = plan
@@ -558,6 +610,12 @@ func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, pla
 		Findings:     make([]scanFinding, 0, len(findings)),
 		FindingCount: len(findings),
 		Validation:   append([]validation.Result(nil), validationResults...),
+	}
+	if metadata != nil {
+		suppressedCount := metadata.SuppressedFindingsCount
+		report.ConfigApplied = metadata.ConfigApplied
+		report.DisabledRules = append([]analysis.RuleID(nil), metadata.DisabledRules...)
+		report.SuppressedFindingsCount = &suppressedCount
 	}
 	for _, finding := range findings {
 		item, err := projectFinding(root, finding, g)
@@ -941,6 +999,11 @@ func absClean(path string) string {
 func writeHumanReport(w io.Writer, report scanReport) error {
 	if _, err := fmt.Fprintf(w, "Finding count: %d\n", report.FindingCount); err != nil {
 		return err
+	}
+	if report.SuppressedFindingsCount != nil && *report.SuppressedFindingsCount > 0 {
+		if _, err := fmt.Fprintf(w, "Suppressed findings: %d\n", *report.SuppressedFindingsCount); err != nil {
+			return err
+		}
 	}
 	if report.FindingCount == 0 {
 		if _, err := fmt.Fprintln(w, "No findings."); err != nil {

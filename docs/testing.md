@@ -31,10 +31,24 @@ Scan command tests cover argument validation, deterministic controlled flag
 errors, accepted `--format json` and `--format=json` syntax, accepted
 `--format sarif` and `--format=sarif` syntax, accepted `--repo OWNER/REPO`
 syntax, invalid `--repo` errors with empty stdout, accepted
-`--preview-patches` syntax, missing and non-directory path errors, human
-output, JSON output, SARIF output, exactly one trailing newline, stderr-only
-errors, output write failures, deterministic repeated output, deterministic
-input file ordering, and Secret-value absence from stdout and stderr.
+`--config <file>` syntax, accepted `--preview-patches` syntax, missing and
+non-directory path errors, human output, JSON output, SARIF output, exactly one
+trailing newline, stderr-only errors, output write failures, deterministic
+repeated output, deterministic input file ordering, and Secret-value absence
+from stdout and stderr.
+Config parser coverage asserts that the explicit local JSON file format parses
+empty configs, disabled rule lists, enable allowlists, disable-over-enable
+conflicts, duplicate rule IDs, and exact finding suppressions; rejects
+malformed JSON, non-object JSON, unknown top-level and nested fields,
+unsupported `path_exclusions`, unknown rule IDs, empty suppression fields, and
+control characters; and does not echo raw config content or secret-like values
+in errors. CLI config coverage asserts that rule filtering happens before
+remediation and output, exact suppressions happen before remediation and
+output, stale suppressions do not fail scans, all-suppressed scans exit `0`,
+mixed suppressed/unsuppressed scans exit `1`, unknown rule configs exit `2`
+with empty stdout, JSON config metadata is deterministic, human suppressed
+counts appear only when findings are actually suppressed, and finding IDs do
+not change merely because config was supplied.
 GitHub Actions CLI coverage
 asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
 unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
@@ -58,6 +72,11 @@ safe pin patches, secret-like workflow context such as tokens, passwords, or
 credentials, same-line unsafe fields, and same-line comments stay unsupported,
 and `permissions: id-token` is not treated as a secret-bearing key.
 `--validate-patches` produces no `PP-GHA-001` validation result.
+Config-specific remediation and patch coverage asserts that disabled or
+suppressed `PP-K8S-001` findings produce no Kubernetes remediation, patch
+previews, written patch files, or validation rows, and disabled or suppressed
+`PP-GHA-001` findings produce no GitHub Actions remediation, patch previews,
+or written patch files.
 Graph-only OIDC capability text is not emitted in scan output. Terraform AWS
 OIDC trust graph-only coverage asserts that a matching trust policy plus
 `--repo` can create a graph edge while human no-finding output remains
@@ -117,6 +136,9 @@ workflow source as the primary URI-safe location, stable
 content and secret-like values. Cross-domain admin-role SARIF coverage asserts
 the same for `PP-XDOMAIN-002`, plus administrative-permission summary text and
 deterministic rule presence without relying only on total rule counts.
+Config SARIF coverage asserts disabled and suppressed findings are omitted
+from SARIF results, SARIF remains findings-focused and valid 2.1.0, and config
+content and suppression reasons are not emitted.
 Cross-domain S3 SARIF coverage asserts the same for `PP-XDOMAIN-003`, plus S3
 bucket name, access mode, sanitized matched grant evidence, and no remediation
 or raw policy text. It also asserts that existing SARIF findings remain

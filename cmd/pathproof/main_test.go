@@ -1696,6 +1696,275 @@ func TestRunScanMixedKubernetesAndGitHubActionsFindingsAreDeterministic(t *testi
 	}
 }
 
+func TestRunScanConfigDisablesGitHubActionsRule(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["PP-GHA-001"]}}`)
+
+	humanStdout, humanStderr, humanCode := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "scan")
+	jsonStdout, jsonStderr, jsonCode := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, humanCode, 0)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "human stdout", humanStdout, "Finding count: 0\nNo findings.\n")
+
+	assertCode(t, jsonCode, 0)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	if !report.ConfigApplied || report.SuppressedFindingsCount == nil || *report.SuppressedFindingsCount != 0 {
+		t.Fatalf("config metadata = applied:%t suppressed:%v", report.ConfigApplied, report.SuppressedFindingsCount)
+	}
+	if !reflect.DeepEqual(report.DisabledRules, []string{"PP-GHA-001"}) {
+		t.Fatalf("disabled_rules = %#v, want PP-GHA-001", report.DisabledRules)
+	}
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("findings = %#v count=%d, want none", report.Findings, report.FindingCount)
+	}
+}
+
+func TestRunScanConfigEnableAllowlistEmitsOnlyAllowedRule(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: docker/login-action@v3
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"rules":{"enable":["PP-GHA-001"]}}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 || report.Findings[0].RuleID != "PP-GHA-001" {
+		t.Fatalf("findings = %#v count=%d, want only PP-GHA-001", report.Findings, report.FindingCount)
+	}
+	if len(report.DisabledRules) != 7 {
+		t.Fatalf("disabled_rules = %#v, want seven non-allowlisted rules", report.DisabledRules)
+	}
+	assertNoRuleInJSONReport(t, stdout, "PP-K8S-001")
+}
+
+func TestRunScanConfigDisableWinsOverEnable(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"rules":{"enable":["PP-GHA-001"],"disable":["PP-GHA-001"]}}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("findings = %#v count=%d, want disabled conflict to emit none", report.Findings, report.FindingCount)
+	}
+	for _, ruleID := range report.DisabledRules {
+		if ruleID == "PP-GHA-001" {
+			return
+		}
+	}
+	t.Fatalf("disabled_rules = %#v, want PP-GHA-001 included", report.DisabledRules)
+}
+
+func TestRunScanConfigUnknownRuleExitsTwoWithSanitizedError(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["FAKE_CLI_CONFIG_RULE_SECRET_DO_NOT_RETAIN"]}}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "unknown rule ID")
+	if strings.Contains(stderr, "FAKE_CLI_CONFIG_RULE_SECRET_DO_NOT_RETAIN") {
+		t.Fatalf("stderr leaks secret-like config value: %s", stderr)
+	}
+}
+
+func TestRunScanConfigLoadAndParseErrorsExitTwoWithEmptyStdout(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "missing.json", "scan")
+
+		assertCode(t, code, 2)
+		assertString(t, "stdout", stdout, "")
+		assertOneLineStderr(t, stderr)
+		assertContains(t, stderr, "read config file")
+	})
+
+	t.Run("malformed json", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		content := `{"rules":{"disable":["FAKE_CLI_CONFIG_JSON_SECRET_DO_NOT_RETAIN"]}`
+		writeFileForTest(t, parent, "pathproof.json", content)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 2)
+		assertString(t, "stdout", stdout, "")
+		assertOneLineStderr(t, stderr)
+		assertContains(t, stderr, "not valid JSON")
+		if strings.Contains(stderr, content) || strings.Contains(stderr, "FAKE_CLI_CONFIG_JSON_SECRET_DO_NOT_RETAIN") {
+			t.Fatalf("stderr leaks raw config content: %s", stderr)
+		}
+	})
+}
+
+func TestRunScanConfigSuppressesExactFindingID(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	assertCode(t, baselineCode, 1)
+	assertString(t, "baseline stderr", baselineStderr, "")
+	baseline := assertValidJSONReport(t, baselineStdout)
+	if baseline.FindingCount != 1 || len(baseline.Findings) != 1 {
+		t.Fatalf("baseline findings = %#v", baseline.Findings)
+	}
+	writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"`+baseline.Findings[0].ID+`","reason":"Accepted risk for fixture"}]}`)
+
+	humanStdout, humanStderr, humanCode := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "scan")
+	jsonStdout, jsonStderr, jsonCode := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, humanCode, 0)
+	assertString(t, "human stderr", humanStderr, "")
+	assertContains(t, humanStdout, "Finding count: 0\n")
+	assertContains(t, humanStdout, "Suppressed findings: 1\n")
+	if strings.Contains(humanStdout, "Accepted risk") || strings.Contains(humanStdout, "Rule: PP-GHA-001") {
+		t.Fatalf("human output exposes suppression reason or finding: %s", humanStdout)
+	}
+
+	assertCode(t, jsonCode, 0)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 || report.SuppressedFindingsCount == nil || *report.SuppressedFindingsCount != 1 {
+		t.Fatalf("suppressed JSON report = %#v", report)
+	}
+	if strings.Contains(jsonStdout, "Accepted risk") {
+		t.Fatalf("JSON output exposes suppression reason: %s", jsonStdout)
+	}
+}
+
+func TestRunScanConfigStaleSuppressionDoesNotFail(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "safe.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"finding:PP-GHA-001:stale","reason":"Accepted stale baseline entry"}]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 0 || report.SuppressedFindingsCount == nil || *report.SuppressedFindingsCount != 0 {
+		t.Fatalf("stale suppression report = %#v", report)
+	}
+}
+
+func TestRunScanConfigSuppressesOneFindingButLeavesUnsuppressedFindings(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unsafe.yml", `on: pull_request_target
+permissions:
+  contents: write
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+`)
+	baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	assertCode(t, baselineCode, 1)
+	assertString(t, "baseline stderr", baselineStderr, "")
+	baseline := assertValidJSONReport(t, baselineStdout)
+	if baseline.FindingCount != 3 {
+		t.Fatalf("baseline finding count = %d, want 3", baseline.FindingCount)
+	}
+	suppressed := firstCLIFindingByRule(t, baseline.Findings, "PP-GHA-001")
+	writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"`+suppressed.ID+`","reason":"Accepted risk for one action"}]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 2 || len(report.Findings) != 2 || report.SuppressedFindingsCount == nil || *report.SuppressedFindingsCount != 1 {
+		t.Fatalf("mixed suppression report = %#v", report)
+	}
+	assertNoRuleInJSONReport(t, stdout, "PP-GHA-001")
+	if !jsonReportHasRule(report, "PP-GHA-002") || !jsonReportHasRule(report, "PP-GHA-003") {
+		t.Fatalf("remaining findings = %#v, want PP-GHA-002 and PP-GHA-003", report.Findings)
+	}
+}
+
+func TestRunScanConfigDoesNotChangeUnsuppressedFindingIDs(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{}`)
+
+	baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	configStdout, configStderr, configCode := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, baselineCode, 1)
+	assertString(t, "baseline stderr", baselineStderr, "")
+	assertCode(t, configCode, 1)
+	assertString(t, "config stderr", configStderr, "")
+	baseline := assertValidJSONReport(t, baselineStdout)
+	configured := assertValidJSONReport(t, configStdout)
+	if len(baseline.Findings) != len(configured.Findings) {
+		t.Fatalf("finding lengths = %d/%d", len(baseline.Findings), len(configured.Findings))
+	}
+	for i := range baseline.Findings {
+		if baseline.Findings[i].ID != configured.Findings[i].ID {
+			t.Fatalf("finding ID changed at %d: %q -> %q", i, baseline.Findings[i].ID, configured.Findings[i].ID)
+		}
+	}
+}
+
 func TestRunScanGitHubActionsPatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "scan")
@@ -1721,6 +1990,115 @@ func TestRunScanGitHubActionsPatchFlagsDoNotPatchOrValidateFinding(t *testing.T)
 	}
 	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
 		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestRunScanConfigDisabledAndSuppressedKubernetesFindingsDoNotPatchOrValidate(t *testing.T) {
+	tests := []struct {
+		name          string
+		configContent func(t *testing.T, parent string) string
+	}{
+		{
+			name: "disabled",
+			configContent: func(t *testing.T, parent string) string {
+				return `{"rules":{"disable":["PP-K8S-001"]}}`
+			},
+		},
+		{
+			name: "suppressed",
+			configContent: func(t *testing.T, parent string) string {
+				baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+				assertCode(t, baselineCode, 1)
+				assertString(t, "baseline stderr", baselineStderr, "")
+				finding := firstCLIFindingByRule(t, assertValidJSONReport(t, baselineStdout).Findings, "PP-K8S-001")
+				return `{"suppressions":[{"finding_id":"` + finding.ID + `","reason":"Accepted risk for fixture"}]}`
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			root := filepath.Join(parent, "scan")
+			writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+			writeFileForTest(t, parent, "pathproof.json", tt.configContent(t, parent))
+
+			stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--preview-patches", "--write-patches", "patched", "--validate-patches", "scan")
+
+			assertCode(t, code, 0)
+			assertString(t, "stderr", stderr, "")
+			report := assertValidJSONReport(t, stdout)
+			if report.FindingCount != 0 || len(report.Findings) != 0 {
+				t.Fatalf("findings = %#v count=%d, want none", report.Findings, report.FindingCount)
+			}
+			if report.PatchOutputs == nil || len(*report.PatchOutputs) != 0 {
+				t.Fatalf("patch_outputs = %#v, want empty output list", report.PatchOutputs)
+			}
+			if len(report.Validation) != 0 {
+				t.Fatalf("validation = %#v, want none", report.Validation)
+			}
+			if strings.Contains(stdout, "remediation") || strings.Contains(stdout, "patch_previews") || strings.Contains(stdout, "diff") {
+				t.Fatalf("JSON output contains remediation or patch data: %s", stdout)
+			}
+			if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+				t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunScanConfigDisabledAndSuppressedGitHubActionsFindingsDoNotPatch(t *testing.T) {
+	tests := []struct {
+		name          string
+		configContent func(t *testing.T, parent string) string
+	}{
+		{
+			name: "disabled",
+			configContent: func(t *testing.T, parent string) string {
+				return `{"rules":{"disable":["PP-GHA-001"]}}`
+			},
+		},
+		{
+			name: "suppressed",
+			configContent: func(t *testing.T, parent string) string {
+				baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+				assertCode(t, baselineCode, 1)
+				assertString(t, "baseline stderr", baselineStderr, "")
+				finding := firstCLIFindingByRule(t, assertValidJSONReport(t, baselineStdout).Findings, "PP-GHA-001")
+				return `{"suppressions":[{"finding_id":"` + finding.ID + `","reason":"Accepted risk for fixture"}]}`
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			root := filepath.Join(parent, "scan")
+			sha := strings.Repeat("a", 40)
+			writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+			writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+			writeFileForTest(t, parent, "pathproof.json", tt.configContent(t, parent))
+
+			stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--github-action-pins", "pins.json", "--preview-patches", "--write-patches", "patched", "scan")
+
+			assertCode(t, code, 0)
+			assertString(t, "stderr", stderr, "")
+			report := assertValidJSONReport(t, stdout)
+			if report.FindingCount != 0 || len(report.Findings) != 0 {
+				t.Fatalf("findings = %#v count=%d, want none", report.Findings, report.FindingCount)
+			}
+			if report.PatchOutputs == nil || len(*report.PatchOutputs) != 0 {
+				t.Fatalf("patch_outputs = %#v, want empty output list", report.PatchOutputs)
+			}
+			if strings.Contains(stdout, "PinGitHubActionToSHA") || strings.Contains(stdout, sha) || strings.Contains(stdout, "patch_previews") {
+				t.Fatalf("JSON output contains GitHub Actions remediation or patch data: %s", stdout)
+			}
+			if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+				t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+			}
+		})
 	}
 }
 
@@ -3293,7 +3671,7 @@ func TestProjectFindingRejectsMissingNode(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing node error")
 	}
@@ -3318,7 +3696,7 @@ func TestProjectFindingRejectsMissingEdge(t *testing.T) {
 		Evidence: []analysis.FindingEvidence{{EdgeID: route.ID, Kind: route.Kind, Source: route.Evidence}, {EdgeID: runsAs.ID, Kind: runsAs.Kind, Source: runsAs.Evidence}, {EdgeID: canRead.ID, Kind: canRead.Kind, Source: canRead.Evidence}},
 	}
 
-	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil)
+	_, err := newScanReport(".", []analysis.Finding{finding}, g, nil, nil, nil, false, nil, nil)
 	if err == nil {
 		t.Fatal("newScanReport error = nil, want missing edge error")
 	}
@@ -3628,10 +4006,13 @@ func projectionFixtureWithValidFinding(t *testing.T) projectionFixture {
 }
 
 type cliJSONReport struct {
-	Findings     []cliJSONFinding      `json:"findings"`
-	FindingCount int                   `json:"finding_count"`
-	PatchOutputs *[]cliJSONPatchOutput `json:"patch_outputs,omitempty"`
-	Validation   []cliJSONValidation   `json:"validation,omitempty"`
+	Findings                []cliJSONFinding      `json:"findings"`
+	FindingCount            int                   `json:"finding_count"`
+	ConfigApplied           bool                  `json:"config_applied,omitempty"`
+	DisabledRules           []string              `json:"disabled_rules,omitempty"`
+	SuppressedFindingsCount *int                  `json:"suppressed_findings_count,omitempty"`
+	PatchOutputs            *[]cliJSONPatchOutput `json:"patch_outputs,omitempty"`
+	Validation              []cliJSONValidation   `json:"validation,omitempty"`
 }
 
 type cliJSONFinding struct {
@@ -4430,6 +4811,26 @@ func assertNoRuleInJSONReport(t *testing.T, output, ruleID string) {
 			t.Fatalf("JSON report contains %s: %#v", ruleID, report.Findings)
 		}
 	}
+}
+
+func firstCLIFindingByRule(t *testing.T, findings []cliJSONFinding, ruleID string) cliJSONFinding {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.RuleID == ruleID {
+			return finding
+		}
+	}
+	t.Fatalf("missing %s finding in %#v", ruleID, findings)
+	return cliJSONFinding{}
+}
+
+func jsonReportHasRule(report cliJSONReport, ruleID string) bool {
+	for _, finding := range report.Findings {
+		if finding.RuleID == ruleID {
+			return true
+		}
+	}
+	return false
 }
 
 func legacyGitHubActionsRuleWording() string {
