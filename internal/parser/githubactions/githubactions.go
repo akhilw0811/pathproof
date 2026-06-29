@@ -22,6 +22,10 @@ type Source struct {
 	Document     int    `json:"document"`
 }
 
+type ParseOptions struct {
+	ExcludePath func(rel string) bool
+}
+
 type Workflow struct {
 	Name                      string            `json:"name,omitempty"`
 	Source                    Source            `json:"source"`
@@ -67,6 +71,14 @@ type PermissionGrant struct {
 }
 
 func ParseDir(root string) (Resources, error) {
+	return ParseDirWithOptions(root, ParseOptions{})
+}
+
+func ParseDirWithOptions(root string, options ParseOptions) (Resources, error) {
+	if options.ExcludePath != nil && (options.ExcludePath(".github/") || options.ExcludePath(".github/workflows/")) {
+		return Resources{}, nil
+	}
+
 	workflowDir := filepath.Join(root, ".github", "workflows")
 	entries, err := os.ReadDir(workflowDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -84,6 +96,10 @@ func ParseDir(root string) (Resources, error) {
 		name := entry.Name()
 		ext := filepath.Ext(name)
 		if ext != ".yml" && ext != ".yaml" {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Join(".github", "workflows", name))
+		if options.ExcludePath != nil && options.ExcludePath(rel) {
 			continue
 		}
 		paths = append(paths, filepath.Join(workflowDir, name))

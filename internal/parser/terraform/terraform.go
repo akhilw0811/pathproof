@@ -26,6 +26,10 @@ type Source struct {
 	ResourceName string `json:"resource_name"`
 }
 
+type ParseOptions struct {
+	ExcludePath func(rel string) bool
+}
+
 type IAMRole struct {
 	ResourceType string          `json:"resource_type"`
 	ResourceName string          `json:"resource_name"`
@@ -111,16 +115,32 @@ const (
 )
 
 func ParseDir(root string) (Resources, error) {
+	return ParseDirWithOptions(root, ParseOptions{})
+}
+
+func ParseDirWithOptions(root string, options ParseOptions) (Resources, error) {
 	var paths []string
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return fmt.Errorf("read terraform path %q: %w", path, err)
 		}
 		if entry.IsDir() {
+			if path != root && options.ExcludePath != nil {
+				rel, ok := cleanRelativePath(root, path)
+				if ok && options.ExcludePath(rel+"/") {
+					return filepath.SkipDir
+				}
+			}
 			return nil
 		}
 		if filepath.Ext(entry.Name()) != ".tf" {
 			return nil
+		}
+		if options.ExcludePath != nil {
+			rel, ok := cleanRelativePath(root, path)
+			if ok && options.ExcludePath(rel) {
+				return nil
+			}
 		}
 		paths = append(paths, path)
 		return nil
@@ -156,6 +176,18 @@ func ParseDir(root string) (Resources, error) {
 		return a.ResourceName < b.ResourceName
 	})
 	return resources, nil
+}
+
+func cleanRelativePath(root, path string) (string, bool) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", false
+	}
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", false
+	}
+	return rel, true
 }
 
 func parseFile(root, path string) (Resources, error) {

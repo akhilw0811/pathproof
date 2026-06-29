@@ -28,6 +28,10 @@ type Source struct {
 	Document int
 }
 
+type ParseOptions struct {
+	ExcludePath func(rel string) bool
+}
+
 type Service struct {
 	Namespace string
 	Name      string
@@ -118,6 +122,10 @@ type ClusterRoleBinding struct {
 }
 
 func ParseDir(dir string) (Resources, error) {
+	return ParseDirWithOptions(dir, ParseOptions{})
+}
+
+func ParseDirWithOptions(dir string, options ParseOptions) (Resources, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return Resources{}, fmt.Errorf("read kubernetes manifest directory %q: %w", dir, err)
@@ -131,6 +139,10 @@ func ParseDir(dir string) (Resources, error) {
 		name := entry.Name()
 		ext := filepath.Ext(name)
 		if ext == ".yaml" || ext == ".yml" {
+			rel := filepath.ToSlash(filepath.Clean(name))
+			if options.ExcludePath != nil && options.ExcludePath(rel) {
+				continue
+			}
 			paths = append(paths, filepath.Join(dir, name))
 		}
 	}

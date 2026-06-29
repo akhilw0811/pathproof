@@ -1965,6 +1965,163 @@ func TestRunScanConfigDoesNotChangeUnsuppressedFindingIDs(t *testing.T) {
 	}
 }
 
+func TestRunScanConfigPathExclusionsExcludeOnlyFinding(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "ignored.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":[".github/workflows/ignored.yml"]}`)
+
+	humanStdout, humanStderr, humanCode := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "scan")
+	jsonStdout, jsonStderr, jsonCode := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, humanCode, 0)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "human stdout", humanStdout, "Finding count: 0\nNo findings.\n")
+	assertCode(t, jsonCode, 0)
+	assertString(t, "json stderr", jsonStderr, "")
+	report := assertValidJSONReport(t, jsonStdout)
+	if !report.ConfigApplied || report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("JSON report = %#v, want config metadata with no findings", report)
+	}
+	for _, output := range []string{humanStdout, jsonStdout} {
+		if strings.Contains(output, "ignored.yml") || strings.Contains(output, "path_exclusions") {
+			t.Fatalf("output lists excluded file or config field: %s", output)
+		}
+	}
+}
+
+func TestRunScanConfigPathExclusionsExcludeOneFindingWhileAnotherRemains(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+	writeGitHubActionsWorkflowForTest(t, root, "ignored.yml", `jobs:
+  test:
+    steps:
+      - uses: docker/login-action@v3
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":[".github/workflows/ignored.yml"]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 1 || len(report.Findings) != 1 || report.Findings[0].RuleID != "PP-K8S-001" {
+		t.Fatalf("findings = %#v count=%d, want only PP-K8S-001", report.Findings, report.FindingCount)
+	}
+	assertNoRuleInJSONReport(t, stdout, "PP-GHA-001")
+	if strings.Contains(stdout, "ignored.yml") {
+		t.Fatalf("JSON output contains excluded workflow: %s", stdout)
+	}
+}
+
+func TestRunScanConfigPathExclusionsMalformedConfigIsSanitized(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":["../FAKE_CONFIG_EXCLUSION_SECRET_DO_NOT_RETAIN.yml"]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "path_exclusions[0]")
+	assertContains(t, stderr, "scan root")
+	if strings.Contains(stderr, "FAKE_CONFIG_EXCLUSION_SECRET_DO_NOT_RETAIN") || strings.Contains(stderr, "../") {
+		t.Fatalf("stderr leaks raw exclusion value: %s", stderr)
+	}
+}
+
+func TestRunScanConfigPathExclusionsExcludedMalformedSourcesDoNotErrorOrLeak(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "bad.yml", `name: bad
+env:
+  TOKEN: FAKE_EXCLUDED_WORKFLOW_SECRET_DO_NOT_RETAIN
+jobs: [
+`)
+	writeTerraformForTest(t, root, "bad.tf", `resource "aws_iam_role" "bad" {
+  assume_role_policy = <<EOF
+  FAKE_EXCLUDED_TERRAFORM_SECRET_DO_NOT_RETAIN
+`)
+	writeFileForTest(t, root, "bad.yaml", `apiVersion: v1
+kind: Service
+metadata: [
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":[".github/workflows/bad.yml","bad.tf","bad.yaml"]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Finding count: 0\nNo findings.\n")
+	for _, forbidden := range []string{"FAKE_EXCLUDED_WORKFLOW_SECRET_DO_NOT_RETAIN", "FAKE_EXCLUDED_TERRAFORM_SECRET_DO_NOT_RETAIN", "metadata: [", "jobs: [", "assume_role_policy"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("output leaks excluded source value %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanConfigPathExclusionsWorkWithRuleControlsAndSuppressions(t *testing.T) {
+	t.Run("rule controls", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":["rbac.yaml"],"rules":{"disable":["PP-GHA-001"]}}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		if report.FindingCount != 0 || len(report.Findings) != 0 {
+			t.Fatalf("findings = %#v count=%d, want none", report.Findings, report.FindingCount)
+		}
+	})
+
+	t.Run("suppression", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+		assertCode(t, baselineCode, 1)
+		assertString(t, "baseline stderr", baselineStderr, "")
+		finding := firstCLIFindingByRule(t, assertValidJSONReport(t, baselineStdout).Findings, "PP-GHA-001")
+		writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":["rbac.yaml"],"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted risk for fixture"}]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidJSONReport(t, stdout)
+		if report.FindingCount != 0 || report.SuppressedFindingsCount == nil || *report.SuppressedFindingsCount != 1 {
+			t.Fatalf("report = %#v, want excluded K8S and one suppressed GHA finding", report)
+		}
+		if strings.Contains(stdout, "Accepted risk") || strings.Contains(stdout, "rbac.yaml") {
+			t.Fatalf("JSON output exposes suppression reason or excluded file: %s", stdout)
+		}
+	})
+}
+
 func TestRunScanGitHubActionsPatchFlagsDoNotPatchOrValidateFinding(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "scan")
@@ -2099,6 +2256,88 @@ func TestRunScanConfigDisabledAndSuppressedGitHubActionsFindingsDoNotPatch(t *te
 				t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
 			}
 		})
+	}
+}
+
+func TestRunScanConfigPathExcludedKubernetesFindingDoesNotPatchOrValidate(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":["rbac.yaml"]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--preview-patches", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("findings = %#v count=%d, want none", report.Findings, report.FindingCount)
+	}
+	if report.PatchOutputs == nil || len(*report.PatchOutputs) != 0 {
+		t.Fatalf("patch_outputs = %#v, want empty output list", report.PatchOutputs)
+	}
+	if len(report.Validation) != 0 {
+		t.Fatalf("validation = %#v, want none", report.Validation)
+	}
+	if strings.Contains(stdout, "remediation") || strings.Contains(stdout, "patch_previews") || strings.Contains(stdout, "diff") || strings.Contains(stdout, "rbac.yaml") {
+		t.Fatalf("JSON output contains remediation, patch data, or excluded file: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestRunScanConfigPathExcludedGitHubActionsFindingDoesNotPatch(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("a", 40)
+	writeGitHubActionsWorkflowForTest(t, root, "ignored.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":[".github/workflows/ignored.yml"]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--github-action-pins", "pins.json", "--preview-patches", "--write-patches", "patched", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.FindingCount != 0 || len(report.Findings) != 0 {
+		t.Fatalf("findings = %#v count=%d, want none", report.Findings, report.FindingCount)
+	}
+	if report.PatchOutputs == nil || len(*report.PatchOutputs) != 0 {
+		t.Fatalf("patch_outputs = %#v, want empty output list", report.PatchOutputs)
+	}
+	if strings.Contains(stdout, "PinGitHubActionToSHA") || strings.Contains(stdout, sha) || strings.Contains(stdout, "ignored.yml") || strings.Contains(stdout, "patch_previews") {
+		t.Fatalf("JSON output contains GitHub Actions remediation, patch data, or excluded file: %s", stdout)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+		t.Fatalf("patched output directory exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestRunScanConfigPathExclusionsValidationDoesNotReintroduceExcludedMalformedFiles(t *testing.T) {
+	parent := t.TempDir()
+	writeSplitPreviewFixture(t, parent, "scan")
+	root := filepath.Join(parent, "scan")
+	writeFileForTest(t, root, "ignored-bad.yaml", `apiVersion: v1
+kind: Service
+metadata: [
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":["ignored-bad.yaml"]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--write-patches", "patched", "--validate-patches", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if len(report.Validation) != 1 || report.Validation[0].RuleID != "PP-K8S-001" || report.Validation[0].Status != "remediated" {
+		t.Fatalf("validation = %#v, want remediated PP-K8S-001 without excluded parse error", report.Validation)
+	}
+	if strings.Contains(stdout, "ignored-bad.yaml") || strings.Contains(stderr, "ignored-bad.yaml") || strings.Contains(stderr, "invalid YAML") {
+		t.Fatalf("output contains excluded malformed source or parse error\nstdout:%s\nstderr:%s", stdout, stderr)
 	}
 }
 

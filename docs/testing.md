@@ -38,17 +38,23 @@ repeated output, deterministic input file ordering, and Secret-value absence
 from stdout and stderr.
 Config parser coverage asserts that the explicit local JSON file format parses
 empty configs, disabled rule lists, enable allowlists, disable-over-enable
-conflicts, duplicate rule IDs, and exact finding suppressions; rejects
-malformed JSON, non-object JSON, unknown top-level and nested fields,
-unsupported `path_exclusions`, unknown rule IDs, empty suppression fields, and
-control characters; and does not echo raw config content or secret-like values
-in errors. CLI config coverage asserts that rule filtering happens before
-remediation and output, exact suppressions happen before remediation and
-output, stale suppressions do not fail scans, all-suppressed scans exit `0`,
-mixed suppressed/unsuppressed scans exit `1`, unknown rule configs exit `2`
-with empty stdout, JSON config metadata is deterministic, human suppressed
-counts appear only when findings are actually suppressed, and finding IDs do
-not change merely because config was supplied.
+conflicts, duplicate rule IDs, exact finding suppressions, and
+`path_exclusions`; rejects malformed JSON, non-object JSON, unknown top-level
+and nested fields, unknown rule IDs, empty suppression fields, control
+characters, malformed path exclusion shapes, null entries, non-string entries,
+empty exclusions, absolute paths, Windows drive paths, outside-root paths,
+root exclusions, URL-like schemes, backslashes, and unsupported glob syntax;
+deduplicates and sorts exclusions deterministically while preserving exact-file
+and trailing-slash directory-prefix semantics; and does not echo raw config
+content or secret-like values in errors. CLI config coverage asserts that path
+exclusions happen before parsing, rule filtering happens after analysis and
+before remediation and output, exact suppressions happen after rule filtering
+and before remediation and output, stale suppressions do not fail scans,
+all-suppressed or fully excluded scans exit `0`, mixed excluded, suppressed,
+and unsuppressed scans exit `1`, malformed configs exit `2` with empty stdout,
+JSON config metadata is deterministic, human suppressed counts appear only
+when findings are actually suppressed, and finding IDs do not change merely
+because config was supplied.
 GitHub Actions CLI coverage
 asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
 unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
@@ -76,7 +82,9 @@ Config-specific remediation and patch coverage asserts that disabled or
 suppressed `PP-K8S-001` findings produce no Kubernetes remediation, patch
 previews, written patch files, or validation rows, and disabled or suppressed
 `PP-GHA-001` findings produce no GitHub Actions remediation, patch previews,
-or written patch files.
+or written patch files. Path-exclusion coverage asserts the same behavior for
+excluded `PP-K8S-001` and `PP-GHA-001` source files, and asserts validation
+rescans do not reintroduce excluded malformed Kubernetes files.
 Graph-only OIDC capability text is not emitted in scan output. Terraform AWS
 OIDC trust graph-only coverage asserts that a matching trust policy plus
 `--repo` can create a graph edge while human no-finding output remains
@@ -136,9 +144,10 @@ workflow source as the primary URI-safe location, stable
 content and secret-like values. Cross-domain admin-role SARIF coverage asserts
 the same for `PP-XDOMAIN-002`, plus administrative-permission summary text and
 deterministic rule presence without relying only on total rule counts.
-Config SARIF coverage asserts disabled and suppressed findings are omitted
-from SARIF results, SARIF remains findings-focused and valid 2.1.0, and config
-content and suppression reasons are not emitted.
+Config SARIF coverage asserts disabled, suppressed, and path-excluded findings
+are omitted from SARIF results, SARIF remains findings-focused and valid 2.1.0,
+and config content, suppression reasons, and raw exclusion lists are not
+emitted.
 Cross-domain S3 SARIF coverage asserts the same for `PP-XDOMAIN-003`, plus S3
 bucket name, access mode, sanitized matched grant evidence, and no remediation
 or raw policy text. It also asserts that existing SARIF findings remain
@@ -172,7 +181,9 @@ those rules. Secret parser tests cover core `v1` metadata-only parsing,
 default namespaces, unsupported Secret API version skipping before typed
 decoding, deterministic ordering, duplicate source preservation, and regression
 checks that Secret `data`, `stringData`, and values are absent from serialized
-parser output and parse errors.
+parser output and parse errors. Exclusion option tests assert selected
+top-level YAML files are skipped before parsing, excluded malformed YAML files
+do not return parse errors, and filenames with spaces match deterministically.
 
 GitHub Actions parser tests cover workflow file discovery under
 `.github/workflows`, `.yml` and `.yaml` filtering, one-job workflows, multiple
@@ -190,6 +201,9 @@ planning, unsupported patch context is represented only by coarse reason
 strings, and env values, arbitrary with values, secret-like tokens, run scripts,
 unknown or expression-based permission values, expression-only `uses:` values,
 and raw workflow documents are absent from serialized parser output and errors.
+Exclusion option tests assert selected workflow files under `.github/workflows`
+are skipped before parsing, excluded malformed workflows do not return parse
+errors, and workflow filenames with spaces match deterministically.
 
 Terraform parser tests cover deterministic local `.tf` file walking, top-level
 `aws_iam_role` resource extraction, literal heredoc and quoted JSON
@@ -220,6 +234,11 @@ wildcard/dynamic ARN negatives, `NotAction`/`NotResource`/condition
 negatives, malformed S3 policy JSON sanitization, deterministic
 bucket/resource ordering, deterministic sensitivity reason deduplication and
 sorting, and raw Terraform/tag/provider value exclusion.
+Terraform exclusion option tests assert selected `.tf` files are skipped
+before parsing, excluded malformed Terraform files do not return parse errors,
+trailing-slash directory exclusions prune nested Terraform files, exact-file
+exclusions leave siblings in the same directory, and paths with spaces match
+deterministically.
 
 Kubernetes routing tests cover deterministic graph construction, source
 evidence, duplicate conflict rejection before graph mutation, namespace-scoped

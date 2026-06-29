@@ -1050,6 +1050,101 @@ func TestParseDirMissingWorkflowDirectoryReturnsEmptyResources(t *testing.T) {
 	}
 }
 
+func TestParseDirWithOptionsExcludesWorkflowDirectoryBeforeReading(t *testing.T) {
+	tests := []struct {
+		name      string
+		exclusion string
+	}{
+		{name: "github directory", exclusion: ".github/"},
+		{name: "workflows directory", exclusion: ".github/workflows/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			githubDir := filepath.Join(root, ".github")
+			if err := os.MkdirAll(githubDir, 0o700); err != nil {
+				t.Fatalf("mkdir .github: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(githubDir, "workflows"), []byte("not a directory"), 0o600); err != nil {
+				t.Fatalf("write workflows file: %v", err)
+			}
+
+			resources, err := ParseDirWithOptions(root, ParseOptions{
+				ExcludePath: func(rel string) bool { return rel == tt.exclusion },
+			})
+			if err != nil {
+				t.Fatalf("parse dir: %v", err)
+			}
+			if !reflect.DeepEqual(resources, Resources{}) {
+				t.Fatalf("resources = %#v, want empty", resources)
+			}
+		})
+	}
+}
+
+func TestParseDirWithOptionsExcludesWorkflowBeforeParsing(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "ignored.yml", `jobs:
+  ignored:
+    steps:
+      - uses: ignored/repo@main
+`)
+	path := writeWorkflow(t, root, "kept.yml", `jobs:
+  kept:
+    steps:
+      - uses: kept/repo@main
+`)
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == ".github/workflows/ignored.yml" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.Workflows) != 1 {
+		t.Fatalf("workflows = %#v, want one kept workflow", resources.Workflows)
+	}
+	if source := resources.Workflows[0].Source; source.Filename != path || source.RelativePath != ".github/workflows/kept.yml" {
+		t.Fatalf("source = %#v, want kept workflow source", source)
+	}
+}
+
+func TestParseDirWithOptionsExcludedMalformedWorkflowDoesNotError(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "bad.yml", `name: bad
+jobs: [
+`)
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == ".github/workflows/bad.yml" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if !reflect.DeepEqual(resources, Resources{Workflows: []Workflow{}}) {
+		t.Fatalf("resources = %#v, want no workflows", resources)
+	}
+}
+
+func TestParseDirWithOptionsExcludesWorkflowPathWithSpaces(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflow(t, root, "ignored workflow.yml", `jobs:
+  ignored:
+    steps:
+      - uses: ignored/repo@main
+`)
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == ".github/workflows/ignored workflow.yml" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.Workflows) != 0 {
+		t.Fatalf("workflows = %#v, want none", resources.Workflows)
+	}
+}
+
 func writeWorkflow(t *testing.T, root, name, content string) string {
 	t.Helper()
 	dir := filepath.Join(root, ".github", "workflows")

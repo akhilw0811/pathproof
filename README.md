@@ -60,8 +60,9 @@ Terraform literals, but PathProof does not perform S3 content discovery or
 cloud data classification.
 An explicit local JSON config can be supplied with `--config <file>` to
 deterministically enable or disable implemented rules and suppress exact
-finding IDs with a required human reason. Config files are local-only and are
-not discovered automatically.
+finding IDs with a required human reason. Config can also exclude explicit
+relative files or trailing-slash directory prefixes from the scan before
+parsing. Config files are local-only and are not discovered automatically.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
@@ -70,8 +71,8 @@ resolution, action source inspection, broader sensitive-resource types, live
 cluster scanning, cloud validation, IAM simulation, broad cross-domain
 analysis, S3 bucket policies, KMS modeling, public access block modeling,
 object modeling, full data discovery, DLP-style classification, sensitivity
-based findings, path exclusions, baseline generation, pull request creation,
-AI/ML ranking, and dashboards are not implemented.
+based findings, glob or regex exclusions, baseline generation, pull request
+creation, AI/ML ranking, and dashboards are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, and internal scan errors exit `2`.
@@ -218,6 +219,13 @@ Minimal config example:
       "finding_id": "finding:PP-K8S-001:...",
       "reason": "Accepted risk for this test fixture"
     }
+  ],
+  "path_exclusions": [
+    "vendor/",
+    "third_party/",
+    "testdata/ignored/",
+    ".github/workflows/ignored.yml",
+    "infra/generated.tf"
   ]
 }
 ```
@@ -228,8 +236,20 @@ rules, and disable wins on conflicts. Unknown rule IDs are config errors.
 Suppressions match exact stable finding IDs only and require a nonempty
 reason. Suppressed findings are omitted from human, JSON, and SARIF results,
 do not produce remediation or patches, and do not make the scan exit `1`.
-Suppression reasons are validated but not printed. Config errors exit `2`
-with sanitized stderr and no scan output.
+Suppression reasons are validated but not printed.
+
+`path_exclusions` entries are relative to the scan root. A trailing slash
+means a directory-prefix exclusion: `vendor/` excludes `vendor/a.yaml` and
+`vendor/nested/b.tf`. Without a trailing slash, the entry is an exact file
+path: `.github/workflows/ignored.yml` excludes only that workflow file, and
+`infra/generated.tf` excludes only that Terraform file. `vendor` does not mean
+`vendor/`. Path exclusions are applied before Kubernetes YAML, GitHub Actions
+workflow, and Terraform parsing, so excluded files are not parsed and produce
+no parse errors, findings, remediation, patches, validation rows, JSON output,
+human output, or SARIF results. Glob patterns, `**`, regex, environment
+expansion, absolute paths, Windows drive paths, URL-like paths, backslashes,
+and outside-root paths are not supported. Config errors exit `2` with
+sanitized stderr and no scan output.
 
 Scan the GitHub Actions demo fixture:
 

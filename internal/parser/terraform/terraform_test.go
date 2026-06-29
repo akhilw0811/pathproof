@@ -1139,6 +1139,87 @@ func TestParseDirSortsTerraformFilesAndRolesDeterministically(t *testing.T) {
 	}
 }
 
+func TestParseDirWithOptionsExcludesTerraformFileBeforeParsing(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "ignored.tf", validRole("ignored"))
+	writeTerraform(t, root, "kept.tf", validRole("kept"))
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "ignored.tf" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.IAMRoles) != 1 || resources.IAMRoles[0].ResourceName != "kept" {
+		t.Fatalf("roles = %#v, want only kept role", resources.IAMRoles)
+	}
+}
+
+func TestParseDirWithOptionsExcludedMalformedTerraformDoesNotError(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, "bad.tf", `resource "aws_iam_role" "bad" {
+  assume_role_policy = <<EOF
+  FAKE_TF_EXCLUDED_SECRET_DO_NOT_RETAIN
+`)
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "bad.tf" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if !reflect.DeepEqual(resources, Resources{}) {
+		t.Fatalf("resources = %#v, want empty", resources)
+	}
+}
+
+func TestParseDirWithOptionsDirectoryExclusionExcludesNestedTerraformFiles(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, filepath.Join("infra", "nested", "ignored.tf"), validRole("ignored"))
+	writeTerraform(t, root, "kept.tf", validRole("kept"))
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "infra/" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.IAMRoles) != 1 || resources.IAMRoles[0].ResourceName != "kept" {
+		t.Fatalf("roles = %#v, want only kept role", resources.IAMRoles)
+	}
+}
+
+func TestParseDirWithOptionsExactTerraformExclusionDoesNotExcludeSibling(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, filepath.Join("infra", "ignored.tf"), validRole("ignored"))
+	writeTerraform(t, root, filepath.Join("infra", "kept.tf"), validRole("kept"))
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "infra/ignored.tf" || rel == "infra" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.IAMRoles) != 1 || resources.IAMRoles[0].ResourceName != "kept" {
+		t.Fatalf("roles = %#v, want exact file exclusion to leave sibling", resources.IAMRoles)
+	}
+}
+
+func TestParseDirWithOptionsExcludesTerraformPathWithSpaces(t *testing.T) {
+	root := t.TempDir()
+	writeTerraform(t, root, filepath.Join("with spaces", "ignored.tf"), validRole("ignored"))
+
+	resources, err := ParseDirWithOptions(root, ParseOptions{
+		ExcludePath: func(rel string) bool { return rel == "with spaces/" },
+	})
+	if err != nil {
+		t.Fatalf("parse dir: %v", err)
+	}
+	if len(resources.IAMRoles) != 0 {
+		t.Fatalf("roles = %#v, want none", resources.IAMRoles)
+	}
+}
+
 func validRole(name string) string {
 	return `resource "aws_iam_role" "` + name + `" {
   assume_role_policy = <<EOF
