@@ -111,6 +111,7 @@ func newSARIFLog(root string, report scanReport) sarifLog {
 							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSRoleRule(),
 							sarifCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleRule(),
 							sarifCrossDomainRiskyGitHubActionsCanAccessAWSS3BucketRule(),
+							sarifCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketRule(),
 						},
 					},
 				},
@@ -232,6 +233,20 @@ func sarifCrossDomainRiskyGitHubActionsCanAccessAWSS3BucketRule() sarifRule {
 	}
 }
 
+func sarifCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketRule() sarifRule {
+	const title = "Risky GitHub Actions workflow can access sensitive AWS S3 bucket"
+	return sarifRule{
+		ID:               string(analysis.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket),
+		Name:             title,
+		ShortDescription: sarifMessage{Text: title},
+		FullDescription:  sarifMessage{Text: "Detects a deterministic local cross-domain path where a risky GitHub Actions workflow or job has OIDC capability that can assume a statically modeled AWS IAM role with explicit static S3 access to a modeled bucket classified sensitive by conservative local metadata."},
+		DefaultConfiguration: sarifDefaultConfiguration{
+			Level: "error",
+		},
+		Help: sarifMessage{Text: "Review the risky pull_request_target workflow condition, AWS IAM role trust, explicit S3 policy grant, and conservative S3 sensitivity reason. PathProof does not execute workflows, generate OIDC tokens, call cloud APIs, simulate IAM permissions, parse S3 bucket policies, perform data discovery, model KMS, or provide remediation for this rule."},
+	}
+}
+
 func newSARIFResult(root string, finding scanFinding) sarifResult {
 	sourceReferences := sarifSourceReferences(root, finding)
 	locations := make([]sarifLocation, 0, len(sourceReferences))
@@ -264,7 +279,7 @@ func newSARIFResult(root string, finding scanFinding) sarifResult {
 }
 
 func sarifFindingMessage(finding scanFinding) string {
-	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions || finding.RuleID == analysis.RuleAWSIAMRoleAdministrativePermissions || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket) && finding.Summary != "" {
+	if (finding.RuleID == analysis.RuleGitHubActionsUnsafePullRequestTargetCheckout || finding.RuleID == analysis.RuleGitHubActionsDangerousPermissions || finding.RuleID == analysis.RuleAWSIAMRoleAdministrativePermissions || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket || finding.RuleID == analysis.RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket) && finding.Summary != "" {
 		return finding.Summary
 	}
 	parts := make([]string, 0, len(finding.Path))

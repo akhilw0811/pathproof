@@ -16,16 +16,17 @@ type RuleID string
 type Severity string
 
 const (
-	RulePublicWorkloadCanReadSecret                        RuleID   = "PP-K8S-001"
-	RuleGitHubActionsUnpinnedAction                        RuleID   = "PP-GHA-001"
-	RuleGitHubActionsUnsafePullRequestTargetCheckout       RuleID   = "PP-GHA-002"
-	RuleGitHubActionsDangerousPermissions                  RuleID   = "PP-GHA-003"
-	RuleAWSIAMRoleAdministrativePermissions                RuleID   = "PP-AWS-001"
-	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole      RuleID   = "PP-XDOMAIN-001"
-	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole RuleID   = "PP-XDOMAIN-002"
-	RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket  RuleID   = "PP-XDOMAIN-003"
-	SeverityHigh                                           Severity = "High"
-	SeverityMedium                                         Severity = "Medium"
+	RulePublicWorkloadCanReadSecret                                RuleID   = "PP-K8S-001"
+	RuleGitHubActionsUnpinnedAction                                RuleID   = "PP-GHA-001"
+	RuleGitHubActionsUnsafePullRequestTargetCheckout               RuleID   = "PP-GHA-002"
+	RuleGitHubActionsDangerousPermissions                          RuleID   = "PP-GHA-003"
+	RuleAWSIAMRoleAdministrativePermissions                        RuleID   = "PP-AWS-001"
+	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSRole              RuleID   = "PP-XDOMAIN-001"
+	RuleCrossDomainRiskyGitHubActionsCanAssumeAWSAdminRole         RuleID   = "PP-XDOMAIN-002"
+	RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket          RuleID   = "PP-XDOMAIN-003"
+	RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket RuleID   = "PP-XDOMAIN-004"
+	SeverityHigh                                                   Severity = "High"
+	SeverityMedium                                                 Severity = "Medium"
 )
 
 const publicWorkloadCanReadSecretTitle = "Public workload can read Kubernetes Secret"
@@ -36,18 +37,20 @@ const awsIAMRoleAdministrativePermissionsTitle = "AWS IAM role grants administra
 const crossDomainRiskyGitHubActionsCanAssumeAWSRoleTitle = "Risky GitHub Actions workflow can assume AWS IAM role"
 const crossDomainRiskyGitHubActionsCanAssumeAWSAdminRoleTitle = "Risky GitHub Actions workflow can assume administrative AWS IAM role"
 const crossDomainRiskyGitHubActionsCanAccessAWSS3BucketTitle = "Risky GitHub Actions workflow can access AWS S3 bucket"
+const crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle = "Risky GitHub Actions workflow can access sensitive AWS S3 bucket"
 
 type Finding struct {
-	ID               FindingID         `json:"id"`
-	RuleID           RuleID            `json:"rule_id"`
-	Title            string            `json:"title"`
-	Severity         Severity          `json:"severity"`
-	NodeIDs          []graph.NodeID    `json:"node_ids"`
-	EdgeIDs          []graph.EdgeID    `json:"edge_ids"`
-	Summary          string            `json:"summary"`
-	Evidence         []FindingEvidence `json:"evidence"`
-	SourceReferences []string          `json:"source_references"`
-	RiskSignal       *RiskSignal       `json:"risk_signal,omitempty"`
+	ID                FindingID                  `json:"id"`
+	RuleID            RuleID                     `json:"rule_id"`
+	Title             string                     `json:"title"`
+	Severity          Severity                   `json:"severity"`
+	NodeIDs           []graph.NodeID             `json:"node_ids"`
+	EdgeIDs           []graph.EdgeID             `json:"edge_ids"`
+	Summary           string                     `json:"summary"`
+	Evidence          []FindingEvidence          `json:"evidence"`
+	SourceReferences  []string                   `json:"source_references"`
+	RiskSignal        *RiskSignal                `json:"risk_signal,omitempty"`
+	BucketSensitivity *BucketSensitivityEvidence `json:"bucket_sensitivity,omitempty"`
 }
 
 type FindingEvidence struct {
@@ -66,6 +69,19 @@ type RiskSignal struct {
 	Permission      string                          `json:"permission,omitempty"`
 	Access          string                          `json:"access,omitempty"`
 	Summary         string                          `json:"summary"`
+}
+
+type BucketSensitivityEvidence struct {
+	SensitivityLevel string                            `json:"sensitivity_level"`
+	Reasons          []BucketSensitivityReasonEvidence `json:"reasons"`
+}
+
+type BucketSensitivityReasonEvidence struct {
+	Source       string `json:"source"`
+	MatchedToken string `json:"matched_token,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Value        string `json:"value,omitempty"`
+	SourceRef    string `json:"source_ref"`
 }
 
 type findingIdentity struct {
@@ -141,6 +157,28 @@ type crossDomainS3FindingIdentity struct {
 	S3BucketID  graph.NodeID                   `json:"aws_s3_bucket_node_id"`
 	AccessMode  string                         `json:"access_mode"`
 	S3GrantKeys []s3AccessGrantFindingIdentity `json:"s3_grant_identities"`
+}
+
+type crossDomainSensitiveS3FindingIdentity struct {
+	RuleID             RuleID                               `json:"rule_id"`
+	NodeIDs            []graph.NodeID                       `json:"node_ids"`
+	EdgeIDs            []graph.EdgeID                       `json:"edge_ids"`
+	RiskRuleID         RuleID                               `json:"risk_rule_id"`
+	RiskSignal         crossDomainRiskSignalIdentity        `json:"risk_signal"`
+	AWSRoleID          graph.NodeID                         `json:"aws_role_node_id"`
+	S3BucketID         graph.NodeID                         `json:"aws_s3_bucket_node_id"`
+	AccessMode         string                               `json:"access_mode"`
+	S3GrantKeys        []s3AccessGrantFindingIdentity       `json:"s3_grant_identities"`
+	SensitivityLevel   string                               `json:"sensitivity_level"`
+	SensitivityReasons []s3SensitivityReasonFindingIdentity `json:"sensitivity_reason_identities"`
+}
+
+type s3SensitivityReasonFindingIdentity struct {
+	Source       string `json:"source"`
+	MatchedToken string `json:"matched_token,omitempty"`
+	Key          string `json:"key,omitempty"`
+	Value        string `json:"value,omitempty"`
+	SourceRef    string `json:"source_ref"`
 }
 
 type s3AccessGrantFindingIdentity struct {
@@ -299,6 +337,7 @@ func Analyze(g *graph.Graph) []Finding {
 	findings = append(findings, newCrossDomainGitHubActionsAWSRoleFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, workflowRisks, jobRisks)...)
 	findings = append(findings, newCrossDomainGitHubActionsAWSAdminRoleFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, grantsPermissionByRole, workflowRisks, jobRisks)...)
 	findings = append(findings, newCrossDomainGitHubActionsAWSS3BucketFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, workflowRisks, jobRisks)...)
+	findings = append(findings, newCrossDomainGitHubActionsSensitiveAWSS3BucketFindings(g, definesJob, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, workflowRisks, jobRisks)...)
 	findings = append(findings, newAWSIAMRoleAdministrativePermissionFindings(g, grantsPermission)...)
 
 	sort.Slice(findings, func(i, j int) bool {
@@ -961,6 +1000,75 @@ func newCrossDomainGitHubActionsAWSS3BucketFindings(g *graph.Graph, definesJob [
 	return findings
 }
 
+func newCrossDomainGitHubActionsSensitiveAWSS3BucketFindings(g *graph.Graph, definesJob []graph.Edge, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, canReadObjectByRole, canWriteObjectByRole map[graph.NodeID][]graph.Edge, workflowRisks, jobRisks map[graph.NodeID][]githubActionsRiskSignal) []Finding {
+	findings := make([]Finding, 0)
+	seen := make(map[FindingID]struct{})
+	add := func(nodes []graph.Node, edges []graph.Edge, risk githubActionsRiskSignal, accessMetadata graph.AWSS3AccessMetadata) {
+		if len(nodes) == 0 || len(edges) == 0 {
+			return
+		}
+		role := nodes[len(nodes)-2]
+		bucket := nodes[len(nodes)-1]
+		sensitivity, ok := sensitiveBucketEvidence(bucket)
+		if !ok {
+			return
+		}
+		id, err := stableCrossDomainSensitiveS3FindingID(nodeIDs(nodes), edgeIDs(edges), risk, role.ID, bucket.ID, accessMetadata, sensitivity)
+		if err != nil {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		evidence := findingEvidenceForEdges(edges)
+		findings = append(findings, Finding{
+			ID:                id,
+			RuleID:            RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket,
+			Title:             crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle,
+			Severity:          SeverityHigh,
+			NodeIDs:           nodeIDs(nodes),
+			EdgeIDs:           edgeIDs(edges),
+			Summary:           crossDomainSensitiveS3Summary(nodes, risk, accessMetadata, sensitivity),
+			Evidence:          evidence,
+			SourceReferences:  crossDomainSourceReferences(evidence, risk),
+			RiskSignal:        riskSignal(risk),
+			BucketSensitivity: sensitivity,
+		})
+	}
+
+	for _, workflow := range g.Nodes() {
+		if workflow.Kind != graph.Workflow {
+			continue
+		}
+		for _, risk := range workflowRisks[workflow.ID] {
+			addWorkflowLevelCrossDomainS3Findings(g, workflow, risk, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, add)
+		}
+	}
+
+	for _, defines := range definesJob {
+		workflow, ok := nodeOfKind(g, defines.From, graph.Workflow)
+		if !ok {
+			continue
+		}
+		job, ok := nodeOfKind(g, defines.To, graph.WorkflowJob)
+		if !ok {
+			continue
+		}
+		for _, risk := range jobRisks[job.ID] {
+			if risk.ruleID == RuleGitHubActionsUnsafePullRequestTargetCheckout {
+				addWorkflowLevelCrossDomainS3Findings(g, workflow, risk, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, add)
+			}
+			addJobLevelCrossDomainS3Findings(g, workflow, job, defines, risk, canRequestOIDCBySource, canAssumeRoleByCapability, canReadObjectByRole, canWriteObjectByRole, add)
+		}
+	}
+
+	sort.Slice(findings, func(i, j int) bool {
+		return findings[i].ID < findings[j].ID
+	})
+	return findings
+}
+
 func addWorkflowLevelCrossDomainS3Findings(g *graph.Graph, workflow graph.Node, risk githubActionsRiskSignal, canRequestOIDCBySource map[graph.NodeID][]graph.Edge, canAssumeRoleByCapability map[graph.NodeID][]graph.Edge, canReadObjectByRole, canWriteObjectByRole map[graph.NodeID][]graph.Edge, add func([]graph.Node, []graph.Edge, githubActionsRiskSignal, graph.AWSS3AccessMetadata)) {
 	for _, oidcRequest := range canRequestOIDCBySource[workflow.ID] {
 		capability, ok := nodeOfKind(g, oidcRequest.To, graph.OIDCTokenCapability)
@@ -1030,6 +1138,105 @@ func s3BucketAccessForEdge(g *graph.Graph, accessEdge graph.Edge) (graph.Node, g
 		return graph.Node{}, graph.AWSS3AccessMetadata{}, false
 	}
 	return bucket, metadata, true
+}
+
+func sensitiveBucketEvidence(bucket graph.Node) (*BucketSensitivityEvidence, bool) {
+	if bucket.Metadata == nil || bucket.Metadata.AWSS3Bucket == nil {
+		return nil, false
+	}
+	metadata := bucket.Metadata.AWSS3Bucket
+	if metadata.SensitivityLevel != "sensitive" || len(metadata.SensitivityReasons) == 0 {
+		return nil, false
+	}
+	reasons := bucketSensitivityReasonEvidence(metadata.SensitivityReasons)
+	if len(reasons) == 0 {
+		return nil, false
+	}
+	return &BucketSensitivityEvidence{
+		SensitivityLevel: metadata.SensitivityLevel,
+		Reasons:          reasons,
+	}, true
+}
+
+func bucketSensitivityReasonEvidence(reasons []graph.AWSS3BucketSensitivityReason) []BucketSensitivityReasonEvidence {
+	out := make([]BucketSensitivityReasonEvidence, 0, len(reasons))
+	seen := make(map[string]struct{}, len(reasons))
+	for _, reason := range reasons {
+		item, ok := sanitizedBucketSensitivityReason(reason)
+		if !ok {
+			continue
+		}
+		key := s3SensitivityReasonEvidenceIdentity(item)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return s3SensitivityReasonEvidenceIdentity(out[i]) < s3SensitivityReasonEvidenceIdentity(out[j])
+	})
+	return out
+}
+
+func sanitizedBucketSensitivityReason(reason graph.AWSS3BucketSensitivityReason) (BucketSensitivityReasonEvidence, bool) {
+	switch reason.Source {
+	case "bucket_name":
+		if !allowedS3BucketSensitivityNameToken(reason.MatchedToken) || reason.Key != "" || reason.Value != "" {
+			return BucketSensitivityReasonEvidence{}, false
+		}
+		return BucketSensitivityReasonEvidence{
+			Source:       reason.Source,
+			MatchedToken: reason.MatchedToken,
+			SourceRef:    sanitizedSourceRefForIdentity(reason.SourceRef),
+		}, true
+	case "tag":
+		if !allowedS3BucketSensitivityTagKey(reason.Key) || !allowedS3BucketSensitivityTagValue(reason.Value) || reason.MatchedToken != "" {
+			return BucketSensitivityReasonEvidence{}, false
+		}
+		return BucketSensitivityReasonEvidence{
+			Source:    reason.Source,
+			Key:       reason.Key,
+			Value:     reason.Value,
+			SourceRef: sanitizedSourceRefForIdentity(reason.SourceRef),
+		}, true
+	default:
+		return BucketSensitivityReasonEvidence{}, false
+	}
+}
+
+func allowedS3BucketSensitivityNameToken(token string) bool {
+	switch token {
+	case "prod", "production", "backup", "backups", "db", "database", "customer", "customers", "pii", "phi", "financial", "finance", "payroll", "billing", "invoice", "invoices", "logs", "audit":
+		return true
+	default:
+		return false
+	}
+}
+
+func allowedS3BucketSensitivityTagKey(key string) bool {
+	switch key {
+	case "DataClassification", "Classification", "Sensitivity", "Environment":
+		return true
+	default:
+		return false
+	}
+}
+
+func allowedS3BucketSensitivityTagValue(value string) bool {
+	switch value {
+	case "sensitive", "confidential", "restricted", "private", "pii", "phi", "production", "prod":
+		return true
+	default:
+		return false
+	}
+}
+
+func sanitizedSourceRefForIdentity(sourceRef string) string {
+	if strings.HasPrefix(sourceRef, "/") || strings.Contains(sourceRef, "\\") {
+		return ""
+	}
+	return sourceRef
 }
 
 func stableCrossDomainFindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID, risk githubActionsRiskSignal, roleID graph.NodeID) (FindingID, error) {
@@ -1109,6 +1316,35 @@ func stableCrossDomainS3FindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID
 	return FindingID("finding:" + string(RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket) + ":" + hex.EncodeToString(sum[:])), nil
 }
 
+func stableCrossDomainSensitiveS3FindingID(nodeIDs []graph.NodeID, edgeIDs []graph.EdgeID, risk githubActionsRiskSignal, roleID, bucketID graph.NodeID, access graph.AWSS3AccessMetadata, sensitivity *BucketSensitivityEvidence) (FindingID, error) {
+	data, err := json.Marshal(crossDomainSensitiveS3FindingIdentity{
+		RuleID:     RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket,
+		NodeIDs:    append([]graph.NodeID(nil), nodeIDs...),
+		EdgeIDs:    append([]graph.EdgeID(nil), edgeIDs...),
+		RiskRuleID: risk.ruleID,
+		RiskSignal: crossDomainRiskSignalIdentity{
+			WorkflowFile: risk.workflowFile,
+			JobID:        risk.jobID,
+			StepIndex:    cloneIntPointer(risk.stepIndex),
+			Selectors:    cloneSelectorIdentities(risk.selectors),
+			Scope:        risk.scope,
+			Permission:   risk.permission,
+			Access:       risk.access,
+		},
+		AWSRoleID:          roleID,
+		S3BucketID:         bucketID,
+		AccessMode:         access.AccessMode,
+		S3GrantKeys:        s3AccessGrantFindingIdentities(access.Grants),
+		SensitivityLevel:   sensitivity.SensitivityLevel,
+		SensitivityReasons: s3SensitivityReasonFindingIdentities(sensitivity.Reasons),
+	})
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return FindingID("finding:" + string(RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket) + ":" + hex.EncodeToString(sum[:])), nil
+}
+
 func s3AccessGrantFindingIdentities(grants []graph.AWSS3AccessGrant) []s3AccessGrantFindingIdentity {
 	out := make([]s3AccessGrantFindingIdentity, 0, len(grants))
 	for _, grant := range grants {
@@ -1131,6 +1367,42 @@ func s3AccessGrantFindingIdentities(grants []graph.AWSS3AccessGrant) []s3AccessG
 		return string(a) < string(b)
 	})
 	return out
+}
+
+func s3SensitivityReasonFindingIdentities(reasons []BucketSensitivityReasonEvidence) []s3SensitivityReasonFindingIdentity {
+	out := make([]s3SensitivityReasonFindingIdentity, 0, len(reasons))
+	for _, reason := range reasons {
+		out = append(out, s3SensitivityReasonFindingIdentity{
+			Source:       reason.Source,
+			MatchedToken: reason.MatchedToken,
+			Key:          reason.Key,
+			Value:        reason.Value,
+			SourceRef:    sanitizedSourceRefForIdentity(reason.SourceRef),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, errA := json.Marshal(out[i])
+		b, errB := json.Marshal(out[j])
+		if errA != nil || errB != nil {
+			return false
+		}
+		return string(a) < string(b)
+	})
+	return out
+}
+
+func s3SensitivityReasonEvidenceIdentity(reason BucketSensitivityReasonEvidence) string {
+	data, err := json.Marshal(s3SensitivityReasonFindingIdentity{
+		Source:       reason.Source,
+		MatchedToken: reason.MatchedToken,
+		Key:          reason.Key,
+		Value:        reason.Value,
+		SourceRef:    sanitizedSourceRefForIdentity(reason.SourceRef),
+	})
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func crossDomainSummary(nodes []graph.Node, risk githubActionsRiskSignal) string {
@@ -1174,6 +1446,36 @@ func crossDomainS3Summary(nodes []graph.Node, risk githubActionsRiskSignal, acce
 		target += " job " + risk.jobID
 	}
 	return "GitHub Actions " + target + " has " + risk.ruleIDSummary() + "; its " + scope + " OIDC token capability can assume AWS IAM role " + role.Name + " with " + access.AccessMode + " access to S3 bucket " + bucket.Name + " (" + access.BucketName + ")."
+}
+
+func crossDomainSensitiveS3Summary(nodes []graph.Node, risk githubActionsRiskSignal, access graph.AWSS3AccessMetadata, sensitivity *BucketSensitivityEvidence) string {
+	workflow := nodes[0]
+	role := nodes[len(nodes)-2]
+	bucket := nodes[len(nodes)-1]
+	scope := "workflow-level"
+	if len(nodes) == 5 {
+		scope = "job-level"
+	}
+	target := workflow.Name
+	if risk.jobID != "" {
+		target += " job " + risk.jobID
+	}
+	return "GitHub Actions " + target + " has " + risk.ruleIDSummary() + "; its " + scope + " OIDC token capability can assume AWS IAM role " + role.Name + " with " + access.AccessMode + " access to sensitive S3 bucket " + bucket.Name + " (" + access.BucketName + "; " + bucketSensitivitySummary(sensitivity) + ")."
+}
+
+func bucketSensitivitySummary(sensitivity *BucketSensitivityEvidence) string {
+	if sensitivity == nil || len(sensitivity.Reasons) == 0 {
+		return "sensitivity: sensitive"
+	}
+	reason := sensitivity.Reasons[0]
+	switch reason.Source {
+	case "bucket_name":
+		return "sensitivity: " + sensitivity.SensitivityLevel + " from bucket_name token " + reason.MatchedToken
+	case "tag":
+		return "sensitivity: " + sensitivity.SensitivityLevel + " from tag " + reason.Key + "=" + reason.Value
+	default:
+		return "sensitivity: " + sensitivity.SensitivityLevel
+	}
 }
 
 func (risk githubActionsRiskSignal) ruleIDSummary() string {

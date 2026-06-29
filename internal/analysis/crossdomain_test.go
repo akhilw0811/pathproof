@@ -734,6 +734,305 @@ permissions: write-all
 	}
 }
 
+func TestAnalyzeCrossDomainSensitiveS3WorkflowRiskEmitsPPXDomain004Read(t *testing.T) {
+	findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"), "owner/repo"))
+
+	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	if finding.Title != crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle {
+		t.Fatalf("title = %q, want %q", finding.Title, crossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3BucketTitle)
+	}
+	if finding.Severity != SeverityHigh {
+		t.Fatalf("severity = %q, want High", finding.Severity)
+	}
+	assertFindingNodeKinds(t, finding, []graph.NodeKind{graph.Workflow, graph.OIDCTokenCapability, graph.AWSIAMRole, graph.AWSS3Bucket})
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.CanReadObject})
+	if finding.RiskSignal == nil || finding.RiskSignal.RuleID != RuleGitHubActionsDangerousPermissions {
+		t.Fatalf("risk signal = %#v, want PP-GHA-003", finding.RiskSignal)
+	}
+	if finding.BucketSensitivity == nil || finding.BucketSensitivity.SensitivityLevel != "sensitive" || len(finding.BucketSensitivity.Reasons) != 1 {
+		t.Fatalf("bucket_sensitivity = %#v, want sensitive tag reason", finding.BucketSensitivity)
+	}
+	reason := finding.BucketSensitivity.Reasons[0]
+	if reason.Source != "tag" || reason.Key != "DataClassification" || reason.Value != "sensitive" || reason.SourceRef == "" {
+		t.Fatalf("sensitivity reason = %#v, want sanitized tag reason", reason)
+	}
+	if !strings.Contains(finding.Summary, "sensitive S3 bucket") || !strings.Contains(finding.Summary, "tag DataClassification=sensitive") {
+		t.Fatalf("summary = %q, want sensitive bucket reason", finding.Summary)
+	}
+	if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket); got != 1 {
+		t.Fatalf("PP-XDOMAIN-003 count = %d, want sibling finding still emitted", got)
+	}
+}
+
+func TestAnalyzeCrossDomainSensitiveS3JobRiskEmitsPPXDomain004Write(t *testing.T) {
+	findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+`, terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "write", "s3:PutObject", "arn:aws:s3:::assets/*"), "owner/repo"))
+
+	finding := onlyFindingByRule(t, findings, RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	assertFindingNodeKinds(t, finding, []graph.NodeKind{graph.Workflow, graph.WorkflowJob, graph.OIDCTokenCapability, graph.AWSIAMRole, graph.AWSS3Bucket})
+	assertFindingEdgeKinds(t, finding, []graph.EdgeKind{graph.DefinesJob, graph.CanRequestOIDCToken, graph.CanAssumeRole, graph.CanWriteObject})
+	if finding.RiskSignal == nil || finding.RiskSignal.JobID != "deploy" || finding.RiskSignal.Permission != "id-token" {
+		t.Fatalf("risk signal = %#v, want job-level id-token risk", finding.RiskSignal)
+	}
+	if finding.BucketSensitivity == nil || finding.BucketSensitivity.Reasons[0].Source != "tag" {
+		t.Fatalf("bucket_sensitivity = %#v, want tag reason", finding.BucketSensitivity)
+	}
+	if !strings.Contains(finding.Summary, "write access") {
+		t.Fatalf("summary = %q, want write access", finding.Summary)
+	}
+}
+
+func TestAnalyzeCrossDomainSensitiveS3ReadAndWriteSameBucketProduceDistinctFindings(t *testing.T) {
+	findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions: write-all
+`, terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "all_s3", "s3:*", "arn:aws:s3:::assets/*"), "owner/repo"))
+
+	var sensitiveFindings []Finding
+	for _, finding := range findings {
+		if finding.RuleID == RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket {
+			sensitiveFindings = append(sensitiveFindings, finding)
+		}
+	}
+	if len(sensitiveFindings) != 2 {
+		t.Fatalf("PP-XDOMAIN-004 count = %d, want read and write findings: %#v", len(sensitiveFindings), findings)
+	}
+	if sensitiveFindings[0].ID == sensitiveFindings[1].ID {
+		t.Fatalf("read/write sensitive findings have duplicate ID: %#v", sensitiveFindings)
+	}
+	kinds := map[graph.EdgeKind]bool{}
+	for _, finding := range sensitiveFindings {
+		kinds[finding.Evidence[len(finding.Evidence)-1].Kind] = true
+	}
+	if !kinds[graph.CanReadObject] || !kinds[graph.CanWriteObject] {
+		t.Fatalf("finding edge kinds = %#v, want read and write", kinds)
+	}
+	if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket); got != 2 {
+		t.Fatalf("PP-XDOMAIN-003 count = %d, want read and write sibling findings", got)
+	}
+}
+
+func TestAnalyzeCrossDomainSensitiveS3RequiresSensitivityRiskTrustAndS3Access(t *testing.T) {
+	tests := []struct {
+		name      string
+		workflow  string
+		terraform string
+		repo      string
+	}{
+		{
+			name: "unknown sensitivity",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRoleWithS3BucketAndPolicy("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "safe workflow",
+			workflow: `on: pull_request
+permissions:
+  id-token: write
+`,
+			terraform: terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "branch trust",
+			workflow: `on:
+  push:
+    branches: [main]
+  pull_request_target:
+permissions: write-all
+`,
+			terraform: terraformSensitiveS3Role("deploy", "repo:owner/repo:ref:refs/heads/main", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "environment trust",
+			workflow: `on: pull_request_target
+permissions: write-all
+jobs:
+  deploy:
+    environment: prod
+`,
+			terraform: terraformSensitiveS3Role("deploy", "repo:owner/repo:environment:prod", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "PP-GHA-001 alone",
+			workflow: `on: pull_request
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    steps:
+      - uses: owner/repo@main
+`,
+			terraform: terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "admin permission alone",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRoleWithInlineAdminPolicy("deploy", "repo:owner/repo:pull_request", "admin", "*", "*") + terraformS3BucketWithTags("artifacts", "assets", `
+    DataClassification = "Sensitive"
+`),
+			repo: "owner/repo",
+		},
+		{
+			name: "unsupported S3 policy wildcard bucket",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::*"),
+			repo:      "owner/repo",
+		},
+		{
+			name: "unsupported dynamic sensitivity input",
+			workflow: `on: pull_request_target
+permissions: write-all
+`,
+			terraform: terraformRole("deploy", "repo:owner/repo:pull_request") + terraformS3BucketWithTags("artifacts", "assets", `
+    DataClassification = var.classification
+`) + `
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::assets/*\"}}"
+}
+`,
+			repo: "owner/repo",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := Analyze(crossDomainGraphFromWorkflowAndTerraform(t, tt.workflow, tt.terraform, tt.repo))
+			if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket); got != 0 {
+				t.Fatalf("PP-XDOMAIN-004 count = %d, want 0: %#v", got, findings)
+			}
+		})
+	}
+}
+
+func TestAnalyzeCrossDomainSensitiveS3RejectsNonAllowlistedGraphSensitivityReasons(t *testing.T) {
+	const unsupportedTagValue = "FAKE_XDOMAIN4_UNSUPPORTED_TAG_SECRET_DO_NOT_RETAIN"
+	tests := []struct {
+		name    string
+		reasons []graph.AWSS3BucketSensitivityReason
+	}{
+		{
+			name: "unsupported tag key and value",
+			reasons: []graph.AWSS3BucketSensitivityReason{{
+				Source:    "tag",
+				Key:       "Owner",
+				Value:     unsupportedTagValue,
+				SourceRef: "infra/iam.tf#resource=aws_s3_bucket.artifacts",
+			}},
+		},
+		{
+			name: "noncanonical tag value casing",
+			reasons: []graph.AWSS3BucketSensitivityReason{{
+				Source:    "tag",
+				Key:       "DataClassification",
+				Value:     "Sensitive",
+				SourceRef: "infra/iam.tf#resource=aws_s3_bucket.artifacts",
+			}},
+		},
+		{
+			name: "unsupported bucket name token",
+			reasons: []graph.AWSS3BucketSensitivityReason{{
+				Source:       "bucket_name",
+				MatchedToken: "myproduct",
+				SourceRef:    "infra/iam.tf#resource=aws_s3_bucket.artifacts",
+			}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := Analyze(manualCrossDomainS3GraphWithSensitivityReasons(t, tt.reasons))
+
+			if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket); got != 0 {
+				t.Fatalf("PP-XDOMAIN-004 count = %d, want 0: %#v", got, findings)
+			}
+			if got := countFindingsByRule(findings, RuleCrossDomainRiskyGitHubActionsCanAccessAWSS3Bucket); got != 1 {
+				t.Fatalf("PP-XDOMAIN-003 count = %d, want explicit S3 sibling finding", got)
+			}
+			encoded := string(mustMarshalFindings(t, findings))
+			if strings.Contains(encoded, unsupportedTagValue) || strings.Contains(encoded, `"Owner"`) {
+				t.Fatalf("findings leaked unsupported sensitivity reason: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestAnalyzeCrossDomainSensitiveS3ReasonOrderingDoesNotChangeFindingID(t *testing.T) {
+	workflow := `on: pull_request_target
+permissions: write-all
+`
+	firstTerraform := terraformRole("deploy", "repo:owner/repo:pull_request") + terraformS3BucketWithTags("artifacts", "assets", `
+    DataClassification = "Sensitive"
+    Environment = "Prod"
+`) + `
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::assets/*\"}}"
+}
+`
+	secondTerraform := terraformRole("deploy", "repo:owner/repo:pull_request") + terraformS3BucketWithTags("artifacts", "assets", `
+    Environment = "Prod"
+    DataClassification = "Sensitive"
+`) + `
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::assets/*\"}}"
+}
+`
+
+	first := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, firstTerraform, "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	second := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, secondTerraform, "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	if first.ID != second.ID {
+		t.Fatalf("PP-XDOMAIN-004 ID changed with sensitivity reason order:\nfirst: %s\nsecond:%s", first.ID, second.ID)
+	}
+	if len(first.BucketSensitivity.Reasons) != 2 {
+		t.Fatalf("sensitivity reasons = %#v, want two sorted reasons", first.BucketSensitivity.Reasons)
+	}
+}
+
+func TestAnalyzeCrossDomainSensitiveS3FindingIDIncludesSensitivityIdentity(t *testing.T) {
+	workflow := `on: pull_request_target
+permissions: write-all
+`
+	base := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	changedSensitivity := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraformRole("deploy", "repo:owner/repo:pull_request")+terraformS3BucketWithTags("artifacts", "assets", `
+    Sensitivity = "Restricted"
+`)+`
+resource "aws_iam_role_policy" "read" {
+  role = aws_iam_role.deploy.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::assets/*\"}}"
+}
+`, "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	changedGrant := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, workflow, terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read_list", "s3:ListBucket", "arn:aws:s3:::assets"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	changedRisk := onlyFindingByRule(t, Analyze(crossDomainGraphFromWorkflowAndTerraform(t, `on: pull_request_target
+permissions:
+  id-token: write
+`, terraformSensitiveS3Role("deploy", "repo:owner/repo:pull_request", "artifacts", "assets", "read", "s3:GetObject", "arn:aws:s3:::assets/*"), "owner/repo")), RuleCrossDomainRiskyGitHubActionsCanAccessSensitiveAWSS3Bucket)
+	for name, changed := range map[string]Finding{
+		"sensitivity identity": changedSensitivity,
+		"S3 grant identity":    changedGrant,
+		"risk signal":          changedRisk,
+	} {
+		if base.ID == changed.ID {
+			t.Fatalf("PP-XDOMAIN-004 ID did not change when %s changed: %q", name, base.ID)
+		}
+	}
+}
+
 func TestAnalyzeCrossDomainS3FindingIDsAreStableSensitiveAndSanitized(t *testing.T) {
 	const envSecret = "FAKE_XDOMAIN3_GHA_ENV_SECRET_DO_NOT_RETAIN"
 	const withSecret = "FAKE_XDOMAIN3_GHA_WITH_SECRET_DO_NOT_RETAIN"
@@ -954,6 +1253,17 @@ resource "aws_iam_role_policy" "` + policyName + `" {
 `
 }
 
+func terraformSensitiveS3Role(roleName, subject, bucketResourceName, bucketName, policyName, action, resource string) string {
+	return terraformRole(roleName, subject) + terraformS3BucketWithTags(bucketResourceName, bucketName, `
+    DataClassification = "Sensitive"
+`) + `
+resource "aws_iam_role_policy" "` + policyName + `" {
+  role = aws_iam_role.` + roleName + `.id
+  policy = "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"` + action + `\",\"Resource\":\"` + resource + `\"}}"
+}
+`
+}
+
 func terraformS3Bucket(resourceName, bucketName string) string {
 	return `
 resource "aws_s3_bucket" "` + resourceName + `" {
@@ -1109,6 +1419,91 @@ func manualCrossDomainAdminGraph(t *testing.T, reversed bool) *graph.Graph {
 	for _, edge := range edges {
 		mustAddEdge(t, g, edge)
 	}
+	return g
+}
+
+func manualCrossDomainS3GraphWithSensitivityReasons(t *testing.T, reasons []graph.AWSS3BucketSensitivityReason) *graph.Graph {
+	t.Helper()
+	g := graph.New()
+	workflow := graph.NewNode(graph.Workflow, "githubactions://.github/workflows/deploy.yml")
+	workflow.Evidence = []graph.SourceEvidence{{Source: ".github/workflows/deploy.yml#document=1", Detail: "github actions workflow with permissions: write-all"}}
+	workflow.Metadata = &graph.NodeMetadata{GitHubActionsWorkflow: &graph.GitHubActionsWorkflow{
+		WorkflowSourceReference:   ".github/workflows/deploy.yml#document=1",
+		WorkflowFile:              ".github/workflows/deploy.yml",
+		WorkflowName:              "Deploy",
+		TriggersPullRequestTarget: true,
+		PermissionGrants: []graph.GitHubActionsPermissionGrant{{
+			Scope:      "workflow",
+			Permission: "all",
+			Access:     "write-all",
+		}},
+	}}
+	capability := graph.NewNode(graph.OIDCTokenCapability, "githubactions://.github/workflows/deploy.yml/oidc-token/workflow")
+	capability.Metadata = &graph.NodeMetadata{GitHubActionsOIDCTokenCapability: &graph.GitHubActionsOIDCTokenCapability{
+		Provider:                "github-actions",
+		WorkflowSourceReference: ".github/workflows/deploy.yml#document=1",
+		WorkflowFile:            ".github/workflows/deploy.yml",
+		WorkflowName:            "Deploy",
+		Scope:                   "workflow",
+	}}
+	role := graph.NewNode(graph.AWSIAMRole, "aws://terraform/aws_iam_role/infra/iam.tf/deploy")
+	role.Metadata = &graph.NodeMetadata{AWSIAMRole: &graph.AWSIAMRoleMetadata{
+		Provider:        "aws",
+		ResourceName:    "deploy",
+		SourceReference: "infra/iam.tf#resource=aws_iam_role.deploy",
+	}}
+	bucket := graph.NewNode(graph.AWSS3Bucket, "aws://terraform/aws_s3_bucket/infra/iam.tf/artifacts")
+	bucket.Metadata = &graph.NodeMetadata{AWSS3Bucket: &graph.AWSS3BucketMetadata{
+		Provider:           "aws",
+		BucketName:         "assets",
+		ResourceName:       "artifacts",
+		SourceReference:    "infra/iam.tf#resource=aws_s3_bucket.artifacts",
+		SensitivityLevel:   "sensitive",
+		SensitivityReasons: append([]graph.AWSS3BucketSensitivityReason(nil), reasons...),
+	}}
+	workflow = mustAddNode(t, g, workflow)
+	capability = mustAddNode(t, g, capability)
+	role = mustAddNode(t, g, role)
+	bucket = mustAddNode(t, g, bucket)
+
+	oidc := graph.NewEdge(graph.CanRequestOIDCToken, workflow.ID, capability.ID, graph.SourceEvidence{
+		Source: ".github/workflows/deploy.yml#document=1",
+		Detail: "github actions workflow can request OIDC token because permissions: write-all includes id-token: write",
+	})
+	assumeRole := graph.NewEdge(graph.CanAssumeRole, capability.ID, role.ID, graph.SourceEvidence{
+		Source: "infra/iam.tf#resource=aws_iam_role.deploy",
+		Detail: "github actions oidc subject repo:owner/repo:pull_request matches aws iam role deploy trust statement 0",
+	})
+	assumeRole.Metadata = &graph.EdgeMetadata{AWSCanAssumeRole: &graph.AWSCanAssumeRoleMetadata{
+		Provider:         "aws",
+		RoleResourceName: "deploy",
+		SubjectCandidate: "repo:owner/repo:pull_request",
+	}}
+	read := graph.NewEdge(graph.CanReadObject, role.ID, bucket.ID, graph.SourceEvidence{
+		Source: "infra/iam.tf#resource=aws_iam_role_policy.read",
+		Detail: "aws iam role deploy has read access to s3 bucket assets",
+	})
+	read.Metadata = &graph.EdgeMetadata{AWSS3Access: &graph.AWSS3AccessMetadata{
+		Provider:              "aws",
+		RoleResourceName:      "deploy",
+		BucketName:            "assets",
+		BucketResourceName:    "artifacts",
+		BucketSourceReference: "infra/iam.tf#resource=aws_s3_bucket.artifacts",
+		AccessMode:            "read",
+		Grants: []graph.AWSS3AccessGrant{{
+			AccessMode:               "read",
+			AccessKind:               "get_object",
+			Action:                   "s3:GetObject",
+			Resource:                 "arn:aws:s3:::assets/*",
+			PolicySourceReference:    "infra/iam.tf#resource=aws_iam_role_policy.read",
+			PolicyResourceName:       "read",
+			AttachedRoleResourceName: "deploy",
+			StatementIndex:           0,
+		}},
+	}}
+	mustAddEdge(t, g, oidc)
+	mustAddEdge(t, g, assumeRole)
+	mustAddEdge(t, g, read)
 	return g
 }
 
