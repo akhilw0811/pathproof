@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"pathproof/internal/analysis"
+	"pathproof/internal/config"
 	"pathproof/internal/graph"
 )
 
@@ -1961,6 +1962,390 @@ func TestRunScanConfigDoesNotChangeUnsuppressedFindingIDs(t *testing.T) {
 	for i := range baseline.Findings {
 		if baseline.Findings[i].ID != configured.Findings[i].ID {
 			t.Fatalf("finding ID changed at %d: %q -> %q", i, baseline.Findings[i].ID, configured.Findings[i].ID)
+		}
+	}
+}
+
+func TestRunScanWriteBaselineWritesConfigAndRoundTrips(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Baseline written.\nSuppressions generated: 1\n")
+	baseline := readGeneratedBaselineForTest(t, filepath.Join(parent, "baseline.json"))
+	if len(baseline.Suppressions) != 1 {
+		t.Fatalf("suppressions = %#v, want one", baseline.Suppressions)
+	}
+	if baseline.Suppressions[0].Reason != config.BaselineDefaultReason {
+		t.Fatalf("reason = %q, want %q", baseline.Suppressions[0].Reason, config.BaselineDefaultReason)
+	}
+	if !strings.Contains(baseline.Suppressions[0].FindingID, "PP-GHA-001") {
+		t.Fatalf("finding_id = %q, want PP-GHA-001", baseline.Suppressions[0].FindingID)
+	}
+
+	secondStdout, secondStderr, secondCode := runCommandInDir(t, parent, "scan", "--format=json", "--config", "baseline.json", "scan")
+	assertCode(t, secondCode, 0)
+	assertString(t, "second stderr", secondStderr, "")
+	report := assertValidJSONReport(t, secondStdout)
+	if report.FindingCount != 0 || report.SuppressedFindingsCount == nil || *report.SuppressedFindingsCount != 1 {
+		t.Fatalf("round-trip report = %#v, want generated baseline to suppress finding", report)
+	}
+	if after, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "unpinned.yml")); err != nil || !strings.Contains(string(after), "actions/checkout@v4") {
+		t.Fatalf("input workflow changed or could not be read: %v\n%s", err, after)
+	}
+}
+
+func TestRunScanWriteBaselineNoFindingsWritesEmptySuppressions(t *testing.T) {
+	parent := t.TempDir()
+	path := filepath.Join(parent, "baseline.json")
+
+	stdout, stderr, code := runCommand("scan", "--write-baseline", path, safeFixture)
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Baseline written.\nSuppressions generated: 0\n")
+	baseline := readGeneratedBaselineForTest(t, path)
+	if len(baseline.Suppressions) != 0 {
+		t.Fatalf("suppressions = %#v, want empty", baseline.Suppressions)
+	}
+}
+
+func TestRunScanWriteBaselineAppliesConfigBeforeGeneratingSuppressions(t *testing.T) {
+	t.Run("disabled rules", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["PP-GHA-001"]}}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "--write-baseline", "baseline.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		assertString(t, "stdout", stdout, "Baseline written.\nSuppressions generated: 1\n")
+		baseline := readGeneratedBaselineForTest(t, filepath.Join(parent, "baseline.json"))
+		if len(baseline.Suppressions) != 1 || !strings.Contains(baseline.Suppressions[0].FindingID, "PP-K8S-001") {
+			t.Fatalf("baseline suppressions = %#v, want only PP-K8S-001", baseline.Suppressions)
+		}
+	})
+
+	t.Run("path exclusions", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		writeFileForTest(t, parent, "pathproof.json", `{"path_exclusions":["rbac.yaml"]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "--write-baseline", "baseline.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		assertString(t, "stdout", stdout, "Baseline written.\nSuppressions generated: 1\n")
+		baseline := readGeneratedBaselineForTest(t, filepath.Join(parent, "baseline.json"))
+		if len(baseline.Suppressions) != 1 || !strings.Contains(baseline.Suppressions[0].FindingID, "PP-GHA-001") {
+			t.Fatalf("baseline suppressions = %#v, want only PP-GHA-001", baseline.Suppressions)
+		}
+	})
+
+	t.Run("existing suppressions and stale suppressions", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		initialStdout, initialStderr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+		assertCode(t, initialCode, 1)
+		assertString(t, "initial stderr", initialStderr, "")
+		suppressed := firstCLIFindingByRule(t, assertValidJSONReport(t, initialStdout).Findings, "PP-GHA-001")
+		writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"`+suppressed.ID+`","reason":"FAKE_BASELINE_INPUT_REASON_SECRET_DO_NOT_RETAIN"},{"finding_id":"finding:PP-GHA-001:stale","reason":"Accepted stale"}]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "--write-baseline", "baseline.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		assertString(t, "stdout", stdout, "Baseline written.\nSuppressions generated: 1\n")
+		baselineContent, err := os.ReadFile(filepath.Join(parent, "baseline.json"))
+		if err != nil {
+			t.Fatalf("read baseline: %v", err)
+		}
+		baseline := readGeneratedBaselineForTest(t, filepath.Join(parent, "baseline.json"))
+		if len(baseline.Suppressions) != 1 || !strings.Contains(baseline.Suppressions[0].FindingID, "PP-K8S-001") {
+			t.Fatalf("baseline suppressions = %#v, want only unsuppressed PP-K8S-001", baseline.Suppressions)
+		}
+		for _, forbidden := range []string{string(suppressed.ID), "stale", "FAKE_BASELINE_INPUT_REASON_SECRET_DO_NOT_RETAIN", "Accepted stale"} {
+			if strings.Contains(string(baselineContent), forbidden) || strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+				t.Fatalf("baseline mode copied suppressed/stale/config value %q\nstdout:%s\nstderr:%s\nbaseline:%s", forbidden, stdout, stderr, baselineContent)
+			}
+		}
+	})
+}
+
+func TestRunScanWriteBaselineConfigErrorsDoNotWriteFile(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["FAKE_BASELINE_CONFIG_SECRET_DO_NOT_RETAIN"]}}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--config", "pathproof.json", "--write-baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "unknown rule ID")
+	if strings.Contains(stderr, "FAKE_BASELINE_CONFIG_SECRET_DO_NOT_RETAIN") {
+		t.Fatalf("stderr leaks config value: %s", stderr)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "baseline.json")); !os.IsNotExist(err) {
+		t.Fatalf("baseline exists after config error or unexpected stat error: %v", err)
+	}
+}
+
+func TestRunScanWriteBaselineRejectsExistingOutputWithEmptyStdout(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "baseline.json", `{}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "already exists")
+	if strings.Contains(stderr, parent) {
+		t.Fatalf("stderr contains temp directory prefix: %s", stderr)
+	}
+}
+
+func TestRunScanWriteBaselineWriteErrorHasEmptyStdoutAndNoPartialFile(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	original := writeBaselineConfig
+	writeBaselineConfig = func(path string, findings []analysis.Finding) (int, error) {
+		return 0, errors.New("write baseline output file")
+	}
+	defer func() {
+		writeBaselineConfig = original
+	}()
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "write baseline output file")
+	if _, err := os.Stat(filepath.Join(parent, "baseline.json")); !os.IsNotExist(err) {
+		t.Fatalf("baseline exists after write error or unexpected stat error: %v", err)
+	}
+}
+
+func TestRunScanWriteBaselineJSONOutputMetadataAndNoRemediation(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	sha := strings.Repeat("a", 40)
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"`+sha+`"}`)
+
+	firstOut, firstErr, firstCode := runCommandInDir(t, parent, "scan", "--format=json", "--github-action-pins", "pins.json", "--write-baseline", "baseline-a.json", "scan")
+	secondOut, secondErr, secondCode := runCommandInDir(t, parent, "scan", "--format=json", "--github-action-pins", "pins.json", "--write-baseline", "baseline-b.json", "scan")
+
+	assertCode(t, firstCode, 0)
+	assertCode(t, secondCode, 0)
+	assertString(t, "first stderr", firstErr, "")
+	assertString(t, "second stderr", secondErr, "")
+	assertString(t, "deterministic JSON stdout", secondOut, firstOut)
+	report := assertValidJSONReport(t, firstOut)
+	if report.BaselineWritten == nil || report.BaselineWritten.SuppressionsGenerated != 1 {
+		t.Fatalf("baseline_written = %#v, want one generated suppression", report.BaselineWritten)
+	}
+	if report.FindingCount != 1 || len(report.Findings) != 1 {
+		t.Fatalf("report findings = %#v count=%d, want one current finding", report.Findings, report.FindingCount)
+	}
+	if report.Findings[0].Remediation != nil {
+		t.Fatalf("baseline JSON finding has remediation: %#v", report.Findings[0].Remediation)
+	}
+	for _, forbidden := range []string{"baseline-a.json", "baseline-b.json", sha, "PinGitHubActionToSHA", "patch_previews", "patch_outputs", "validation", "diff"} {
+		if strings.Contains(firstOut, forbidden) || strings.Contains(firstErr, forbidden) {
+			t.Fatalf("baseline JSON output contains forbidden value %q\nstdout:%s\nstderr:%s", forbidden, firstOut, firstErr)
+		}
+	}
+}
+
+func TestRunScanWriteBaselineIgnoresInvalidGitHubActionPins(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	writeFileForTest(t, parent, "pins.json", `{"actions/checkout@v4":"FAKE_BASELINE_PIN_SECRET_DO_NOT_RETAIN"`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--github-action-pins", "pins.json", "--write-baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "stdout", stdout, "Baseline written.\nSuppressions generated: 1\n")
+	content, err := os.ReadFile(filepath.Join(parent, "baseline.json"))
+	if err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	if strings.Contains(string(content), "FAKE_BASELINE_PIN_SECRET_DO_NOT_RETAIN") || strings.Contains(stdout, "FAKE_BASELINE_PIN_SECRET_DO_NOT_RETAIN") || strings.Contains(stderr, "FAKE_BASELINE_PIN_SECRET_DO_NOT_RETAIN") {
+		t.Fatalf("baseline mode used or leaked invalid pin mapping\nstdout:%s\nstderr:%s\nbaseline:%s", stdout, stderr, content)
+	}
+}
+
+func TestRunScanWriteBaselineSARIFOutputIsFindingsOnly(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=sarif", "--write-baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidSARIFReport(t, stdout)
+	if got := countSARIFResultsByRule(report, "PP-GHA-001"); got != 1 {
+		t.Fatalf("PP-GHA-001 SARIF result count = %d, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "baseline.json")); err != nil {
+		t.Fatalf("baseline was not written: %v", err)
+	}
+	for _, forbidden := range []string{"baseline_written", "patch_outputs", "validation", "diff", "PinGitHubActionToSHA"} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("SARIF baseline output contains forbidden value %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
+func TestRunScanWriteBaselineRejectsPatchAndValidationCombinations(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "preview patches",
+			args: []string{"scan", "--write-baseline", "baseline.json", "--preview-patches", "scan"},
+			want: "--write-baseline cannot be combined with --preview-patches",
+		},
+		{
+			name: "write patches",
+			args: []string{"scan", "--write-baseline", "baseline.json", "--write-patches", "patched", "scan"},
+			want: "--write-baseline cannot be combined with --write-patches",
+		},
+		{
+			name: "validate patches",
+			args: []string{"scan", "--write-baseline", "baseline.json", "--validate-patches", "scan"},
+			want: "--write-baseline cannot be combined with --validate-patches",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := t.TempDir()
+			writeGitHubActionsWorkflowForTest(t, filepath.Join(parent, "scan"), "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+
+			stdout, stderr, code := runCommandInDir(t, parent, tt.args...)
+
+			assertCode(t, code, 2)
+			assertString(t, "stdout", stdout, "")
+			assertOneLineStderr(t, stderr)
+			assertContains(t, stderr, tt.want)
+			if _, err := os.Stat(filepath.Join(parent, "baseline.json")); !os.IsNotExist(err) {
+				t.Fatalf("baseline exists after rejected flags or unexpected stat error: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(parent, "patched")); !os.IsNotExist(err) {
+				t.Fatalf("patch output exists after rejected flags or unexpected stat error: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunScanWriteBaselineDoesNotLeakSecretLikeSourceOrConfigValues(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `name: Baseline
+env:
+  TOKEN: FAKE_BASELINE_WORKFLOW_ENV_SECRET_DO_NOT_RETAIN
+jobs:
+  test:
+    steps:
+      - run: echo FAKE_BASELINE_WORKFLOW_RUN_SECRET_DO_NOT_RETAIN
+      - uses: actions/checkout@v4
+        with:
+          token: FAKE_BASELINE_WORKFLOW_WITH_SECRET_DO_NOT_RETAIN
+`)
+	writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"finding:PP-GHA-001:stale","reason":"FAKE_BASELINE_CONFIG_REASON_SECRET_DO_NOT_RETAIN"}]}`)
+
+	jsonStdout, jsonStderr, jsonCode := runCommandInDir(t, parent, "scan", "--format=json", "--config", "pathproof.json", "--write-baseline", "baseline.json", "scan")
+	sarifStdout, sarifStderr, sarifCode := runCommandInDir(t, parent, "scan", "--format=sarif", "--config", "pathproof.json", "--write-baseline", "baseline-sarif.json", "scan")
+
+	assertCode(t, jsonCode, 0)
+	assertCode(t, sarifCode, 0)
+	assertString(t, "json stderr", jsonStderr, "")
+	assertString(t, "sarif stderr", sarifStderr, "")
+	baselineContent, err := os.ReadFile(filepath.Join(parent, "baseline.json"))
+	if err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	for _, output := range []string{jsonStdout, jsonStderr, sarifStdout, sarifStderr, string(baselineContent)} {
+		for _, forbidden := range []string{
+			"FAKE_BASELINE_WORKFLOW_ENV_SECRET_DO_NOT_RETAIN",
+			"FAKE_BASELINE_WORKFLOW_RUN_SECRET_DO_NOT_RETAIN",
+			"FAKE_BASELINE_WORKFLOW_WITH_SECRET_DO_NOT_RETAIN",
+			"FAKE_BASELINE_CONFIG_REASON_SECRET_DO_NOT_RETAIN",
+			"env:",
+			"run:",
+			"with:",
+			"token:",
+		} {
+			if strings.Contains(output, forbidden) {
+				t.Fatalf("baseline mode leaked forbidden value %q in output: %s", forbidden, output)
+			}
 		}
 	}
 }
@@ -4250,8 +4635,13 @@ type cliJSONReport struct {
 	ConfigApplied           bool                  `json:"config_applied,omitempty"`
 	DisabledRules           []string              `json:"disabled_rules,omitempty"`
 	SuppressedFindingsCount *int                  `json:"suppressed_findings_count,omitempty"`
+	BaselineWritten         *cliJSONBaseline      `json:"baseline_written,omitempty"`
 	PatchOutputs            *[]cliJSONPatchOutput `json:"patch_outputs,omitempty"`
 	Validation              []cliJSONValidation   `json:"validation,omitempty"`
+}
+
+type cliJSONBaseline struct {
+	SuppressionsGenerated int `json:"suppressions_generated"`
 }
 
 type cliJSONFinding struct {
@@ -4802,6 +5192,33 @@ func readFileForTest(t *testing.T, dir, name string) string {
 		t.Fatalf("read %s: %v", name, err)
 	}
 	return string(data)
+}
+
+type generatedBaselineForTest struct {
+	Suppressions []generatedSuppressionForTest `json:"suppressions"`
+}
+
+type generatedSuppressionForTest struct {
+	FindingID string `json:"finding_id"`
+	Reason    string `json:"reason"`
+}
+
+func readGeneratedBaselineForTest(t *testing.T, path string) generatedBaselineForTest {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated baseline: %v", err)
+	}
+	var baseline generatedBaselineForTest
+	if err := json.Unmarshal(data, &baseline); err != nil {
+		t.Fatalf("unmarshal generated baseline: %v\n%s", err, data)
+	}
+	for _, forbidden := range []string{"rules", "path_exclusions", "disabled_rules"} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("generated baseline contains non-suppression config field %q: %s", forbidden, data)
+		}
+	}
+	return baseline
 }
 
 func writeGitHubActionsWorkflowForTest(t *testing.T, root, name, content string) {

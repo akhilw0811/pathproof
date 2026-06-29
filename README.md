@@ -63,6 +63,8 @@ deterministically enable or disable implemented rules and suppress exact
 finding IDs with a required human reason. Config can also exclude explicit
 relative files or trailing-slash directory prefixes from the scan before
 parsing. Config files are local-only and are not discovered automatically.
+`pathproof scan --write-baseline <file>` can generate a local JSON config
+containing finding-ID suppressions for the current unsuppressed findings.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
@@ -71,11 +73,14 @@ resolution, action source inspection, broader sensitive-resource types, live
 cluster scanning, cloud validation, IAM simulation, broad cross-domain
 analysis, S3 bucket policies, KMS modeling, public access block modeling,
 object modeling, full data discovery, DLP-style classification, sensitivity
-based findings, glob or regex exclusions, baseline generation, pull request
-creation, AI/ML ranking, and dashboards are not implemented.
+based findings, glob or regex exclusions, baseline diffing, newly introduced
+findings mode, pull request creation, AI/ML ranking, and dashboards are not
+implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
-parsing, patch, validation, and internal scan errors exit `2`.
+parsing, patch, validation, baseline write, and internal scan errors exit `2`.
+Baseline generation exits `0` when the baseline file is written successfully,
+even if findings were added to it.
 
 ## Quick demo
 
@@ -250,6 +255,47 @@ human output, or SARIF results. Glob patterns, `**`, regex, environment
 expansion, absolute paths, Windows drive paths, URL-like paths, backslashes,
 and outside-root paths are not supported. Config errors exit `2` with
 sanitized stderr and no scan output.
+
+Generate a local baseline config from the current unsuppressed findings:
+
+```sh
+./bin/pathproof scan --write-baseline ./pathproof-baseline.json ./examples/kubernetes/public-secret-path
+```
+
+Expected shape:
+
+```text
+Baseline written.
+Suppressions generated: 1
+```
+
+The generated file uses the same config shape and contains only deterministic
+finding-ID suppressions:
+
+```json
+{
+  "suppressions": [
+    {
+      "finding_id": "finding:PP-K8S-001:...",
+      "reason": "Baseline accepted at generation time"
+    }
+  ]
+}
+```
+
+Rerun with the generated baseline:
+
+```sh
+./bin/pathproof scan --config ./pathproof-baseline.json ./examples/kubernetes/public-secret-path
+```
+
+If `--config` is supplied while writing a baseline, rule controls, path
+exclusions, and existing suppressions are applied before baseline generation.
+Already-suppressed and stale suppression entries are not copied into the new
+baseline. The baseline writer is local-only, does not overwrite existing
+files, does not create parent directories, and may write inside the scan root
+because scanning has already completed before the file is created. Baseline
+diffing and newly introduced finding mode are not implemented yet.
 
 Scan the GitHub Actions demo fixture:
 
@@ -437,8 +483,11 @@ The demo fixture is expected to produce `PP-K8S-001`, so CI handles exit code
 
 - `0`: scan succeeded and found zero findings.
 - `1`: scan succeeded and found one or more findings.
-- `2`: usage, parsing, routing, patch output, validation, or internal scan
-  error.
+- `2`: usage, parsing, routing, patch output, validation, baseline write, or
+  internal scan error.
+
+When `--write-baseline` succeeds, the scan exits `0` even if findings were
+written into the generated baseline.
 
 CI verifies that `pathproof.sarif` exists, is non-empty, contains SARIF version
 `2.1.0`, and contains `PP-K8S-001`, then uploads it with
@@ -458,6 +507,8 @@ only publishes the SARIF file as an artifact.
 - Safe read-only patch previews.
 - Patched-copy output to a separate directory, never in-place edits.
 - Validation by rescanning a complete temporary patched manifest set.
+- Local baseline generation as JSON config suppressions for current
+  unsuppressed findings.
 - SARIF 2.1.0 finding export for implemented Kubernetes, GitHub Actions, AWS,
   and cross-domain rules.
 - Local GitHub Actions workflow parsing under `.github/workflows`.
@@ -505,11 +556,13 @@ The scan loop is:
 8. Analyze the graph for `PP-K8S-001`, `PP-GHA-001`, `PP-GHA-002`,
    `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, `PP-XDOMAIN-002`, and
    `PP-XDOMAIN-003`.
-9. Build advisory remediation plans from structured graph metadata for
+9. Optionally write a local baseline config for current unsuppressed findings
+   after configured rule filtering and suppressions.
+10. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
-10. Optionally generate read-only `NarrowBindingSubject` patch previews.
-11. Optionally write patched copies to a separate output directory.
-12. Optionally validate by rescanning a complete temporary overlay that replaces
+11. Optionally generate read-only `NarrowBindingSubject` patch previews.
+12. Optionally write patched copies to a separate output directory.
+13. Optionally validate by rescanning a complete temporary overlay that replaces
    original files with generated patched copies.
 
 PathProof does not contact a live cluster, run `kubectl`, apply patches in
@@ -535,6 +588,7 @@ Implemented:
 - `PP-XDOMAIN-003` finding for risky GitHub Actions OIDC access to a modeled
   AWS S3 bucket.
 - SARIF 2.1.0 finding export.
+- Local baseline generation for current unsuppressed findings.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
 - Validation rescan.
@@ -550,6 +604,7 @@ Not implemented:
 - Action source inspection.
 - Automatic action pinning patches.
 - Automatic remediation for unsafe `pull_request_target` checkout patterns.
+- Baseline diffing or newly introduced finding mode.
 - PR creation.
 - In-place edits.
 - Broad RBAC patching.
@@ -593,5 +648,8 @@ Scan exit codes are stable:
 
 - `0`: scan succeeded and found zero findings.
 - `1`: scan succeeded and found one or more findings.
-- `2`: usage, parsing, routing, patch output, validation, or internal scan
-  error.
+- `2`: usage, parsing, routing, patch output, validation, baseline write, or
+  internal scan error.
+
+Baseline generation exits `0` when the baseline file is written successfully,
+even if suppressions were generated.

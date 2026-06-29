@@ -55,6 +55,21 @@ and unsuppressed scans exit `1`, malformed configs exit `2` with empty stdout,
 JSON config metadata is deterministic, human suppressed counts appear only
 when findings are actually suppressed, and finding IDs do not change merely
 because config was supplied.
+Baseline writer coverage asserts suppressions-only JSON output, deterministic
+finding-ID sorting, duplicate finding-ID deduplication, the exact default
+reason, empty suppression arrays when no unsuppressed findings remain,
+round-trip loading through the existing config parser, no raw finding title,
+evidence, source-reference, path, secret-like, config, or patch data in the
+generated file, rejection of existing files, directories, missing parents,
+remote-like paths, and invalid parents, deterministic repeated output, and
+sanitized cleanup behavior on injected write failures. CLI baseline coverage
+asserts that `--write-baseline` exits `0` after successful writes even when
+findings were present, generated baselines suppress the same findings when
+reused through `--config`, existing `--config` rule controls, path exclusions,
+and suppressions are applied before baseline generation, stale suppressions
+are not copied, malformed configs and write errors exit `2` with empty stdout,
+and secret-like source or config values do not leak to stdout, stderr, JSON,
+SARIF, or baseline files.
 GitHub Actions CLI coverage
 asserts safe pinned workflows exit `0`, unpinned `uses:` workflows exit `1`,
 unsafe `pull_request_target` checkout workflows exit `1`, mixed Kubernetes and
@@ -85,6 +100,12 @@ previews, written patch files, or validation rows, and disabled or suppressed
 or written patch files. Path-exclusion coverage asserts the same behavior for
 excluded `PP-K8S-001` and `PP-GHA-001` source files, and asserts validation
 rescans do not reintroduce excluded malformed Kubernetes files.
+Baseline-specific side-effect coverage asserts that baseline mode does not
+build remediation, patch previews, patch outputs, validation rows, diffs,
+patched contents, or GitHub Action pin SHA metadata, ignores
+`--github-action-pins`, and rejects combinations with `--preview-patches`,
+`--write-patches`, and `--validate-patches` before writing any baseline or
+patch output.
 Graph-only OIDC capability text is not emitted in scan output. Terraform AWS
 OIDC trust graph-only coverage asserts that a matching trust policy plus
 `--repo` can create a graph edge while human no-finding output remains
@@ -148,6 +169,11 @@ Config SARIF coverage asserts disabled, suppressed, and path-excluded findings
 are omitted from SARIF results, SARIF remains findings-focused and valid 2.1.0,
 and config content, suppression reasons, and raw exclusion lists are not
 emitted.
+Baseline SARIF coverage asserts that `--format=sarif --write-baseline` writes
+the baseline as a side effect, exits `0`, keeps SARIF valid and findings-only,
+and omits baseline metadata, remediation, patch previews, patch outputs,
+validation arrays, diffs, patched contents, mapping data, raw source, and
+secret-like values.
 Cross-domain S3 SARIF coverage asserts the same for `PP-XDOMAIN-003`, plus S3
 bucket name, access mode, sanitized matched grant evidence, and no remediation
 or raw policy text. It also asserts that existing SARIF findings remain

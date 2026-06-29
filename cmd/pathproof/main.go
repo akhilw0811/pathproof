@@ -27,7 +27,7 @@ import (
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--config <file>] [--repo OWNER/REPO] [--github-action-pins <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--config <file>] [--repo OWNER/REPO] [--github-action-pins <file>] [--write-baseline <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
@@ -45,6 +45,8 @@ type scanOptions struct {
 	repo             string
 	githubActionPins string
 	configPath       string
+	writeBaseline    string
+	writeBaselineSet bool
 	directory        string
 }
 
@@ -54,7 +56,12 @@ type scanConfigMetadata struct {
 	SuppressedFindingsCount int
 }
 
+type scanBaselineMetadata struct {
+	SuppressionsGenerated int `json:"suppressions_generated"`
+}
+
 var scanValidationDirectory = scanDirectory
+var writeBaselineConfig = config.WriteBaseline
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -119,6 +126,10 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		var suppressedCount int
 		findings, suppressedCount = applyConfigToFindings(findings, cfg)
 		metadata.SuppressedFindingsCount = suppressedCount
+	}
+
+	if options.writeBaselineSet {
+		return writeBaselineScanResult(findings, g, options.directory, options.format, options.writeBaseline, metadata, stdout, stderr)
 	}
 
 	pins, err := remediation.LoadGitHubActionPins(options.githubActionPins)
@@ -205,6 +216,45 @@ func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *gr
 	return 0
 }
 
+func writeBaselineScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, baselinePath string, metadata *scanConfigMetadata, stdout, stderr io.Writer) int {
+	report, err := newScanReport(root, findings, g, nil, nil, nil, false, nil, metadata)
+	if err != nil {
+		printError(stderr, "internal scan error: "+err.Error())
+		return 2
+	}
+
+	suppressionCount, err := writeBaselineConfig(baselinePath, findings)
+	if err != nil {
+		printError(stderr, err.Error())
+		return 2
+	}
+	report.BaselineWritten = &scanBaselineMetadata{
+		SuppressionsGenerated: suppressionCount,
+	}
+
+	var output bytes.Buffer
+	switch format {
+	case scanFormatHuman:
+		err = writeHumanBaselineReport(&output, suppressionCount)
+	case scanFormatJSON:
+		err = writeJSONReport(&output, report)
+	case scanFormatSARIF:
+		err = writeSARIFReport(&output, root, report)
+	default:
+		err = fmt.Errorf("unsupported format %q", format)
+	}
+	if err != nil {
+		printError(stderr, "format scan report: "+err.Error())
+		return 2
+	}
+
+	if err := writeAll(stdout, output.Bytes()); err != nil {
+		printError(stderr, "write scan report: "+err.Error())
+		return 2
+	}
+	return 0
+}
+
 func parseScanArgs(args []string) (scanOptions, error) {
 	flags := flag.NewFlagSet("scan", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -212,6 +262,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	repoValue := flags.String("repo", "", "repository identity for GitHub Actions OIDC trust matching, in OWNER/REPO form")
 	githubActionPins := flags.String("github-action-pins", "", "local JSON mapping of GitHub Action refs to full commit SHAs")
 	configPath := flags.String("config", "", "local JSON PathProof config file")
+	writeBaseline := flags.String("write-baseline", "", "write a local JSON baseline config for current unsuppressed findings")
 	previewPatches := flags.Bool("preview-patches", false, "include read-only patch previews")
 	writePatches := flags.String("write-patches", "", "write patched copies to an output directory")
 	validatePatches := flags.Bool("validate-patches", false, "rescan a temporary patched manifest set after writing patches")
@@ -219,9 +270,13 @@ func parseScanArgs(args []string) (scanOptions, error) {
 		return scanOptions{}, fmt.Errorf("invalid scan arguments: %w; %s", err, usage)
 	}
 	writePatchesSet := false
+	writeBaselineSet := false
 	flags.Visit(func(f *flag.Flag) {
 		if f.Name == "write-patches" {
 			writePatchesSet = true
+		}
+		if f.Name == "write-baseline" {
+			writeBaselineSet = true
 		}
 	})
 	format := scanFormat(*formatValue)
@@ -243,6 +298,15 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	if !info.IsDir() {
 		return scanOptions{}, fmt.Errorf("scan path %q is not a directory", dir)
 	}
+	if writeBaselineSet && *previewPatches {
+		return scanOptions{}, fmt.Errorf("--write-baseline cannot be combined with --preview-patches")
+	}
+	if writeBaselineSet && writePatchesSet {
+		return scanOptions{}, fmt.Errorf("--write-baseline cannot be combined with --write-patches")
+	}
+	if writeBaselineSet && *validatePatches {
+		return scanOptions{}, fmt.Errorf("--write-baseline cannot be combined with --validate-patches")
+	}
 	if writePatchesSet {
 		if err := patchpreview.ValidateOutputRoot(dir, *writePatches); err != nil {
 			return scanOptions{}, err
@@ -261,7 +325,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			return scanOptions{}, err
 		}
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, configPath: *configPath, directory: dir}, nil
+	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, configPath: *configPath, writeBaseline: *writeBaseline, writeBaselineSet: writeBaselineSet, directory: dir}, nil
 }
 
 func applyConfigToFindings(findings []analysis.Finding, cfg config.Config) ([]analysis.Finding, int) {
@@ -524,13 +588,14 @@ func sanitizeValidationError(err error, overlay string) string {
 }
 
 type scanReport struct {
-	Findings                []scanFinding       `json:"findings"`
-	FindingCount            int                 `json:"finding_count"`
-	ConfigApplied           bool                `json:"config_applied,omitempty"`
-	DisabledRules           []analysis.RuleID   `json:"disabled_rules,omitempty"`
-	SuppressedFindingsCount *int                `json:"suppressed_findings_count,omitempty"`
-	PatchOutputs            *[]scanPatchOutput  `json:"patch_outputs,omitempty"`
-	Validation              []validation.Result `json:"validation,omitempty"`
+	Findings                []scanFinding         `json:"findings"`
+	FindingCount            int                   `json:"finding_count"`
+	ConfigApplied           bool                  `json:"config_applied,omitempty"`
+	DisabledRules           []analysis.RuleID     `json:"disabled_rules,omitempty"`
+	SuppressedFindingsCount *int                  `json:"suppressed_findings_count,omitempty"`
+	BaselineWritten         *scanBaselineMetadata `json:"baseline_written,omitempty"`
+	PatchOutputs            *[]scanPatchOutput    `json:"patch_outputs,omitempty"`
+	Validation              []validation.Result   `json:"validation,omitempty"`
 }
 
 type scanFinding struct {
@@ -1160,6 +1225,14 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 		return err
 	}
 	return writeHumanValidation(w, report)
+}
+
+func writeHumanBaselineReport(w io.Writer, suppressionCount int) error {
+	if _, err := fmt.Fprintln(w, "Baseline written."); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(w, "Suppressions generated: %d\n", suppressionCount)
+	return err
 }
 
 func writeHumanChangeParameters(w io.Writer, change scanRemediationChange) error {
