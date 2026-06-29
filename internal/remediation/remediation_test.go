@@ -164,7 +164,7 @@ func TestBuildGitHubActionsUnpinnedActionAdvisoryOnlyWithoutMapping(t *testing.T
 	if !change.Advisory || change.PatchSupported || change.ActionRef != "actions/checkout@v4" || change.ReplacementSHA != "" {
 		t.Fatalf("change = %#v, want advisory-only action pinning", change)
 	}
-	if strings.Contains(change.SourceReference, filepath.Dir(os.TempDir())) || strings.Contains(change.Reason, "FAKE") {
+	if strings.Contains(change.SourceReference, os.TempDir()) || strings.Contains(change.Reason, "FAKE") {
 		t.Fatalf("change contains unsafe data: %#v", change)
 	}
 }

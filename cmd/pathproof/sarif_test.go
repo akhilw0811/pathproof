@@ -158,6 +158,56 @@ func TestRunScanSARIFOutputShapeAndFinding(t *testing.T) {
 	assertDoesNotContainSecretPayloadFields(t, stdout, stderr)
 }
 
+func TestRunScanSARIFOmitDisabledAndSuppressedFindings(t *testing.T) {
+	t.Run("disabled", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+		writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["PP-GHA-001"]}}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=sarif", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidSARIFReport(t, stdout)
+		assertSARIFRuleSet(t, report.Runs[0].Tool.Driver.Rules)
+		if got := countSARIFResultsByRule(report, "PP-GHA-001"); got != 0 {
+			t.Fatalf("PP-GHA-001 SARIF result count = %d, want 0", got)
+		}
+		if strings.Contains(stdout, "pathproof.json") || strings.Contains(stdout, "disable") {
+			t.Fatalf("SARIF output contains config details: %s", stdout)
+		}
+	})
+
+	t.Run("suppressed", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "scan")
+		writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+		baselineStdout, baselineStderr, baselineCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+		assertCode(t, baselineCode, 1)
+		assertString(t, "baseline stderr", baselineStderr, "")
+		finding := firstCLIFindingByRule(t, assertValidJSONReport(t, baselineStdout).Findings, "PP-K8S-001")
+		writeFileForTest(t, parent, "pathproof.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted risk for fixture"}]}`)
+
+		stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=sarif", "--config", "pathproof.json", "scan")
+
+		assertCode(t, code, 0)
+		assertString(t, "stderr", stderr, "")
+		report := assertValidSARIFReport(t, stdout)
+		assertSARIFRuleSet(t, report.Runs[0].Tool.Driver.Rules)
+		if len(report.Runs[0].Results) != 0 {
+			t.Fatalf("SARIF results = %#v, want suppressed finding omitted", report.Runs[0].Results)
+		}
+		if strings.Contains(stdout, "Accepted risk") || strings.Contains(stdout, string(finding.ID)) {
+			t.Fatalf("SARIF output contains suppression reason or suppressed finding ID: %s", stdout)
+		}
+	})
+}
+
 func TestRunScanGitHubActionsSARIFOutputShapeAndFinding(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "build workflow.yml", `name: Build

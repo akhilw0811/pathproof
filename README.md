@@ -58,6 +58,10 @@ access to a locally modeled `aws_s3_bucket`. Modeled S3 buckets may carry
 graph-only `unknown` or `sensitive` metadata from conservative local
 Terraform literals, but PathProof does not perform S3 content discovery or
 cloud data classification.
+An explicit local JSON config can be supplied with `--config <file>` to
+deterministically enable or disable implemented rules and suppress exact
+finding IDs with a required human reason. Config files are local-only and are
+not discovered automatically.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
@@ -66,8 +70,8 @@ resolution, action source inspection, broader sensitive-resource types, live
 cluster scanning, cloud validation, IAM simulation, broad cross-domain
 analysis, S3 bucket policies, KMS modeling, public access block modeling,
 object modeling, full data discovery, DLP-style classification, sensitivity
-based findings, pull request creation, AI/ML ranking, and dashboards are not
-implemented.
+based findings, path exclusions, baseline generation, pull request creation,
+AI/ML ranking, and dashboards are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, and internal scan errors exit `2`.
@@ -194,6 +198,38 @@ Get SARIF output for code-scanning-style integrations:
 SARIF export from the CLI is local stdout only. The GitHub Actions workflow
 generates a SARIF file from the public demo fixture and uploads it as a
 workflow artifact.
+
+Use an explicit local JSON config:
+
+```sh
+./bin/pathproof scan --config ./pathproof.json ./examples/kubernetes/public-secret-path
+```
+
+Minimal config example:
+
+```json
+{
+  "rules": {
+    "disable": ["PP-GHA-001"],
+    "enable": ["PP-K8S-001", "PP-XDOMAIN-003"]
+  },
+  "suppressions": [
+    {
+      "finding_id": "finding:PP-K8S-001:...",
+      "reason": "Accepted risk for this test fixture"
+    }
+  ]
+}
+```
+
+By default all implemented rules are enabled. If `rules.enable` is present and
+nonempty, only those rule IDs are enabled; `rules.disable` then removes listed
+rules, and disable wins on conflicts. Unknown rule IDs are config errors.
+Suppressions match exact stable finding IDs only and require a nonempty
+reason. Suppressed findings are omitted from human, JSON, and SARIF results,
+do not produce remediation or patches, and do not make the scan exit `1`.
+Suppression reasons are validated but not printed. Config errors exit `2`
+with sanitized stderr and no scan output.
 
 Scan the GitHub Actions demo fixture:
 

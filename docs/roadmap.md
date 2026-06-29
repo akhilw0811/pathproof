@@ -142,10 +142,18 @@
   Validation builds a temporary complete patched manifest set from the input
   directory plus generated patch files, rescans it locally, and reports
   remediated, failed, or skipped results for supported `PP-K8S-001` findings.
+- Explicit local JSON config loading through `pathproof scan --config <file>`.
+  Config can deterministically enable or disable implemented rules and
+  suppress exact finding IDs with a required human reason. Rule filtering and
+  suppressions are applied before remediation, patch preview, patch writing,
+  validation, JSON, human output, and SARIF. There is no config discovery,
+  environment expansion, remote config, includes, path exclusions, or baseline
+  generation in this slice.
 - Local Kubernetes YAML, GitHub Actions workflow, and narrow Terraform scan CLI for
   `pathproof scan <directory>` with human-readable finding, supported
   Kubernetes remediation and optional patch preview output, optional
-  `--repo OWNER/REPO` OIDC trust matching, JSON output, SARIF 2.1.0 finding
+  `--repo OWNER/REPO` OIDC trust matching, optional `--config <file>` local
+  rule controls and finding suppressions, JSON output, SARIF 2.1.0 finding
   output, and stable exit codes.
 - Local findings-only SARIF export for `PP-K8S-001`, `PP-GHA-001`,
   `PP-GHA-002`, `PP-GHA-003`, `PP-AWS-001`, `PP-XDOMAIN-001`, and
@@ -156,6 +164,11 @@
 
 - Additional deterministic attack-path rules.
 - Parsers for additional infrastructure and supply-chain artifacts.
+- Path exclusions.
+- Baseline generation, baseline diffing, newly introduced findings mode,
+  suppression expiration, owner/team metadata, and severity thresholds.
+- Enterprise policy packs, remote configs, config discovery, inheritance, and
+  includes.
 - Full CI/CD attack-path modeling.
 - Exact GitHub Actions workflow permission inheritance/override modeling.
 - Broad Terraform/HCL support, modules, variables, locals, functions,
