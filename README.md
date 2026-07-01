@@ -74,6 +74,12 @@ against a local config-shaped baseline file and reports current findings as
 new or existing, plus baseline finding IDs that are resolved. `--baseline`
 does not suppress findings by itself; pass a file through `--config` when its
 suppressions should hide accepted findings.
+`pathproof scan --rank heuristic <directory>` can optionally compute a local
+deterministic heuristic priority score for visible verified findings. Ranking
+uses structured finding, rule, graph, baseline, remediation, and validation
+metadata only; it does not create findings, suppress findings, replace
+evidence or severity, sort output, change exit codes, call external APIs, or
+use learned AI/ML.
 
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
@@ -84,7 +90,7 @@ analysis, S3 bucket policies, KMS modeling, public access block modeling,
 object modeling, full data discovery, DLP-style classification, broad
 sensitivity-based findings, glob or regex exclusions, fail-on-new baseline
 gating, baseline update or merge, remote baselines, pull request creation,
-AI/ML ranking, and dashboards are not implemented.
+learned AI/ML ranking, and dashboards are not implemented.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, baseline write, and internal scan errors exit `2`.
@@ -203,6 +209,17 @@ Expected excerpt:
   ]
 }
 ```
+
+Compute an opt-in deterministic heuristic priority score for the same visible
+findings:
+
+```sh
+./bin/pathproof scan --rank heuristic ./examples/kubernetes/public-secret-path
+```
+
+Human output adds a concise `Priority score: N (heuristic, band)` line per
+finding. JSON output adds a per-finding `ranking` object with `method`,
+`score`, `band`, and deterministic `reasons`. SARIF output remains unchanged.
 
 Get SARIF output for code-scanning-style integrations:
 
@@ -612,14 +629,16 @@ The scan loop is:
    suppression finding IDs before active config suppressions are applied.
 11. Build advisory remediation plans from structured graph metadata for
    supported Kubernetes findings only.
-12. Optionally generate read-only `NarrowBindingSubject` patch previews.
-13. Optionally write patched copies to a separate output directory.
-14. Optionally validate by rescanning a complete temporary overlay that replaces
+12. Optionally compute deterministic heuristic ranking metadata for visible
+   verified findings when `--rank heuristic` is supplied.
+13. Optionally generate read-only `NarrowBindingSubject` patch previews.
+14. Optionally write patched copies to a separate output directory.
+15. Optionally validate by rescanning a complete temporary overlay that replaces
    original files with generated patched copies.
 
 PathProof does not contact a live cluster, run `kubectl`, apply patches in
 place, execute GitHub Actions workflows, call GitHub APIs, create pull
-requests, persist the graph, or use AI/ML ranking.
+requests, persist the graph, or use learned AI/ML ranking.
 
 ## Current scope
 
@@ -644,6 +663,8 @@ Implemented:
 - SARIF 2.1.0 finding export.
 - Local baseline generation for current unsuppressed findings.
 - Local baseline comparison for new, existing, and resolved finding IDs.
+- Opt-in deterministic heuristic priority scoring for visible verified
+  findings through `--rank heuristic`.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
 - Validation rescan.
@@ -663,7 +684,7 @@ Not implemented:
 - PR creation.
 - In-place edits.
 - Broad RBAC patching.
-- AI/ML ranking.
+- Learned AI/ML ranking.
 - Dashboard.
 
 ## Resume summary

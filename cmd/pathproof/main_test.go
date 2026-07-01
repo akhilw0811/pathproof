@@ -1209,6 +1209,194 @@ func TestRunScanVulnerableFixtureReturnsOneAndHumanFinding(t *testing.T) {
 	assertExactlyOneTrailingNewline(t, stdout)
 }
 
+func TestRunScanRankDefaultOutputHasNoRankingMetadata(t *testing.T) {
+	humanStdout, humanStderr, humanCode := runCommand("scan", vulnerableFixture)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", vulnerableFixture)
+
+	assertCode(t, humanCode, 1)
+	assertCode(t, jsonCode, 1)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "json stderr", jsonStderr, "")
+	if strings.Contains(humanStdout, "Priority score:") {
+		t.Fatalf("default human output contains ranking metadata: %s", humanStdout)
+	}
+	report := assertValidJSONReport(t, jsonStdout)
+	if len(report.Findings) != 1 {
+		t.Fatalf("finding count = %d, want 1", len(report.Findings))
+	}
+	if report.Findings[0].Ranking != nil || strings.Contains(jsonStdout, `"ranking"`) {
+		t.Fatalf("default JSON output contains ranking metadata: %s", jsonStdout)
+	}
+}
+
+func TestRunScanRankHeuristicAddsHumanAndJSONRanking(t *testing.T) {
+	humanStdout, humanStderr, humanCode := runCommand("scan", "--rank", "heuristic", vulnerableFixture)
+	jsonStdout, jsonStderr, jsonCode := runCommand("scan", "--format=json", "--rank=heuristic", vulnerableFixture)
+
+	assertCode(t, humanCode, 1)
+	assertCode(t, jsonCode, 1)
+	assertString(t, "human stderr", humanStderr, "")
+	assertString(t, "json stderr", jsonStderr, "")
+	assertContains(t, humanStdout, "Priority score: 105 (heuristic, critical_priority)\n")
+
+	report := assertValidJSONReport(t, jsonStdout)
+	if len(report.Findings) != 1 || report.Findings[0].Ranking == nil {
+		t.Fatalf("ranking JSON finding = %#v, want one ranked finding", report.Findings)
+	}
+	ranking := report.Findings[0].Ranking
+	wantReasons := []string{
+		"high severity +50",
+		"public exposure +15",
+		"sensitive resource +20",
+		"Kubernetes Secret access +15",
+		"remediation available +5",
+	}
+	if ranking.Method != "heuristic" || ranking.Score != 105 || ranking.Band != "critical_priority" || !reflect.DeepEqual(ranking.Reasons, wantReasons) {
+		t.Fatalf("ranking = %#v, want heuristic score 105 with stable reasons", ranking)
+	}
+}
+
+func TestRunScanRankHeuristicDoesNotChangeExitCodesFindingIDsOrOrder(t *testing.T) {
+	stdout, stderr, code := runCommand("scan", "--format=json", vulnerableFixture)
+	rankedStdout, rankedStderr, rankedCode := runCommand("scan", "--format=json", "--rank", "heuristic", vulnerableFixture)
+
+	assertCode(t, code, 1)
+	assertCode(t, rankedCode, 1)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "ranked stderr", rankedStderr, "")
+	report := assertValidJSONReport(t, stdout)
+	rankedReport := assertValidJSONReport(t, rankedStdout)
+	if len(report.Findings) != len(rankedReport.Findings) {
+		t.Fatalf("ranked finding count = %d, want %d", len(rankedReport.Findings), len(report.Findings))
+	}
+	for i := range report.Findings {
+		if rankedReport.Findings[i].ID != report.Findings[i].ID || rankedReport.Findings[i].Severity != report.Findings[i].Severity || rankedReport.Findings[i].RuleID != report.Findings[i].RuleID {
+			t.Fatalf("rank changed finding identity/order/severity:\nbase:%#v\nrank:%#v", report.Findings, rankedReport.Findings)
+		}
+	}
+}
+
+func TestRunScanRankHeuristicDoesNotChangeSARIF(t *testing.T) {
+	stdout, stderr, code := runCommand("scan", "--format=sarif", vulnerableFixture)
+	rankedStdout, rankedStderr, rankedCode := runCommand("scan", "--format=sarif", "--rank", "heuristic", vulnerableFixture)
+
+	assertCode(t, code, 1)
+	assertCode(t, rankedCode, 1)
+	assertString(t, "stderr", stderr, "")
+	assertString(t, "ranked stderr", rankedStderr, "")
+	assertString(t, "ranked SARIF stdout", rankedStdout, stdout)
+	if strings.Contains(rankedStdout, "ranking") || strings.Contains(rankedStdout, "priority") {
+		t.Fatalf("ranked SARIF contains ranking metadata: %s", rankedStdout)
+	}
+}
+
+func TestRunScanRejectsInvalidRankFlag(t *testing.T) {
+	stdout, stderr, code := runCommand("scan", "--rank", "ml", safeFixture)
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "unsupported --rank \"ml\"")
+}
+
+func TestRunScanWriteBaselineRejectsRank(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--write-baseline", "baseline.json", "--rank", "heuristic", "scan")
+
+	assertCode(t, code, 2)
+	assertString(t, "stdout", stdout, "")
+	assertOneLineStderr(t, stderr)
+	assertContains(t, stderr, "--write-baseline cannot be combined with --rank")
+	assertPathDoesNotExist(t, filepath.Join(parent, "baseline.json"))
+}
+
+func TestRunScanRankHeuristicWorksWithConfigFiltering(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeSplitVulnerableFixture(t, root, []string{"service.yaml", "deployment.yaml", "secret.yaml", "rbac.yaml"})
+	writeFileForTest(t, parent, "pathproof.json", `{"rules":{"disable":["PP-K8S-001"]}}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--rank", "heuristic", "--config", "pathproof.json", "scan")
+
+	assertCode(t, code, 0)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Finding count: 0\n")
+	if strings.Contains(stdout, "Priority score:") {
+		t.Fatalf("ranked config-filtered output contains ranking for hidden finding: %s", stdout)
+	}
+}
+
+func TestRunScanRankHeuristicWorksWithBaselineComparison(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "scan")
+	writeGitHubActionsWorkflowForTest(t, root, "unpinned.yml", `jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+`)
+	initialOut, initialErr, initialCode := runCommandInDir(t, parent, "scan", "--format=json", "scan")
+	assertCode(t, initialCode, 1)
+	assertString(t, "initial stderr", initialErr, "")
+	finding := firstCLIFindingByRule(t, assertValidJSONReport(t, initialOut).Findings, "PP-GHA-001")
+	staleID := testCLIBaselineFindingID("PP-GHA-001", "c")
+	writeFileForTest(t, parent, "baseline.json", `{"suppressions":[{"finding_id":"`+finding.ID+`","reason":"Accepted"},{"finding_id":"`+staleID+`","reason":"Accepted stale"}]}`)
+
+	stdout, stderr, code := runCommandInDir(t, parent, "scan", "--format=json", "--rank", "heuristic", "--baseline", "baseline.json", "scan")
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	report := assertValidJSONReport(t, stdout)
+	if report.BaselineComparison == nil || report.BaselineComparison.ResolvedFindingsCount != 1 {
+		t.Fatalf("baseline comparison = %#v, want one resolved ID", report.BaselineComparison)
+	}
+	if len(report.Findings) != 1 || report.Findings[0].BaselineStatus != "existing" || report.Findings[0].Ranking == nil {
+		t.Fatalf("ranked baseline finding = %#v, want existing ranked finding", report.Findings)
+	}
+	for _, reason := range report.Findings[0].Ranking.Reasons {
+		if reason == "new baseline status +10" {
+			t.Fatalf("existing baseline finding has new-status score reason: %#v", report.Findings[0].Ranking)
+		}
+	}
+	if strings.Count(stdout, `"ranking"`) != 1 {
+		t.Fatalf("ranking count in stdout = %d, want only visible current finding ranked: %s", strings.Count(stdout, `"ranking"`), stdout)
+	}
+}
+
+func TestRunScanRankHeuristicDoesNotCreateSideEffectsOrLeakRawValues(t *testing.T) {
+	dir := t.TempDir()
+	writeGitHubActionsWorkflowForTest(t, dir, "unsafe.yml", `on: pull_request_target
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          token: FAKE_RANK_SECRET_DO_NOT_RETAIN
+      - run: echo FAKE_RANK_RUN_SCRIPT_DO_NOT_RETAIN
+`)
+
+	stdout, stderr, code := runCommand("scan", "--rank", "heuristic", dir)
+
+	assertCode(t, code, 1)
+	assertString(t, "stderr", stderr, "")
+	assertContains(t, stdout, "Priority score:")
+	for _, forbidden := range []string{
+		"FAKE_RANK_SECRET_DO_NOT_RETAIN",
+		"FAKE_RANK_RUN_SCRIPT_DO_NOT_RETAIN",
+		"Patch Output:",
+		"Patch Preview:",
+		"Validation:",
+		"replacement_sha",
+	} {
+		if strings.Contains(stdout, forbidden) || strings.Contains(stderr, forbidden) {
+			t.Fatalf("rank output contains forbidden value %q\nstdout:%s\nstderr:%s", forbidden, stdout, stderr)
+		}
+	}
+}
+
 func TestRunScanSafeGitHubActionsWorkflowReturnsZero(t *testing.T) {
 	dir := t.TempDir()
 	writeGitHubActionsWorkflowForTest(t, dir, "safe.yml", `name: Safe
@@ -5168,7 +5356,15 @@ type cliJSONFinding struct {
 	RiskSignal        *cliJSONRiskSignal        `json:"risk_signal,omitempty"`
 	BucketSensitivity *cliJSONBucketSensitivity `json:"bucket_sensitivity,omitempty"`
 	BaselineStatus    string                    `json:"baseline_status,omitempty"`
+	Ranking           *cliJSONRanking           `json:"ranking,omitempty"`
 	Remediation       *cliJSONRemediation       `json:"remediation,omitempty"`
+}
+
+type cliJSONRanking struct {
+	Method  string   `json:"method"`
+	Score   int      `json:"score"`
+	Band    string   `json:"band"`
+	Reasons []string `json:"reasons"`
 }
 
 type cliJSONRiskSignal struct {
@@ -6050,6 +6246,15 @@ func jsonReportHasRule(report cliJSONReport, ruleID string) bool {
 
 func legacyGitHubActionsRuleWording() string {
 	return "third" + "-party"
+}
+
+func assertPathDoesNotExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err == nil {
+		t.Fatalf("path exists, want absent: %s", path)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", path, err)
+	}
 }
 
 func listDirNames(t *testing.T, dir string) []string {

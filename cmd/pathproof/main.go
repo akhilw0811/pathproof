@@ -19,6 +19,7 @@ import (
 	parserkubernetes "pathproof/internal/parser/kubernetes"
 	parserterraform "pathproof/internal/parser/terraform"
 	"pathproof/internal/patchpreview"
+	"pathproof/internal/ranking"
 	"pathproof/internal/remediation"
 	routinggithubactions "pathproof/internal/routing/githubactions"
 	routingkubernetes "pathproof/internal/routing/kubernetes"
@@ -27,7 +28,7 @@ import (
 )
 
 const version = "pathproof dev"
-const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--config <file>] [--baseline <file>] [--repo OWNER/REPO] [--github-action-pins <file>] [--write-baseline <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
+const usage = "Usage: pathproof version | pathproof scan [--format human|json|sarif] [--rank heuristic] [--config <file>] [--baseline <file>] [--repo OWNER/REPO] [--github-action-pins <file>] [--write-baseline <file>] [--preview-patches] [--write-patches <output-directory>] [--validate-patches] <directory>"
 
 type scanFormat string
 
@@ -39,6 +40,7 @@ const (
 
 type scanOptions struct {
 	format           scanFormat
+	rankMethod       ranking.Method
 	previewPatches   bool
 	writePatches     string
 	validatePatches  bool
@@ -159,7 +161,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return writeScanResultWithMetadataAndExclusions(findings, g, options.directory, options.format, options.previewPatches, options.writePatches, options.validatePatches, pins, cfg.PathExclusions, metadata, baselineComparison, stdout, stderr)
+	return writeScanResultWithRanking(findings, g, options.directory, options.format, options.rankMethod, options.previewPatches, options.writePatches, options.validatePatches, pins, cfg.PathExclusions, metadata, baselineComparison, stdout, stderr)
 }
 
 func writeScanResult(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, stdout, stderr io.Writer) int {
@@ -171,6 +173,10 @@ func writeScanResultWithMetadata(findings []analysis.Finding, g *graph.Graph, ro
 }
 
 func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, pathExclusions config.PathExclusions, metadata *scanConfigMetadata, baselineComparison *config.BaselineComparison, stdout, stderr io.Writer) int {
+	return writeScanResultWithRanking(findings, g, root, format, "", previewPatches, writePatches, validatePatches, pins, pathExclusions, metadata, baselineComparison, stdout, stderr)
+}
+
+func writeScanResultWithRanking(findings []analysis.Finding, g *graph.Graph, root string, format scanFormat, rankMethod ranking.Method, previewPatches bool, writePatches string, validatePatches bool, pins remediation.GitHubActionPins, pathExclusions config.PathExclusions, metadata *scanConfigMetadata, baselineComparison *config.BaselineComparison, stdout, stderr io.Writer) int {
 	plans, err := remediation.BuildWithGitHubActionPins(g, findings, pins)
 	if err != nil {
 		printError(stderr, "internal scan error: build remediation plans: "+err.Error())
@@ -204,7 +210,7 @@ func writeScanResultWithMetadataAndExclusions(findings []analysis.Finding, g *gr
 			return 2
 		}
 	}
-	report, err := newScanReport(root, findings, g, plans, reportPreviews, patchOutputs, includePatchOutputs, validationResults, metadata, baselineComparison)
+	report, err := newScanReportWithRanking(root, findings, g, plans, reportPreviews, patchOutputs, includePatchOutputs, validationResults, metadata, baselineComparison, rankMethod)
 	if err != nil {
 		printError(stderr, "internal scan error: "+err.Error())
 		return 2
@@ -280,6 +286,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	flags := flag.NewFlagSet("scan", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	formatValue := flags.String("format", string(scanFormatHuman), "output format")
+	rankValue := flags.String("rank", "", "optional ranking method")
 	repoValue := flags.String("repo", "", "repository identity for GitHub Actions OIDC trust matching, in OWNER/REPO form")
 	githubActionPins := flags.String("github-action-pins", "", "local JSON mapping of GitHub Action refs to full commit SHAs")
 	configPath := flags.String("config", "", "local JSON PathProof config file")
@@ -311,6 +318,12 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	default:
 		return scanOptions{}, fmt.Errorf("unsupported scan format %q; supported formats are human, json, and sarif", format)
 	}
+	rankMethod := ranking.Method(*rankValue)
+	switch rankMethod {
+	case "", ranking.MethodHeuristic:
+	default:
+		return scanOptions{}, fmt.Errorf("unsupported --rank %q; supported rank methods are heuristic", rankMethod)
+	}
 
 	remaining := flags.Args()
 	if len(remaining) != 1 {
@@ -336,6 +349,9 @@ func parseScanArgs(args []string) (scanOptions, error) {
 	if writeBaselineSet && baselineSet {
 		return scanOptions{}, fmt.Errorf("--baseline cannot be combined with --write-baseline")
 	}
+	if writeBaselineSet && rankMethod != "" {
+		return scanOptions{}, fmt.Errorf("--write-baseline cannot be combined with --rank")
+	}
 	if writePatchesSet {
 		if err := patchpreview.ValidateOutputRoot(dir, *writePatches); err != nil {
 			return scanOptions{}, err
@@ -354,7 +370,7 @@ func parseScanArgs(args []string) (scanOptions, error) {
 			return scanOptions{}, err
 		}
 	}
-	return scanOptions{format: format, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, configPath: *configPath, baselinePath: *baselinePath, baselineSet: baselineSet, writeBaseline: *writeBaseline, writeBaselineSet: writeBaselineSet, directory: dir}, nil
+	return scanOptions{format: format, rankMethod: rankMethod, previewPatches: *previewPatches, writePatches: writePatchesValue, validatePatches: *validatePatches, repo: repo, githubActionPins: *githubActionPins, configPath: *configPath, baselinePath: *baselinePath, baselineSet: baselineSet, writeBaseline: *writeBaseline, writeBaselineSet: writeBaselineSet, directory: dir}, nil
 }
 
 func applyConfigToFindings(findings []analysis.Finding, cfg config.Config) ([]analysis.Finding, int) {
@@ -660,8 +676,16 @@ type scanFinding struct {
 	RiskSignal        *scanRiskSignal        `json:"risk_signal,omitempty"`
 	BucketSensitivity *scanBucketSensitivity `json:"bucket_sensitivity,omitempty"`
 	BaselineStatus    config.BaselineStatus  `json:"baseline_status,omitempty"`
+	Ranking           *scanRanking           `json:"ranking,omitempty"`
 	Remediation       *scanRemediation       `json:"remediation,omitempty"`
 	SARIFSources      []string               `json:"-"`
+}
+
+type scanRanking struct {
+	Method  ranking.Method `json:"method"`
+	Score   int            `json:"score"`
+	Band    string         `json:"band"`
+	Reasons []string       `json:"reasons"`
 }
 
 type scanRiskSignal struct {
@@ -770,6 +794,10 @@ type scanPatchOutput struct {
 }
 
 func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool, validationResults []validation.Result, metadata *scanConfigMetadata, baselineComparison *config.BaselineComparison) (scanReport, error) {
+	return newScanReportWithRanking(root, findings, g, plans, previews, patchOutputs, includePatchOutputs, validationResults, metadata, baselineComparison, "")
+}
+
+func newScanReportWithRanking(root string, findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, previews []patchpreview.Preview, patchOutputs []patchpreview.WrittenFile, includePatchOutputs bool, validationResults []validation.Result, metadata *scanConfigMetadata, baselineComparison *config.BaselineComparison, rankMethod ranking.Method) (scanReport, error) {
 	planByFinding := make(map[analysis.FindingID]remediation.Plan, len(plans))
 	for _, plan := range plans {
 		planByFinding[plan.FindingID] = plan
@@ -793,6 +821,7 @@ func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, pla
 			ResolvedFindingIDs:    append([]analysis.FindingID(nil), baselineComparison.ResolvedFindingIDs...),
 		}
 	}
+	scoreByFinding := rankingScoresByFindingID(findings, g, plans, validationResults, baselineComparison, rankMethod)
 	for _, finding := range findings {
 		item, err := projectFinding(root, finding, g)
 		if err != nil {
@@ -800,6 +829,9 @@ func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, pla
 		}
 		if baselineComparison != nil {
 			item.BaselineStatus = baselineComparison.StatusByFindingID[finding.ID]
+		}
+		if score, ok := scoreByFinding[finding.ID]; ok {
+			item.Ranking = projectRanking(rankMethod, score)
 		}
 		if plan, ok := planByFinding[finding.ID]; ok {
 			item.Remediation = projectRemediation(root, plan, previews)
@@ -819,6 +851,38 @@ func newScanReport(root string, findings []analysis.Finding, g *graph.Graph, pla
 		report.PatchOutputs = &outputs
 	}
 	return report, nil
+}
+
+func rankingScoresByFindingID(findings []analysis.Finding, g *graph.Graph, plans []remediation.Plan, validationResults []validation.Result, baselineComparison *config.BaselineComparison, rankMethod ranking.Method) map[analysis.FindingID]ranking.Score {
+	if rankMethod != ranking.MethodHeuristic {
+		return nil
+	}
+	baselineStatuses := make(map[analysis.FindingID]string)
+	if baselineComparison != nil {
+		for id, status := range baselineComparison.StatusByFindingID {
+			baselineStatuses[id] = string(status)
+		}
+	}
+	vectors := ranking.ExtractFeatures(findings, g, ranking.Context{
+		BaselineStatusByFindingID: baselineStatuses,
+		Plans:                     plans,
+		ValidationResults:         validationResults,
+	})
+	scores := ranking.ScoreHeuristicAll(vectors)
+	out := make(map[analysis.FindingID]ranking.Score, len(scores))
+	for _, score := range scores {
+		out[analysis.FindingID(score.FindingID)] = score
+	}
+	return out
+}
+
+func projectRanking(method ranking.Method, score ranking.Score) *scanRanking {
+	return &scanRanking{
+		Method:  method,
+		Score:   score.Score,
+		Band:    score.Band,
+		Reasons: append([]string(nil), score.Reasons...),
+	}
 }
 
 func projectFinding(root string, finding analysis.Finding, g *graph.Graph) (scanFinding, error) {
@@ -1237,6 +1301,11 @@ func writeHumanReport(w io.Writer, report scanReport) error {
 		}
 		if _, err := fmt.Fprintf(w, "Severity: %s\n", finding.Severity); err != nil {
 			return err
+		}
+		if finding.Ranking != nil {
+			if _, err := fmt.Fprintf(w, "Priority score: %d (%s, %s)\n", finding.Ranking.Score, finding.Ranking.Method, finding.Ranking.Band); err != nil {
+				return err
+			}
 		}
 		if finding.Summary != "" {
 			if _, err := fmt.Fprintf(w, "Summary: %s\n", finding.Summary); err != nil {
