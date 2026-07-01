@@ -1,0 +1,123 @@
+{
+  "findings": [
+    {
+      "id": "finding:PP-K8S-001:example-python-agent",
+      "rule_id": "PP-K8S-001",
+      "title": "Public workload can read Kubernetes Secret",
+      "severity": "High",
+      "summary": "Public endpoint kubernetes://prod/service/public-api routes to a workload whose ServiceAccount can read Secret metadata.",
+      "path": [
+        {
+          "id": "node:public-endpoint",
+          "kind": "PublicEndpoint",
+          "name": "kubernetes://prod/service/public-api"
+        },
+        {
+          "id": "node:workload",
+          "kind": "Workload",
+          "name": "kubernetes://prod/deployment/api"
+        },
+        {
+          "id": "node:serviceaccount",
+          "kind": "ServiceAccount",
+          "name": "kubernetes://prod/serviceaccount/api"
+        },
+        {
+          "id": "node:secret",
+          "kind": "Secret",
+          "name": "kubernetes://prod/secret/app-secret"
+        }
+      ],
+      "source_references": [
+        "service.yaml#document=1",
+        "workload.yaml#document=1",
+        "rbac.yaml#document=1"
+      ],
+      "baseline_status": "new",
+      "remediation": {
+        "id": "plan:example-python-agent-k8s",
+        "finding_id": "finding:PP-K8S-001:example-python-agent",
+        "rule_id": "PP-K8S-001",
+        "summary": "Remediate Kubernetes Secret read access for the verified finding.",
+        "options": [
+          {
+            "priority": 1,
+            "action": "NarrowBindingSubject",
+            "summary": "Remove the affected ServiceAccount from one multi-subject binding.",
+            "rationale": "Removing only the affected ServiceAccount subject breaks the modeled read edge without deleting the binding for other subjects.",
+            "requires_all_changes": false,
+            "changes": [
+              {
+                "action": "NarrowBindingSubject",
+                "target": {
+                  "kind": "RoleBinding",
+                  "namespace": "prod",
+                  "name": "read-secrets"
+                },
+                "summary": "Remove only ServiceAccount prod/api from RoleBinding prod/read-secrets.",
+                "source_reference": "rbac.yaml#document=1",
+                "subject": "prod/api",
+                "patch_supported": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "finding:PP-XDOMAIN-004:example-python-agent",
+      "rule_id": "PP-XDOMAIN-004",
+      "title": "Risky GitHub Actions workflow can access sensitive AWS S3 bucket",
+      "severity": "High",
+      "summary": "A verified GitHub Actions OIDC path reaches a Terraform-modeled sensitive S3 bucket.",
+      "path": [
+        {
+          "id": "node:workflow",
+          "kind": "Workflow",
+          "name": "githubactions://.github/workflows/unsafe.yml"
+        },
+        {
+          "id": "node:job",
+          "kind": "WorkflowJob",
+          "name": "githubactions://.github/workflows/unsafe.yml/job/deploy"
+        },
+        {
+          "id": "node:oidc",
+          "kind": "OIDCTokenCapability",
+          "name": "githubactions://.github/workflows/unsafe.yml/job/deploy/oidc-token"
+        },
+        {
+          "id": "node:role",
+          "kind": "AWSIAMRole",
+          "name": "aws://terraform/aws_iam_role/infra/iam.tf/deploy"
+        },
+        {
+          "id": "node:bucket",
+          "kind": "AWSS3Bucket",
+          "name": "aws://terraform/aws_s3_bucket/infra/s3.tf/artifacts"
+        }
+      ],
+      "risk_signal": {
+        "rule_id": "PP-GHA-003",
+        "source_reference": ".github/workflows/unsafe.yml#document=1",
+        "workflow_file": ".github/workflows/unsafe.yml",
+        "job_id": "deploy",
+        "permission": "id-token",
+        "access": "write",
+        "summary": "dangerous permission grant id-token: write under pull_request_target"
+      },
+      "bucket_sensitivity": {
+        "sensitivity_level": "sensitive",
+        "reasons": [
+          {
+            "source": "tag",
+            "key": "Classification",
+            "value": "restricted",
+            "source_ref": "infra/s3.tf#resource=aws_s3_bucket.artifacts"
+          }
+        ]
+      }
+    }
+  ],
+  "finding_count": 2
+}

@@ -1,0 +1,167 @@
+{
+  "description": "Synthetic local priority labels for the experimental PathProof ranking prototype. Labels are priority examples, not vulnerability truth.",
+  "records": [
+    {
+      "priority_label": 1,
+      "finding": {
+        "id": "finding:PP-K8S-001:synthetic-public-secret",
+        "rule_id": "PP-K8S-001",
+        "severity": "High",
+        "baseline_status": "new",
+        "path": [
+          {"kind": "PublicEndpoint"},
+          {"kind": "Workload"},
+          {"kind": "ServiceAccount"},
+          {"kind": "Secret"}
+        ],
+        "remediation": {
+          "options": [
+            {
+              "priority": 1,
+              "action": "NarrowBindingSubject",
+              "changes": [
+                {"action": "NarrowBindingSubject", "patch_supported": true}
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "priority_label": 0,
+      "finding": {
+        "id": "finding:PP-GHA-001:synthetic-unpinned-action",
+        "rule_id": "PP-GHA-001",
+        "severity": "Medium",
+        "baseline_status": "existing",
+        "path": [
+          {"kind": "Workflow"},
+          {"kind": "WorkflowJob"},
+          {"kind": "GitHubAction"}
+        ],
+        "remediation": {
+          "options": [
+            {
+              "priority": 1,
+              "action": "PinGitHubActionToSHA",
+              "changes": [
+                {"action": "PinGitHubActionToSHA", "patch_supported": false}
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "priority_label": 0,
+      "finding": {
+        "id": "finding:PP-GHA-002:synthetic-unsafe-checkout",
+        "rule_id": "PP-GHA-002",
+        "severity": "High",
+        "baseline_status": "existing",
+        "path": [
+          {"kind": "Workflow"},
+          {"kind": "WorkflowJob"},
+          {"kind": "GitHubAction"}
+        ]
+      }
+    },
+    {
+      "priority_label": 1,
+      "finding": {
+        "id": "finding:PP-GHA-003:synthetic-dangerous-permissions",
+        "rule_id": "PP-GHA-003",
+        "severity": "High",
+        "baseline_status": "new",
+        "path": [
+          {"kind": "Workflow"},
+          {"kind": "WorkflowJob"}
+        ]
+      }
+    },
+    {
+      "priority_label": 0,
+      "finding": {
+        "id": "finding:PP-AWS-001:synthetic-admin-role",
+        "rule_id": "PP-AWS-001",
+        "severity": "High",
+        "baseline_status": "existing",
+        "path": [
+          {"kind": "AWSIAMRole"},
+          {"kind": "AWSPermission"}
+        ]
+      }
+    },
+    {
+      "priority_label": 0,
+      "finding": {
+        "id": "finding:PP-XDOMAIN-001:synthetic-oidc-role",
+        "rule_id": "PP-XDOMAIN-001",
+        "severity": "High",
+        "baseline_status": "existing",
+        "path": [
+          {"kind": "Workflow"},
+          {"kind": "OIDCTokenCapability"},
+          {"kind": "AWSIAMRole"}
+        ],
+        "risk_signal": {"rule_id": "PP-GHA-003"}
+      }
+    },
+    {
+      "priority_label": 1,
+      "finding": {
+        "id": "finding:PP-XDOMAIN-002:synthetic-oidc-admin",
+        "rule_id": "PP-XDOMAIN-002",
+        "severity": "High",
+        "baseline_status": "new",
+        "path": [
+          {"kind": "Workflow"},
+          {"kind": "OIDCTokenCapability"},
+          {"kind": "AWSIAMRole"},
+          {"kind": "AWSPermission"}
+        ],
+        "risk_signal": {"rule_id": "PP-GHA-003"}
+      }
+    },
+    {
+      "priority_label": 1,
+      "finding": {
+        "id": "finding:PP-XDOMAIN-003:synthetic-oidc-s3",
+        "rule_id": "PP-XDOMAIN-003",
+        "severity": "High",
+        "baseline_status": "new",
+        "path": [
+          {"kind": "Workflow"},
+          {"kind": "WorkflowJob"},
+          {"kind": "OIDCTokenCapability"},
+          {"kind": "AWSIAMRole"},
+          {"kind": "AWSS3Bucket"}
+        ],
+        "risk_signal": {"rule_id": "PP-GHA-002"}
+      }
+    },
+    {
+      "priority_label": 1,
+      "finding": {
+        "id": "finding:PP-XDOMAIN-004:synthetic-oidc-sensitive-s3",
+        "rule_id": "PP-XDOMAIN-004",
+        "severity": "High",
+        "baseline_status": "new",
+        "path": [
+          {"kind": "Workflow"},
+          {"kind": "WorkflowJob"},
+          {"kind": "OIDCTokenCapability"},
+          {"kind": "AWSIAMRole"},
+          {"kind": "AWSS3Bucket"}
+        ],
+        "risk_signal": {"rule_id": "PP-GHA-003"},
+        "bucket_sensitivity": {
+          "sensitivity_level": "sensitive",
+          "reasons": [
+            {"source": "tag", "key": "Classification", "value": "restricted", "source_ref": "infra/s3.tf#resource=aws_s3_bucket.artifacts"}
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -5,3 +5,14 @@
 .DS_Store
 .idea/
 .vscode/
+
+.codex/
+AGENTS.md
+docs/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.pkl
+*.joblib

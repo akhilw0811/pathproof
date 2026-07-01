@@ -81,6 +81,16 @@ metadata only; it does not create findings, suppress findings, replace
 evidence or severity, sort output, change exit codes, call external APIs, or
 use learned AI/ML.
 
+Experimental Python prototypes live under `python/` and are separate from the
+Go engine. `pathproof_ranking` trains and evaluates a small local scikit-learn
+priority ranker over synthetic PathProof-style verified findings. Labels
+represent priority examples only, not vulnerability truth. `pathproof_agent`
+defines a dry-run-first LangGraph remediation workflow that consumes PathProof
+JSON, prepares a safe remediation/validation/PR summary, can optionally use the
+OpenAI API for grounded wording only, and can optionally run `gh pr create`
+only when explicitly enabled. These prototypes do not change Go findings,
+finding IDs, SARIF output, exit codes, or deterministic rule behavior.
+
 Cloud provider APIs, full CI/CD attack-path modeling, exact GitHub workflow
 permission inheritance/override modeling, broad Terraform/HCL parsing,
 Terraform execution, module or variable evaluation, reusable workflow
@@ -90,7 +100,8 @@ analysis, S3 bucket policies, KMS modeling, public access block modeling,
 object modeling, full data discovery, DLP-style classification, broad
 sensitivity-based findings, glob or regex exclusions, fail-on-new baseline
 gating, baseline update or merge, remote baselines, pull request creation,
-learned AI/ML ranking, and dashboards are not implemented.
+production learned AI/ML ranking, production PR automation, and dashboards are
+not implemented in the Go engine.
 
 Vulnerable scans exit `1` by design because findings were found. Usage,
 parsing, patch, validation, baseline write, and internal scan errors exit `2`.
@@ -573,6 +584,10 @@ only publishes the SARIF file as an artifact.
   unsuppressed findings.
 - SARIF 2.1.0 finding export for implemented Kubernetes, GitHub Actions, AWS,
   and cross-domain rules.
+- Experimental local Python scikit-learn priority ranking over structured
+  verified finding fixtures.
+- Experimental dry-run-first LangGraph remediation agent over PathProof JSON,
+  with optional grounded OpenAI wording and explicit PR-opening helper path.
 - Local GitHub Actions workflow parsing under `.github/workflows`.
 - `PP-GHA-001` detection for GitHub Actions `uses:` references that are not
   pinned to a full 40-character commit SHA.
@@ -604,6 +619,9 @@ generation, and CLI presentation separate.
 Implemented rule metadata is centralized in a static in-code registry used by
 config validation, finding metadata, and SARIF rule metadata; rule detection
 remains deterministic analysis/routing code.
+The experimental Python prototypes are post-processing tools over structured
+JSON output; they do not participate in parser, graph, analysis, remediation,
+patch, validation, SARIF, or exit-code decisions.
 
 The scan loop is:
 
@@ -636,8 +654,8 @@ The scan loop is:
 15. Optionally validate by rescanning a complete temporary overlay that replaces
    original files with generated patched copies.
 
-PathProof does not contact a live cluster, run `kubectl`, apply patches in
-place, execute GitHub Actions workflows, call GitHub APIs, create pull
+The Go scan loop does not contact a live cluster, run `kubectl`, apply patches
+in place, execute GitHub Actions workflows, call GitHub APIs, create pull
 requests, persist the graph, or use learned AI/ML ranking.
 
 ## Current scope
@@ -665,6 +683,10 @@ Implemented:
 - Local baseline comparison for new, existing, and resolved finding IDs.
 - Opt-in deterministic heuristic priority scoring for visible verified
   findings through `--rank heuristic`.
+- Experimental Python scikit-learn ranking prototype over local structured
+  finding fixtures.
+- Experimental Python LangGraph remediation-agent prototype that consumes
+  PathProof JSON and defaults to dry-run PR preparation.
 - Deterministic remediation planning.
 - `NarrowBindingSubject` patch preview and patched-copy output.
 - Validation rescan.
@@ -681,10 +703,10 @@ Not implemented:
 - Automatic action pinning patches.
 - Automatic remediation for unsafe `pull_request_target` checkout patterns.
 - Fail-on-new baseline gating, baseline update or merge, and remote baselines.
-- PR creation.
+- Production PR automation beyond the explicit Python dry-run helper.
 - In-place edits.
 - Broad RBAC patching.
-- Learned AI/ML ranking.
+- Production learned AI/ML ranking.
 - Dashboard.
 
 ## Resume summary
@@ -707,6 +729,22 @@ make build
 ```
 
 The built binary is written to `bin/pathproof`.
+
+Optional Python prototype checks are separate from `make check`:
+
+```sh
+cd python
+python3 -m unittest discover -s .
+```
+
+After installing optional Python dependencies, the prototypes can be run with:
+
+```sh
+python3 -m pip install -r python/requirements.txt
+PYTHONPATH=python python3 -m pathproof_ranking.train_ranker
+PYTHONPATH=python python3 -m pathproof_ranking.evaluate
+PYTHONPATH=python python3 -m pathproof_agent.run_agent --findings examples/python-agent/pathproof_findings.json
+```
 
 Useful local commands:
 
