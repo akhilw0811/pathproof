@@ -30,12 +30,21 @@ SARIF file exists, is non-empty, contains SARIF version `2.1.0`, and contains
 Scan command tests cover argument validation, deterministic controlled flag
 errors, accepted `--format json` and `--format=json` syntax, accepted
 `--format sarif` and `--format=sarif` syntax, accepted `--repo OWNER/REPO`
-syntax, invalid `--repo` errors with empty stdout, accepted
+syntax, invalid `--repo` errors with empty stdout, accepted `--rank heuristic`
+syntax, invalid `--rank` errors with empty stdout, accepted
 `--config <file>` syntax, accepted `--preview-patches` syntax, missing and
 non-directory path errors, human output, JSON output, SARIF output, exactly one
 trailing newline, stderr-only errors, output write failures, deterministic
 repeated output, deterministic input file ordering, and Secret-value absence
 from stdout and stderr.
+Ranking coverage asserts deterministic feature extraction from structured
+finding, rule, graph, baseline, remediation, and validation metadata; stable
+heuristic score and reason ordering; no ranking output unless
+`--rank heuristic` is supplied; human and JSON ranking projection only for
+visible current findings; no finding sorting, finding ID changes, severity
+changes, SARIF changes, exit-code changes, source/prose parsing, raw
+source/config/secret-like value leaks, or ranking-triggered remediation,
+patch, or validation side effects.
 Config parser coverage asserts that the explicit local JSON file format parses
 empty configs, disabled rule lists, enable allowlists, disable-over-enable
 conflicts, duplicate rule IDs, exact finding suppressions, and

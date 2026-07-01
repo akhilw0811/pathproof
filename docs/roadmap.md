@@ -172,6 +172,12 @@
   comparison, classifies active-scope current findings as `new` or
   `existing`, reports resolved baseline finding IDs, and does not suppress
   findings unless `--config` also supplies active suppressions.
+- Local deterministic ranking foundation through
+  `pathproof scan --rank heuristic`. It extracts structured features from
+  visible verified findings and computes a fixed heuristic priority score
+  without creating findings, suppressing findings, sorting findings, changing
+  finding IDs, changing severity or evidence, changing exit codes, calling
+  APIs, exposing feature vectors, or adding SARIF metadata.
 - Local Kubernetes YAML, GitHub Actions workflow, and narrow Terraform scan CLI for
   `pathproof scan <directory>` with human-readable finding, supported
   Kubernetes remediation and optional patch preview output, optional
@@ -187,6 +193,8 @@
 ## Later
 
 - Additional deterministic attack-path rules.
+- Learned ML scorer, ranking evaluation CLI, labeled or synthetic ranking
+  datasets, ranking quality metrics, and model upgrade workflows.
 - Parsers for additional infrastructure and supply-chain artifacts.
 - Globstar, glob, regex, or policy-driven path exclusions.
 - Fail-on-new baseline gating, baseline update or merge, remote baselines,
@@ -237,5 +245,5 @@
   live-cluster authorization verification, and remediation when a concrete task
   requires them.
 
-AI, machine learning, dashboards, graph databases, and pull request automation
-remain out of scope until explicitly requested.
+Dashboards, graph databases, pull request automation, and learned AI/ML
+ranking remain out of scope until explicitly requested.

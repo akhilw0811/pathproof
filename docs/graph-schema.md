@@ -1106,6 +1106,27 @@ binding or role source reference, matched verb or subject when applicable, and
 other canonical action parameters. Summary, rationale, constraints prose, and
 evidence string ordering are excluded from identity.
 
+Ranking is not part of the graph schema. When `pathproof scan --rank heuristic`
+is supplied with JSON output, the private CLI finding projection may include:
+
+```json
+{
+  "ranking": {
+    "method": "heuristic",
+    "score": 105,
+    "band": "critical_priority",
+    "reasons": [
+      "high severity +50",
+      "public exposure +15"
+    ]
+  }
+}
+```
+
+The ranking projection is derived only from already-detected visible findings
+and structured metadata. It does not add nodes or edges, change finding IDs,
+change severity, replace evidence, affect SARIF, or alter scan exit codes.
+
 Observed Roles or ClusterRoles with empty `rules` can still appear as reachable
 Role nodes and have `BoundTo` edges, but they create no Permission nodes and no
 `GrantsPermission` edges. Missing role references create unresolved Role nodes

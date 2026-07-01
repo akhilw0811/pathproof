@@ -8,6 +8,7 @@ and local directory scans with:
 - `pathproof scan --format json <directory>`
 - `pathproof scan --format=json <directory>`
 - `pathproof scan --format sarif <directory>`
+- `pathproof scan --rank heuristic <directory>`
 - `pathproof scan --config <file> <directory>`
 - `pathproof scan --baseline <file> <directory>`
 - `pathproof scan --repo OWNER/REPO <directory>`
@@ -42,8 +43,9 @@ optional local JSON pin mapping supplied with `--github-action-pins`, never
 calls GitHub, never resolves tags or branches, never guesses SHAs, and does
 not validate `PP-GHA-001` patches in this slice. It does not persist the graph
 or expose graph internals beyond the ordered finding path, evidence,
-remediation plan fields, optional preview fields, optional patch output
-summaries, optional validation results, and SARIF finding projection.
+remediation plan fields, optional ranking fields, optional preview fields,
+optional patch output summaries, optional validation results, and SARIF
+finding projection.
 
 Config loading, baseline writing, and baseline comparison loading live under
 `internal/config` and use only Go standard library JSON parsing. Config is
@@ -60,6 +62,17 @@ output, and SARIF. Suppressions are exact finding-ID matches applied after
 rule filtering; suppressed findings are omitted from output and downstream
 remediation/patch/validation behavior. Suppression reasons are required and
 validated but are not printed.
+
+Ranking lives under `internal/ranking` and is opt-in with
+`pathproof scan --rank heuristic`. It runs only after deterministic analysis,
+rule filtering, baseline comparison, and suppressions have determined the
+visible current findings. Ranking extracts feature vectors from structured
+finding, rule, graph, baseline, remediation, and validation metadata, then
+computes a deterministic heuristic priority score. It does not parse source
+files or evidence prose, call APIs, create findings, suppress findings, sort
+findings, change finding IDs, replace severity or evidence, affect exit codes,
+or add SARIF metadata. Deterministic graph and rule analysis remain the source
+of truth for whether a finding exists.
 
 Baseline comparison is explicit and local-only through
 `pathproof scan --baseline <file>`. The baseline file uses the same local JSON
